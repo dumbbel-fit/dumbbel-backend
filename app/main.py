@@ -34,14 +34,23 @@ log = logging.getLogger("dumbbel")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    log.info("starting DUMBBEL API env=%s auth_provider=%s", settings.env, settings.auth_provider)
     if settings.auto_create_tables:
-        from app.db import Base, engine
-        import app.models  # noqa: F401
-        Base.metadata.create_all(engine)
+        # Never block startup on the DB: if it's unreachable, log why and keep serving (/v1/health shows db=false).
+        try:
+            from app.db import Base, engine
+            import app.models  # noqa: F401
+            Base.metadata.create_all(engine)
+            log.info("database ready")
+        except Exception as e:
+            log.error("DATABASE NOT REACHABLE at startup: %s: %s", type(e).__name__, str(e)[:500])
     sched = None
     if settings.run_scheduler:
-        from app.services.scheduled import start_scheduler
-        sched = start_scheduler()
+        try:
+            from app.services.scheduled import start_scheduler
+            sched = start_scheduler()
+        except Exception as e:
+            log.error("scheduler failed to start: %s", e)
     yield
     if sched:
         sched.shutdown(wait=False)

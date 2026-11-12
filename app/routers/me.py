@@ -73,12 +73,16 @@ def remove_device(token: str, user: User = Depends(current_user), db: Session = 
 
 @public.get("/health", summary="Uptime check")
 def health(db: Session = Depends(get_db)):
+    err = None
     try:
         db.execute(text("SELECT 1"))
         ok = True
-    except Exception:
-        ok = False
-    return {"status": "ok" if ok else "degraded", "db": ok, "time": utcnow().isoformat()}
+    except Exception as e:
+        ok, err = False, f"{type(e).__name__}: {str(e).split(chr(10))[0][:200]}"
+    out = {"status": "ok" if ok else "degraded", "db": ok, "time": utcnow().isoformat()}
+    if err:
+        out["db_error"] = err.replace(settings.database_url, "***")
+    return out
 
 
 @public.get("/config", summary="Min app versions, support phone, maintenance flag, login provider",
