@@ -78,6 +78,8 @@ class Settings(BaseSettings):
     # Comma-separated exact origins (e.g. https://admin.dumbbel.fit). localhost/127.0.0.1 on any port is always allowed.
     cors_origins: str = ""
     cors_allow_localhost: bool = True
+    # Our own sites are always allowed: dumbbel.fit and any subdomain (www, admin, app…), https only.
+    cors_origin_regex: str = r"https://([a-z0-9-]+\.)*dumbbel\.fit"
 
     @property
     def is_prod(self) -> bool:

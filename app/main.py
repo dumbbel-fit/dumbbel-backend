@@ -93,9 +93,12 @@ app = FastAPI(title="DUMBBEL.fit API", version="1.0.0", description=DESCRIPTION,
               swagger_ui_parameters={"persistAuthorization": True, "displayRequestDuration": True,
                                      "docExpansion": "none", "filter": True})
 
-_origins = [o.strip().rstrip("/") for o in settings.cors_origins.split(",") if o.strip()]
+_origins = [o.strip().rstrip("/") for o in settings.cors_origins.split(",") if o.strip() and "YOUR-" not in o]
+_regex = [settings.cors_origin_regex] if settings.cors_origin_regex else []
+if settings.cors_allow_localhost:
+    _regex.append(r"http://(localhost|127\.0\.0\.1)(:\d+)?")
 app.add_middleware(CORSMiddleware, allow_origins=_origins,
-                   allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$" if settings.cors_allow_localhost else None,
+                   allow_origin_regex="^(" + "|".join(_regex) + ")$" if _regex else None,
                    allow_credentials=False, allow_methods=["*"], allow_headers=["*"],
                    expose_headers=["X-Request-Id", "Retry-After", "Idempotent-Replayed", "Content-Disposition"],
                    max_age=600)
