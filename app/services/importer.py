@@ -13,7 +13,7 @@ from app.db import session_scope
 from app.errors import ApiError
 from app.models import Gym, GymMember, Import, ImportRow, Membership, Plan, User
 from app.services.audit import audit
-from app.services.core import add_payment, create_membership, get_or_create_user, next_member_code, overlapping
+from app.services.core import settle_credit, add_payment, create_membership, get_or_create_user, next_member_code, overlapping
 from app.utils import local_midnight_utc, today_in, utcnow
 
 log = logging.getLogger("dumbbel.import")
@@ -531,6 +531,8 @@ def _commit_row(db: Session, gym: Gym, imp: Import, r: ImportRow, plans_by_id: d
         if paid - to_ms > 0:
             add_payment(db, gym, imp.created_by, member, None, paid - to_ms, "cash", paid_at=paid_at, source="import",
                         note="Imported (credit)")
+    db.flush()
+    settle_credit(db, gym, member, imp.created_by, ms.id if ms else None)
     r.member_id = member.id
     r.outcome = "imported"
 

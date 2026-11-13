@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models import Checkin, Gym, Membership, MembershipFreeze, Payment
+from app.models import Checkin, CreditApplication, Gym, Membership, MembershipFreeze, Payment
 from app.utils import local_date_of, today_in, tz
 
 LIVE = ("active", "expiring", "frozen", "suspended")
@@ -96,11 +96,22 @@ def load_states(db: Session, gym: Gym, member_ids: list[str] | None = None) -> d
                                      .where(Payment.membership_id.in_(chunk), Payment.status == "recorded")
                                      .group_by(Payment.membership_id)):
                 paid[mid] = int(s or 0)
+            for mid, s in db.execute(select(CreditApplication.membership_id, func.sum(CreditApplication.amount_paise))
+                                     .where(CreditApplication.membership_id.in_(chunk),
+                                            CreditApplication.reversed_at.is_(None))
+                                     .group_by(CreditApplication.membership_id)):
+                paid[mid] = paid.get(mid, 0) + int(s or 0)
     credit_q = select(Payment.member_id, func.sum(Payment.amount_paise)).where(
         Payment.gym_id == gym.id, Payment.membership_id.is_(None), Payment.status == "recorded")
     if member_ids is not None:
         credit_q = credit_q.where(Payment.member_id.in_(member_ids))
     credits = {k: int(v or 0) for k, v in db.execute(credit_q.group_by(Payment.member_id))}
+    used_q = select(CreditApplication.member_id, func.sum(CreditApplication.amount_paise)).where(
+        CreditApplication.gym_id == gym.id, CreditApplication.reversed_at.is_(None))
+    if member_ids is not None:
+        used_q = used_q.where(CreditApplication.member_id.in_(member_ids))
+    for k, v in db.execute(used_q.group_by(CreditApplication.member_id)):
+        credits[k] = credits.get(k, 0) - int(v or 0)
 
     by_member: dict[str, list] = defaultdict(list)
     for m in ms:
@@ -111,7 +122,7 @@ def load_states(db: Session, gym: Gym, member_ids: list[str] | None = None) -> d
     out: dict[str, MemberState] = {}
     for mid in (member_ids if member_ids is not None else list(by_member.keys())):
         items = by_member.get(mid, [])
-        s = MemberState(memberships=items, credit_paise=credits.get(mid, 0))
+        s = MemberState(memberships=items, credit_paise=max(0, credits.get(mid, 0)))
         cur = pick_current([(m, st) for m, st, _ in items])
         if cur:
             s.current, s.status = cur
@@ -129,7 +140,18 @@ def membership_due(db: Session, m: Membership) -> int:
         return 0
     paid = db.scalar(select(func.coalesce(func.sum(Payment.amount_paise), 0))
                      .where(Payment.membership_id == m.id, Payment.status == "recorded")) or 0
-    return max(0, m.price_paise - int(paid))
+    applied = db.scalar(select(func.coalesce(func.sum(CreditApplication.amount_paise), 0))
+                        .where(CreditApplication.membership_id == m.id, CreditApplication.reversed_at.is_(None))) or 0
+    return max(0, m.price_paise - int(paid) - int(applied))
+
+
+def credit_balance(db: Session, member_id: str) -> int:
+    """Unallocated recorded payments minus credit already applied to memberships (can be < 0 after a void)."""
+    unalloc = db.scalar(select(func.coalesce(func.sum(Payment.amount_paise), 0)).where(
+        Payment.member_id == member_id, Payment.membership_id.is_(None), Payment.status == "recorded")) or 0
+    used = db.scalar(select(func.coalesce(func.sum(CreditApplication.amount_paise), 0)).where(
+        CreditApplication.member_id == member_id, CreditApplication.reversed_at.is_(None))) or 0
+    return int(unalloc) - int(used)
 
 
 def freezes_of(db: Session, membership_id: str) -> list[MembershipFreeze]:

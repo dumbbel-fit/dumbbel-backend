@@ -20,14 +20,15 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.deps import GymCtx, current_user, gym_ctx, perm_ctx
 from app.errors import ApiError, validation
-from app.models import Gym, GymMember, GymUpiAccount, Membership, Payment, UpiPaymentRequest, User
+from app.models import Gym, GymMember, GymStaff, GymUpiAccount, Membership, Payment, Plan, UpiPaymentRequest, User
 from app.responses import (DocRoute, ERRORS, MyUpiInfoOut, UpiAccountListOut, UpiAccountOut, UpiRequestListOut, UpiRequestOut)
 from app.services.audit import audit
 from app.services.cache import rate_limit
-from app.services.core import add_payment, check_duplicate_reference
+from app.services.core import (add_payment, check_duplicate_reference, create_membership, default_start, price_preview,
+                               ser_membership, settle_credit)
 from app.services.jobs import enqueue
 from app.services.push import send_push
-from app.services.rules import load_states, membership_due
+from app.services.rules import credit_balance, load_states, membership_due
 from app.utils import clamp_limit, decode_cursor, encode_cursor, iso, rupees, utcnow
 
 router = APIRouter(tags=["UPI payments"], route_class=DocRoute, responses=ERRORS)
@@ -54,6 +55,7 @@ class UpiAccountPatch(BaseModel):
 
 class UpiRequestIn(BaseModel):
     member_id: str
+    plan_id: str | None = Field(None, description="Renewal: the membership on this plan is created when you verify")
     membership_id: str | None = Field(None, description="Defaults to the member’s current membership with dues")
     amount_paise: int | None = Field(None, gt=0, description="Defaults to the amount due")
     note: str | None = Field(None, max_length=50)
@@ -65,6 +67,11 @@ class MyUpiRequestIn(BaseModel):
     member_id: str | None = Field(None, description="Which gym membership (omit if you have one gym)")
     membership_id: str | None = None
     amount_paise: int | None = Field(None, gt=0, description="Defaults to your total dues at that gym")
+
+
+class RenewIn(BaseModel):
+    member_id: str | None = Field(None, description="Which gym membership (omit if you have one gym)")
+    plan_id: str
 
 
 class ClaimIn(BaseModel):
@@ -111,8 +118,14 @@ def refresh_status(r: UpiPaymentRequest) -> UpiPaymentRequest:
     return r
 
 
-def ser_req(r: UpiPaymentRequest, member: GymMember | None = None, receipt_no: str | None = None) -> dict:
+def ser_req(r: UpiPaymentRequest, member: GymMember | None = None, receipt_no: str | None = None,
+            plan_name: str | None = None) -> dict:
     refresh_status(r)
+    if plan_name is None and r.plan_id:
+        from sqlalchemy.orm import object_session
+        sess = object_session(r)
+        p = sess.get(Plan, r.plan_id) if sess else None
+        plan_name = p.name if p else None
     uri, links = upi_links(r)
     payable = r.status in ("pending", "expired")
     return {"id": r.id, "status": r.status, "amount_paise": r.amount_paise, "vpa": r.vpa, "payee_name": r.payee_name,
@@ -121,7 +134,9 @@ def ser_req(r: UpiPaymentRequest, member: GymMember | None = None, receipt_no: s
             "member": {"id": member.id, "name": member.display_name, "member_code": member.member_code} if member else None,
             "utr": r.utr, "claimed_at": iso(r.claimed_at), "decided_at": iso(r.decided_at),
             "reject_reason": r.reject_reason, "payment_id": r.payment_id, "receipt_no": receipt_no,
-            "created_via": r.created_via, "expires_at": iso(r.expires_at), "created_at": iso(r.created_at)}
+            "created_via": r.created_via, "purpose": r.purpose or "dues", "plan_id": r.plan_id,
+            "plan_name": plan_name, "result_membership_id": r.result_membership_id,
+            "expires_at": iso(r.expires_at), "created_at": iso(r.created_at)}
 
 
 def ser_acct(a: GymUpiAccount) -> dict:
@@ -170,19 +185,23 @@ def resolve_amount(db: Session, gym: Gym, member: GymMember, membership_id: str 
 
 
 def new_request(db: Session, gym: Gym, member: GymMember, ms: Membership | None, amount: int, acct: GymUpiAccount,
-                via: str, actor_id: str, note: str | None, expires_in_min: int) -> UpiPaymentRequest:
-    # one open request per member+amount: reuse it (double taps, retries)
+                via: str, actor_id: str, note: str | None, expires_in_min: int,
+                plan: Plan | None = None) -> UpiPaymentRequest:
+    # one open request per member+amount+purpose: reuse it (double taps, retries)
     existing = db.scalar(select(UpiPaymentRequest).where(
         UpiPaymentRequest.member_id == member.id, UpiPaymentRequest.amount_paise == amount,
         UpiPaymentRequest.status == "pending", UpiPaymentRequest.expires_at > utcnow(),
-        UpiPaymentRequest.upi_account_id == acct.id).limit(1))
+        UpiPaymentRequest.upi_account_id == acct.id,
+        UpiPaymentRequest.plan_id == plan.id if plan else UpiPaymentRequest.plan_id.is_(None)).limit(1))
     if existing:
         return existing
-    note = (note or f"{gym.code_prefix} {member.member_code}" + (f" {ms.plan_name}" if ms else ""))[:50]
+    label = f" {plan.name}" if plan else (f" {ms.plan_name}" if ms else "")
+    note = (note or f"{gym.code_prefix} {member.member_code}{label}")[:50]
     r = UpiPaymentRequest(gym_id=gym.id, member_id=member.id, membership_id=ms.id if ms else None,
                           upi_account_id=acct.id, vpa=acct.vpa, payee_name=acct.payee_name, amount_paise=amount,
                           ref=f"DMBL{secrets.token_hex(6).upper()}", note=re.sub(r"[^\w .\-/]", "", note),
                           status="pending", created_via=via, created_by=actor_id,
+                          purpose="renewal" if plan else "dues", plan_id=plan.id if plan else None,
                           expires_at=utcnow() + timedelta(minutes=expires_in_min))
     db.add(r)
     db.flush()
@@ -206,6 +225,26 @@ def _utr_taken(db: Session, gym_id: str, utr: str, exclude_req: str | None = Non
         q = q.where(UpiPaymentRequest.id != exclude_req)
     if db.scalar(q):
         raise ApiError(409, "DUPLICATE_REFERENCE", "This UTR was already submitted for another payment.")
+
+
+def _active_plan(db: Session, gym_id: str, plan_id: str) -> Plan:
+    plan = db.get(Plan, plan_id)
+    if not plan or plan.gym_id != gym_id:
+        raise ApiError(404, "NOT_FOUND", "That plan wasn’t found.")
+    if not plan.active:
+        raise ApiError(422, "PLAN_INACTIVE")
+    return plan
+
+
+def payment_staff(db: Session, gym_id: str) -> list[str]:
+    """Users at this gym who can verify payments (owner + roles with payments.record)."""
+    from app.permissions import effective_permissions
+    out = []
+    for st in db.scalars(select(GymStaff).where(GymStaff.gym_id == gym_id, GymStaff.status == "active")):
+        if "payments.record" in effective_permissions(st.role, st.staff_role, bool(st.can_record_payments),
+                                                      st.permissions):
+            out.append(st.user_id)
+    return out
 
 
 # ---------------- gym: UPI accounts ----------------
@@ -292,8 +331,16 @@ def create_request(body: UpiRequestIn, ctx: GymCtx = Depends(perm_ctx("payments.
     if not member or member.gym_id != gym.id:
         raise ApiError(404, "NOT_FOUND", "That member wasn’t found.")
     acct = default_account(db, gym.id, body.upi_account_id)
-    ms, amount = resolve_amount(db, gym, member, body.membership_id, body.amount_paise)
-    r = new_request(db, gym, member, ms, amount, acct, "staff", ctx.user.id, body.note, body.expires_in_min)
+    plan = None
+    if body.plan_id:
+        plan = _active_plan(db, gym.id, body.plan_id)
+        ms, amount = None, body.amount_paise or max(0, price_preview(db, plan, member)["total_paise"]
+                                                     - max(0, credit_balance(db, member.id)))
+        if amount <= 0:
+            raise validation({"plan_id": "The member’s credit already covers this plan — renew from their profile."})
+    else:
+        ms, amount = resolve_amount(db, gym, member, body.membership_id, body.amount_paise)
+    r = new_request(db, gym, member, ms, amount, acct, "staff", ctx.user.id, body.note, body.expires_in_min, plan)
     audit(db, gym.id, ctx.user.id, "upi.request", "upi_request", r.id,
           f"UPI request {rupees(amount)} for {member.display_name}")
     db.commit()
@@ -354,29 +401,57 @@ def verify_request(requestId: str, body: VerifyIn, ctx: GymCtx = Depends(perm_ct
         _utr_taken(db, gym.id, utr, exclude_req=r.id)
         check_duplicate_reference(db, gym.id, "upi", utr)
     member = db.get(GymMember, r.member_id)
-    ms = db.get(Membership, r.membership_id) if r.membership_id else None
-    if ms and ms.state == "cancelled":
-        ms = None
-    to_ms = min(r.amount_paise, membership_due(db, ms)) if ms else 0
-    paid_at = r.claimed_at or utcnow()
-    note = f"UPI {r.ref}" + (f" · {body.note}" if body.note else "")
-    main = None
-    if to_ms > 0:
-        main = add_payment(db, gym, ctx.user.id, member, ms, to_ms, "upi", utr, paid_at, note, source="app")
-    if r.amount_paise - to_ms > 0:
-        extra = add_payment(db, gym, ctx.user.id, member, None, r.amount_paise - to_ms, "upi",
-                            utr if main is None else None, paid_at, note + " (credit)", source="app")
-        main = main or extra
+    main = apply_upi_payment(db, gym, member, r, utr, ctx.user.id, body.note)
     r.status, r.utr, r.decided_by, r.decided_at, r.payment_id = "verified", utr, ctx.user.id, utcnow(), main.id
     audit(db, gym.id, ctx.user.id, "upi.verify", "upi_request", r.id,
           f"Verified UPI {rupees(r.amount_paise)} from {member.display_name}" + (f" (UTR {utr})" if utr else ""))
     audit(db, gym.id, ctx.user.id, "payment.record", "payment", main.id,
           f"Recorded {rupees(r.amount_paise)} UPI from {member.display_name}")
     db.commit()
-    enqueue("push.send", send_push, member.user_id, "member", "Payment received",
-            f"{gym.name} confirmed your UPI payment of {rupees(r.amount_paise)}. Receipt {main.receipt_no}.",
-            {"type": "upi_verified", "request_id": r.id, "payment_id": main.id})
+    msg = f"{gym.name} confirmed your UPI payment of {rupees(r.amount_paise)}. Receipt {main.receipt_no}."
+    if r.result_membership_id:
+        new_ms = db.get(Membership, r.result_membership_id)
+        msg = (f"Renewed! Your {new_ms.plan_name} membership at {gym.name} runs "
+               f"{new_ms.start_date.strftime('%d %b')} – {new_ms.end_date.strftime('%d %b %Y')}. Receipt {main.receipt_no}.")
+    enqueue("push.send", send_push, member.user_id, "member", "Payment received", msg,
+            {"type": "upi_verified", "request_id": r.id, "payment_id": main.id,
+             "membership_id": r.result_membership_id or r.membership_id})
     return ser_req(r, member, main.receipt_no)
+
+
+def apply_upi_payment(db: Session, gym: Gym, member: GymMember, r: UpiPaymentRequest, utr: str | None,
+                      actor_id: str, extra_note: str | None = None) -> Payment:
+    """Record a verified UPI payment so it lands on the member:
+    renewal → create the membership first; then pay the target membership (or whatever is due),
+    and anything left becomes credit that's immediately used for other dues."""
+    ms = db.get(Membership, r.membership_id) if r.membership_id else None
+    if ms and ms.state == "cancelled":
+        ms = None
+    if r.purpose == "renewal" and r.plan_id and not r.result_membership_id:
+        plan = _active_plan(db, gym.id, r.plan_id)
+        ms = create_membership(db, gym, actor_id, member, plan=plan, start=default_start(db, gym, member.id))
+        r.membership_id = r.result_membership_id = ms.id
+        audit(db, gym.id, actor_id, "membership.renew", "membership", ms.id,
+              f"Renewed {member.display_name} on {ms.plan_name} via app UPI ({ms.start_date} → {ms.end_date})")
+    if ms is None:  # no target: pay the oldest membership that has dues
+        for cand in db.scalars(select(Membership).where(Membership.member_id == member.id,
+                                                        Membership.state != "cancelled").order_by(Membership.start_date)):
+            if membership_due(db, cand) > 0:
+                ms = cand
+                break
+    to_ms = min(r.amount_paise, membership_due(db, ms)) if ms else 0
+    paid_at = r.claimed_at or utcnow()
+    note = f"UPI {r.ref}" + (f" · {extra_note}" if extra_note else "")
+    main = None
+    if to_ms > 0:
+        main = add_payment(db, gym, actor_id, member, ms, to_ms, "upi", utr, paid_at, note, source="app")
+    if r.amount_paise - to_ms > 0:
+        extra = add_payment(db, gym, actor_id, member, None, r.amount_paise - to_ms, "upi",
+                            utr if main is None else None, paid_at, note + " (credit)", source="app")
+        main = main or extra
+    db.flush()
+    settle_credit(db, gym, member, actor_id)
+    return main
 
 
 @router.post("/gyms/{gymId}/upi-requests/{requestId}/reject", response_model=UpiRequestOut,
@@ -496,9 +571,10 @@ def my_claim(requestId: str, body: ClaimIn, user: User = Depends(current_user), 
     audit(db, g.id, user.id, "upi.claim", "upi_request", r.id,
           f"{m.display_name} says they paid {rupees(r.amount_paise)} by UPI (UTR {utr})")
     db.commit()
-    enqueue("push.send", send_push, g.owner_user_id, "admin", "UPI payment to verify",
-            f"{m.display_name} paid {rupees(r.amount_paise)} (UTR {utr}). Check your bank and verify.",
-            {"type": "upi_claimed", "gym_id": g.id, "request_id": r.id})
+    for uid in payment_staff(db, g.id):
+        enqueue("push.send", send_push, uid, "admin", "UPI payment to verify",
+                f"{m.display_name} paid {rupees(r.amount_paise)} (UTR {utr}). Check your bank and verify.",
+                {"type": "upi_claimed", "gym_id": g.id, "request_id": r.id})
     return ser_req(r, m)
 
 
@@ -513,3 +589,51 @@ def my_cancel(requestId: str, user: User = Depends(current_user), db: Session = 
 
 
 _ = (and_, or_)
+
+
+# ---------------- member app: self renewal ----------------
+@me_router.get("/plans", summary="Plans I can renew to at my gym, with my price and start date",
+               description="`price` is what this member pays (offer price, joining fee for a first membership, GST). "
+                           "`credit_paise` is applied automatically, so `to_pay_paise` = price − credit.")
+def my_plans(member_id: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    m, g = _my_member(db, user, member_id)
+    start = default_start(db, g, m.id)
+    credit = max(0, credit_balance(db, m.id))
+    acct = db.scalar(select(GymUpiAccount.id).where(GymUpiAccount.gym_id == g.id, GymUpiAccount.active.is_(True)).limit(1))
+    out = []
+    for p in db.scalars(select(Plan).where(Plan.gym_id == g.id, Plan.active.is_(True)).order_by(Plan.sort_order, Plan.duration_days)):
+        pr = price_preview(db, p, m)
+        out.append({"id": p.id, "name": p.name, "duration_days": p.duration_days, "description": p.description,
+                    "facilities": p.facilities or [], "price": pr, "price_paise": pr["total_paise"],
+                    "to_pay_paise": max(0, pr["total_paise"] - credit),
+                    "start_date": start.isoformat(), "end_date": (start + timedelta(days=p.duration_days - 1)).isoformat()})
+    return {"member_id": m.id, "gym": {"id": g.id, "name": g.name}, "upi_enabled": bool(acct) and g.status == "active",
+            "credit_paise": credit, "items": out}
+
+
+@me_router.post("/renew", status_code=201, summary="Renew my membership from the app",
+                description="Pick a plan. If your credit covers it, the membership is created now (`mode: credit`). "
+                            "Otherwise you get a UPI payment (`mode: upi`, same as /me/upi-requests): pay, submit the "
+                            "UTR, and the new membership starts as soon as the gym verifies the payment.")
+def my_renew(body: RenewIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rate_limit(f"renew:{user.id}", 10, 3600)
+    m, g = _my_member(db, user, body.member_id)
+    if g.status != "active":
+        raise ApiError(423, "GYM_PENDING")
+    plan = _active_plan(db, g.id, body.plan_id)
+    total = price_preview(db, plan, m)["total_paise"]
+    credit = max(0, credit_balance(db, m.id))
+    if total - credit <= 0:
+        ms = create_membership(db, g, user.id, m, plan=plan, start=default_start(db, g, m.id))
+        db.flush()
+        settle_credit(db, g, m, user.id, ms.id)
+        audit(db, g.id, user.id, "membership.renew", "membership", ms.id,
+              f"{m.display_name} renewed on {plan.name} from the app using credit")
+        db.commit()
+        return {"mode": "credit", "membership": ser_membership(ms, g, db, can_pay=True, due=membership_due(db, ms))}
+    acct = default_account(db, g.id)
+    r = new_request(db, g, m, None, total - credit, acct, "member", user.id, None, 1440, plan)
+    audit(db, g.id, user.id, "upi.request", "upi_request", r.id,
+          f"{m.display_name} started a renewal to {plan.name} ({rupees(r.amount_paise)}) from the app")
+    db.commit()
+    return {"mode": "upi", "request": ser_req(r, m, plan_name=plan.name)}

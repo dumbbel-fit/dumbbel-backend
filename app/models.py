@@ -469,6 +469,9 @@ class UpiPaymentRequest(Base):
     status = mapped_column(Enum("pending", "claimed", "verified", "rejected", "expired", "cancelled",
                                 name="upi_req_status"), default="pending", nullable=False)
     created_via = mapped_column(Enum("staff", "member", name="upi_req_via"), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(10), default="dues", server_default="dues", nullable=False)  # dues|renewal
+    plan_id: Mapped[str | None] = mapped_column(String(36))  # renewal: plan to start once verified
+    result_membership_id: Mapped[str | None] = mapped_column(String(36))  # renewal: membership created on verify
     created_by: Mapped[str | None] = fk("users.id", nullable=True)
     utr: Mapped[str | None] = mapped_column(String(40))
     claimed_at = mapped_column(TS, nullable=True)
@@ -480,3 +483,18 @@ class UpiPaymentRequest(Base):
     created_at = created()
     updated_at = updated()
     __table_args__ = (Index("ix_upi_gym_status", "gym_id", "status", "created_at"),)
+
+
+class CreditApplication(Base):
+    """Member credit (advance / overpayment) used to pay a membership's dues. Not money in: just an allocation.
+    due(membership) = price − payments on it − credit applied to it."""
+    __tablename__ = "credit_applications"
+    id: Mapped[str] = pk()
+    gym_id: Mapped[str] = fk("gyms.id")
+    member_id: Mapped[str] = fk("gym_members.id", index=True)
+    membership_id: Mapped[str] = fk("memberships.id", index=True)
+    amount_paise: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(36))
+    reversed_at = mapped_column(TS, nullable=True)  # set when the credit behind it was voided
+    created_at = created()
+    updated_at = updated()

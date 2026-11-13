@@ -19,7 +19,7 @@ from app.services.storage import public_url
 from app.services.audit import audit, diff
 from app.services.cache import cache
 from app.services.core import (add_payment, check_duplicate_reference, create_membership, default_start,
-                               get_or_create_user, gym_settings, next_member_code, ser_member_basic,
+                               get_or_create_user, gym_settings, next_member_code, ser_member_basic, settle_credit,
                                ser_membership, ser_payment, user_names, validate_paid_at, validate_reference)
 from app.services.rules import LIVE, days_left, freezes_of, load_states, member_state, membership_due, membership_status, \
     pick_current
@@ -240,6 +240,7 @@ def create_member(body: MemberCreate, ctx: GymCtx = Depends(perm_ctx("members.ed
                           validate_paid_at(gym, p.paid_at))
         audit(db, gym.id, ctx.user.id, "payment.record", "payment", pay.id,
               f"Recorded {rupees(pay.amount_paise)} {pay.method.upper()} from {member.display_name}")
+    settle_credit(db, gym, member, ctx.user.id, ms.id if ms else None)
     body_out = {"member": ser_member_basic(member, user),
                 "membership": ser_membership(ms, gym, db, can_pay=ctx.can_pay,
                                              due=membership_due(db, ms)) if ms else None,
@@ -427,6 +428,7 @@ def assign_membership(memberId: str, body: MembershipCreate, ctx: GymCtx = Depen
         pay = add_payment(db, gym, ctx.user.id, m, ms, p.amount_paise, p.method, ref, validate_paid_at(gym, p.paid_at))
         audit(db, gym.id, ctx.user.id, "payment.record", "payment", pay.id,
               f"Recorded {rupees(pay.amount_paise)} {pay.method.upper()} from {m.display_name}")
+    settle_credit(db, gym, m, ctx.user.id, ms.id)  # use any advance/credit the member already has
     due = membership_due(db, ms)
     out = {"membership": ser_membership(ms, gym, db, can_pay=ctx.can_pay, due=due),
            "payment": ser_payment(pay, m.display_name, ms.plan_name, ctx.user.name) if pay else None}

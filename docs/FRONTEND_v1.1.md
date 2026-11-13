@@ -153,6 +153,25 @@ Each note: `{id, body, author{id,name}, created_at}`. (The old single `notes` fi
 
 ---
 
+## 3b. Payments land on the member — end to end (v1.2)
+- **Payment received at the desk:** a UPI request can be verified while `pending` or `expired`, not just `claimed`.
+  Show **"Payment received"** next to the QR and in the queue's *Waiting* tab. The UTR is optional, but recommended
+  because it blocks double-recording.
+- **Where verified money goes:** first the request's membership; if the request had none, the member's oldest unpaid
+  membership. Anything extra becomes **credit**.
+- **Credit is used automatically:** whenever a membership is created (desk renewal, app renewal, import) or money
+  comes in, credit pays open dues. Voiding a payment whose credit was already used puts those dues back.
+  Member detail: `credit_paise`; member app `/me/payments`: `credit_paise`.
+- **Renew at the desk by UPI:** `POST /gyms/{id}/upi-requests {member_id, plan_id}`. The amount defaults to the plan
+  price minus credit. On verify, the new membership is created (starting the day after the current one ends) and paid.
+- **Member app self-renewal:**
+  1. `GET /me/plans?member_id=` → `{upi_enabled, credit_paise, items[{id, name, duration_days, price{base, joining_fee, gst, total}, to_pay_paise, start_date, end_date, facilities}]}`
+  2. `POST /me/renew {member_id?, plan_id}` → `{mode:"credit", membership}` (credit covered it; done) or
+     `{mode:"upi", request}` → same pay screen as dues → claim the UTR → gym verifies → membership starts.
+  3. Poll `GET /me/upi-requests/{id}` while `pending`/`claimed`; on `verified`, reload `/me/memberships`.
+- Requests have `purpose` (`dues`|`renewal`), `plan_id`, `plan_name` and `result_membership_id`. Show "Renewal · Monthly" in the queue.
+- Staff with `payments.record` (not only the owner) get a push when a member submits a UTR.
+
 ## 4. Config / setup
 - `GET /config` now returns `firebase{apiKey, authDomain, projectId, appId, messagingSenderId, storageBucket}`.
   **Initialise Firebase from this** instead of hard-coded `VITE_FIREBASE_*` (keep the env values as a fallback).

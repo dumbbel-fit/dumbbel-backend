@@ -645,6 +645,10 @@ class UpiRequestOut(Out):
     payment_id: str | None = None
     receipt_no: str | None = None
     created_via: str | None = None
+    purpose: str | None = None
+    plan_id: str | None = None
+    plan_name: str | None = None
+    result_membership_id: str | None = None
     expires_at: str | None = None
     created_at: str | None = None
 

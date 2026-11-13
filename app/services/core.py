@@ -253,3 +253,60 @@ def user_names(db: Session, ids) -> dict[str, str]:
 
 def staff_names_for_gym(db: Session, gym_id: str, ids) -> dict[str, str]:
     return user_names(db, ids)
+
+
+
+# ---------------- credit ----------------
+def settle_credit(db: Session, gym: Gym, member: GymMember, actor_id: str | None = None,
+                  prefer_membership_id: str | None = None) -> int:
+    """Use the member's credit to pay their dues (preferred membership first, then oldest first).
+    If credit went negative (a credit payment was voided), reverse the newest applications.
+    Returns paise applied. Caller commits."""
+    from app.models import CreditApplication
+    from app.services.rules import credit_balance, membership_due
+    bal = credit_balance(db, member.id)
+    if bal < 0:
+        for ca in db.scalars(select(CreditApplication).where(CreditApplication.member_id == member.id,
+                                                             CreditApplication.reversed_at.is_(None))
+                             .order_by(CreditApplication.created_at.desc())):
+            if bal >= 0:
+                break
+            ca.reversed_at = utcnow()
+            bal += ca.amount_paise
+        db.flush()
+        return 0
+    if bal <= 0:
+        return 0
+    ms_list = list(db.scalars(select(Membership).where(Membership.member_id == member.id,
+                                                       Membership.state != "cancelled")
+                              .order_by(Membership.start_date)))
+    ms_list.sort(key=lambda m: (m.id != prefer_membership_id, m.start_date))
+    applied = 0
+    for ms in ms_list:
+        if bal <= 0:
+            break
+        due = membership_due(db, ms)
+        if due <= 0:
+            continue
+        use = min(due, bal)
+        db.add(CreditApplication(gym_id=gym.id, member_id=member.id, membership_id=ms.id, amount_paise=use,
+                                 created_by=actor_id))
+        db.flush()
+        bal -= use
+        applied += use
+    if applied:
+        from app.services.audit import audit
+        audit(db, gym.id, actor_id, "credit.apply", "member", member.id,
+              f"Used ₹{applied / 100:,.0f} credit towards {member.display_name}’s dues")
+    return applied
+
+
+def price_preview(db: Session, plan: Plan, member: GymMember | None, discount_paise: int = 0) -> dict:
+    """What a new membership on this plan would cost this member (same maths as create_membership)."""
+    base = plan_price(plan)
+    first = member is None or not db.scalar(select(Membership.id).where(Membership.member_id == member.id).limit(1))
+    joining = plan.joining_fee_paise if (plan.joining_fee_paise and first) else 0
+    taxable = base - discount_paise + joining
+    gst = round(taxable * plan.gst_rate / 100) if plan.gst_mode == "exclusive" and plan.gst_rate else 0
+    return {"base_paise": base, "discount_paise": discount_paise, "joining_fee_paise": joining, "gst_paise": gst,
+            "total_paise": taxable + gst}

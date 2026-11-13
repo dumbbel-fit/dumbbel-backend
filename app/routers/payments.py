@@ -15,7 +15,7 @@ from app.errors import ApiError, validation
 from app.models import Gym, GymMember, Membership, Payment, User
 from app.schemas import PaymentCreate, VoidIn
 from app.services.audit import audit
-from app.services.core import (add_payment, check_duplicate_reference, gym_settings, ser_payment, user_names,
+from app.services.core import (settle_credit, add_payment, check_duplicate_reference, gym_settings, ser_payment, user_names,
                                validate_paid_at, validate_reference)
 from app.services.receipt import render_receipt_pdf
 from app.services.rules import membership_due
@@ -141,6 +141,7 @@ def record_payment(body: PaymentCreate, ctx: GymCtx = Depends(perm_ctx("payments
                              ref if pay is None else None, paid_at, body.note or "Credit from overpayment")
         audit(db, gym.id, ctx.user.id, "payment.record", "payment", credit.id,
               f"Recorded {rupees(credit_amt)} {credit.method.upper()} as credit for {member.display_name}")
+    settle_credit(db, gym, member, ctx.user.id, ms.id if ms else None)  # an advance pays any open dues
     primary = pay or credit
     out = {"payment": ser_payment(primary, member.display_name, ms.plan_name if (ms and primary.membership_id) else None,
                                   ctx.user.name),
@@ -165,6 +166,8 @@ def void_payment(id: str, body: VoidIn, user: User = Depends(current_user), db: 
         raise ApiError(409, "NOT_ACTIVE", "This payment is already voided.")
     p.status, p.void_reason, p.voided_by, p.voided_at = "voided", body.reason, user.id, utcnow()
     member = db.get(GymMember, p.member_id)
+    db.flush()
+    settle_credit(db, ctx.gym, member, user.id)  # if voided money was credit already used, undo that use
     audit(db, p.gym_id, user.id, "payment.void", "payment", p.id,
           f"Voided {rupees(p.amount_paise)} {p.method.upper()} from {member.display_name}: {body.reason}",
           {"status": "recorded"}, {"status": "voided"})
