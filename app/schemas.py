@@ -92,6 +92,11 @@ class GymSettingsIn(BaseModel):
     avg_session_min: int | None = Field(None, ge=20, le=240, description="Typical workout length; used by the crowd meter")
     max_freeze_days: int | None = Field(None, ge=0, le=365)
     receipt_footer: str | None = Field(None, max_length=300)
+    explore_listed: bool | None = Field(None, description="Show this gym in DUMBBEL Explore (map + listing)")
+    visits_enabled: bool | None = Field(None, description="Let people book a visit / free trial from Explore")
+    about: str | None = Field(None, max_length=1500, description="Listing description shown in Explore")
+    visit_note: str | None = Field(None, max_length=300, description="Shown when booking, e.g. “Bring sports shoes and an ID”")
+    amenities: list[str] | None = Field(None, max_length=30, description="Extra amenities shown in Explore")
 
 
 class GymPatch(StrictModel):

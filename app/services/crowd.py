@@ -24,6 +24,8 @@ def _open_window(gym: Gym, d: date) -> tuple[time, time]:
     hrs = (gym.hours or {}).get(DAY_KEYS[d.weekday()]) if isinstance(gym.hours, dict) else None
     try:
         if hrs:
+            hrs = [(h["open"], h["close"]) if isinstance(h, dict) else h for h in (hrs if isinstance(hrs, list) else [hrs])
+                   if not (isinstance(h, dict) and (h.get("closed") or not h.get("open")))]
             o = min(h[0] for h in hrs)
             c = max(h[1] for h in hrs)
             oh, om = map(int, o.split(":"))

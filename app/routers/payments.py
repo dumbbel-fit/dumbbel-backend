@@ -71,6 +71,8 @@ def list_payments(from_: date | None = Query(None, alias="from"), to: date | Non
     for mth, n, s in tot_rows:
         by_method[mth] = int(s or 0)
         count += n
+    v_n, v_sum = db.execute(select(func.count(), func.sum(Payment.amount_paise))
+                            .where(*base, Payment.status == "voided")).one()
 
     q = select(Payment).where(*conds)
     c = decode_cursor(cursor)
@@ -90,7 +92,8 @@ def list_payments(from_: date | None = Query(None, alias="from"), to: date | Non
     names = user_names(db, [p.recorded_by for p in rows])
     return {"items": [ser_payment(p, members.get(p.member_id), plans.get(p.membership_id), names.get(p.recorded_by))
                       for p in rows],
-            "totals": {"collected_paise": sum(by_method.values()), "count": count, "by_method": by_method},
+            "totals": {"collected_paise": sum(by_method.values()), "total_paise": sum(by_method.values()), "count": count,
+                       "by_method": by_method, "voided_paise": int(v_sum or 0), "voided_count": int(v_n or 0)},
             "next_cursor": nxt}
 
 

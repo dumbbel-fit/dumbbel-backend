@@ -541,3 +541,28 @@ class GymPhoto(Base):
     created_by: Mapped[str | None] = mapped_column(String(36))
     created_at = created()
     updated_at = updated()
+
+
+class GymVisit(Base):
+    """A visit / free trial booked from DUMBBEL Explore. requested → confirmed → visited → joined
+    (or cancelled by either side, or no_show)."""
+    __tablename__ = "gym_visits"
+    id: Mapped[str] = pk()
+    gym_id: Mapped[str] = fk("gyms.id", index=True)
+    user_id: Mapped[str] = fk("users.id", index=True)
+    name: Mapped[str | None] = mapped_column(String(200))
+    phone: Mapped[str | None] = mapped_column(String(32))
+    visit_date = mapped_column(Date, nullable=False)
+    slot: Mapped[str] = mapped_column(String(5), nullable=False)  # "HH:MM" gym local time
+    note: Mapped[str | None] = mapped_column(String(500))
+    goal: Mapped[str | None] = mapped_column(String(40))
+    status = mapped_column(Enum("requested", "confirmed", "cancelled", "visited", "no_show", "joined", name="visit_status"),
+                           default="requested", server_default="requested", nullable=False)
+    cancelled_by: Mapped[str | None] = mapped_column(String(10))  # member | gym
+    gym_note: Mapped[str | None] = mapped_column(String(500))
+    handled_by: Mapped[str | None] = mapped_column(String(36))
+    handled_at = mapped_column(TS, nullable=True)
+    member_id: Mapped[str | None] = mapped_column(String(36))
+    created_at = created()
+    updated_at = updated()
+    __table_args__ = (Index("ix_visit_gym_status_date", "gym_id", "status", "visit_date"),)

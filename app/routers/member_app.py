@@ -155,7 +155,7 @@ def my_payments(member_id: str | None = None, user: User = Depends(current_user)
             "items": [{"id": p.id, "receipt_no": p.receipt_no, "plan_name": plans.get(p.membership_id),
                        "amount_paise": p.amount_paise, "method": p.method, "reference": p.reference,
                        "paid_at": iso(p.paid_at), "recorded_by_first_name": first_name(names.get(p.recorded_by)),
-                       "status": p.status} for p in pays]}
+                       "status": p.status, "source": p.source} for p in pays]}
 
 
 @router.post("/claims/{memberId}/dispute", status_code=204, summary="“This isn’t mine” — hide gym, flag to owner & support")
