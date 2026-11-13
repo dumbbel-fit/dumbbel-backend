@@ -20,7 +20,7 @@ from app.deps import GymCtx, Idem, current_user, gym_ctx, idem_header, perm_ctx
 from app.errors import ApiError
 from app.models import Checkin, Gym, GymMember, Membership, User
 from app.schemas import ManualCheckinIn, ScanIn
-from app.security import gym_static_sig, make_gym_display_token, parse_gym_display_token, parse_qr_token
+from app.security import gym_static_sig, parse_gym_display_token, parse_qr_token
 from app.services import storage
 from app.services.audit import audit
 from app.services.cache import cache, rate_limit
@@ -276,33 +276,33 @@ def _ensure_secret(db: Session, gym: Gym) -> str:
 def gym_qr_payload(db: Session, gym: Gym) -> dict:
     secret = _ensure_secret(db, gym)
     s = gym_settings(gym)
-    token, exp = make_gym_display_token(gym.id)
-    base = settings.checkin_url_base
+    url = f"{settings.checkin_url_base}?g={gym.id}&k={gym_static_sig(gym.id, secret)}"
+    # One standard QR per branch: the same code on screen and on paper. It never changes by itself —
+    # only when the owner presses "Reset QR" (POST /checkin-qr/rotate) because a copy leaked.
     return {"gym": {"id": gym.id, "name": gym.name, "status": gym.status},
-            "display": {"url": f"{base}?g={gym.id}&t={token}", "token": token,
-                        "expires_at": datetime.fromtimestamp(exp, timezone.utc).isoformat(), "refresh_in_sec": 20},
-            "poster": {"url": f"{base}?g={gym.id}&k={gym_static_sig(gym.id, secret)}",
-                       "enabled": bool(s.get("checkin_static_qr", True))},
+            "qr": {"url": url, "standard": True},
+            "display": {"url": url, "token": None, "expires_at": None, "refresh_in_sec": None},
+            "poster": {"url": url, "enabled": True},
             "settings": {"require_location": bool(s.get("checkin_require_location", True)),
                          "radius_m": int(s.get("checkin_radius_m", 150)),
-                         "static_qr": bool(s.get("checkin_static_qr", True))},
+                         "static_qr": True},
             "location": {"set": gym.lat is not None and gym.lng is not None,
                          "lat": float(gym.lat) if gym.lat is not None else None,
                          "lng": float(gym.lng) if gym.lng is not None else None}}
 
 
 @router.get("/gyms/{gymId}/checkin-qr", response_model=GymQrOut,
-            summary="This branch’s check-in QR: live screen QR (rotates) + printable poster QR (checkins.manage)",
-            description="Show `display.url` as a QR on a screen at the entrance and refetch every `refresh_in_sec` "
-                        "(each token is valid ~60 s, so photos of it stop working). `poster.url` is a fixed QR to print; "
-                        "it’s protected by the location check and can be revoked with POST /checkin-qr/rotate. "
-                        "Scanning either with a phone camera opens dumbbel.fit/checkin, which checks the member in.")
+            summary="This branch’s standard check-in QR (checkins.manage)",
+            description="`qr.url` is this branch’s one fixed check-in QR — print it or show it on a screen; it does not "
+                        "change over time (`display.url` and `poster.url` are the same URL, kept for older apps). "
+                        "It’s protected by the location check and only changes when the owner calls "
+                        "POST /checkin-qr/rotate. Scanning it with a phone camera opens dumbbel.fit/checkin.")
 def get_gym_qr(ctx: GymCtx = Depends(perm_ctx("checkins.manage")), db: Session = Depends(get_db)):
     return gym_qr_payload(db, ctx.gym)
 
 
 @router.post("/gyms/{gymId}/checkin-qr/rotate", response_model=GymQrOut,
-             summary="Revoke the printed poster QR and make a new one (settings.manage)")
+             summary="Reset this branch’s QR — old prints stop working (settings.manage)")
 def rotate_gym_qr(ctx: GymCtx = Depends(perm_ctx("settings.manage")), db: Session = Depends(get_db)):
     ctx.gym.checkin_secret = secrets.token_urlsafe(24)
     audit(db, ctx.gym.id, ctx.user.id, "checkin.qr_rotate", "gym", ctx.gym.id, "Replaced the printed check-in QR")
@@ -345,7 +345,7 @@ def self_checkin(body: SelfCheckinIn, user: User = Depends(current_user), db: Se
     if token:
         data = parse_gym_display_token(token)
         ok = bool(data and data["g"] == gym.id)
-    elif sig and gym.checkin_secret and gym_settings(gym).get("checkin_static_qr", True):
+    elif sig and gym.checkin_secret:
         ok = hmac.compare_digest(gym_static_sig(gym.id, gym.checkin_secret), sig)
     member = db.scalar(select(GymMember).where(GymMember.gym_id == gym.id, GymMember.user_id == user.id))
     if body.member_id and member and member.id != body.member_id:

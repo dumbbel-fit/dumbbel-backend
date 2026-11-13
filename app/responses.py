@@ -451,6 +451,7 @@ class CheckinResultOut(Out):
 
 class GymQrOut(Out):
     gym: dict[str, Any]
+    qr: dict[str, Any] | None = None
     display: dict[str, Any]
     poster: dict[str, Any]
     settings: dict[str, Any]
