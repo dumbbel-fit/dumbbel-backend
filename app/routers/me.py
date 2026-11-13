@@ -9,7 +9,7 @@ from app.config import settings
 from app.db import get_db
 from app.deps import Auth, current_user, get_auth
 from app.errors import ApiError
-from app.models import DeviceToken, GymStaff, Session as DbSession, User
+from app.models import DeviceToken, GymMember, GymStaff, Session as DbSession, User
 from app.routers.auth import staff_of
 from app.schemas import DeviceTokenIn, MePatch
 from app.services.core import ser_user
@@ -31,6 +31,9 @@ def patch_me(body: MePatch, user: User = Depends(current_user), db: Session = De
     data = body.model_dump(exclude_unset=True)
     if "photo_key" in data:
         user.photo_url = data.pop("photo_key")
+    if data.get("name") and data["name"].strip() and user.name and data["name"].strip() != user.name:
+        db.execute(update(GymMember).where(GymMember.user_id == user.id, GymMember.display_name == user.name)
+                   .values(display_name=data["name"].strip()))
     for k, v in data.items():
         setattr(user, k, v)
     db.commit()

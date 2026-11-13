@@ -139,9 +139,39 @@ def patch_staff(staffId: str, body: StaffPatch, ctx: GymCtx = Depends(perm_ctx("
     before = {"staff_role": st.staff_role, "permissions": st.permissions, "can_record_payments": st.can_record_payments,
               "status": st.status}
     data = body.model_dump(exclude_unset=True)
+    if "staff_role" in data and data["staff_role"] != st.staff_role and "permissions" not in data:
+        # changing the role applies that role's preset (old custom permissions would otherwise override it)
+        st.permissions = None
+        if "can_record_payments" not in data:
+            st.can_record_payments = False
     for k in ("staff_role", "permissions", "can_record_payments"):
         if k in data:
             setattr(st, k, data[k])
+    if data.get("phone"):
+        new_phone = normalize_phone(body.phone)
+        if new_phone != u.phone:
+            if u.first_login_at is not None:
+                raise ApiError(409, "PHONE_LOCKED_AFTER_LOGIN",
+                               "This person has already logged in, so their number can’t be changed. Remove them and add the new number.")
+            other = db.scalar(select(User).where(User.phone == new_phone))
+            if other:
+                if db.scalar(select(GymStaff.id).where(GymStaff.gym_id == ctx.gym.id, GymStaff.user_id == other.id)):
+                    raise ApiError(409, "ALREADY_STAFF")
+                st.user_id = other.id
+            else:
+                shared = db.scalar(select(GymMember.id).where(GymMember.user_id == u.id).limit(1)) \
+                    or db.scalar(select(func.count()).select_from(GymStaff).where(GymStaff.user_id == u.id)) > 1
+                if shared:
+                    nu = User(phone=new_phone, name=u.name)
+                    db.add(nu)
+                    db.flush()
+                    st.user_id = nu.id
+                else:
+                    u.phone = new_phone
+            db.flush()
+            u = db.get(User, st.user_id)
+    if data.get("name"):
+        u.name = data["name"].strip()
     if body.status == "deactivated" and st.status != "deactivated":
         st.status, st.deactivated_at = "deactivated", utcnow()
         db.flush()

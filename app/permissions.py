@@ -35,7 +35,7 @@ def effective_permissions(role: str, staff_role: str | None, can_record_payments
                           explicit: list | None) -> frozenset:
     if role == "owner":
         return ALL
-    if explicit:
+    if explicit is not None:
         perms = frozenset(p for p in explicit if p in ALL)
     else:
         perms = ROLE_PRESETS.get(staff_role or "staff", ROLE_PRESETS["staff"])

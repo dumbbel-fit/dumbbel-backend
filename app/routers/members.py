@@ -367,12 +367,12 @@ def patch_member(memberId: str, body: MemberPatch, ctx: GymCtx = Depends(perm_ct
     for f in ("emergency_contact", "notes"):
         if f in data:
             setattr(m, f, data[f])
-    if u.first_login_at is None:
-        for f in ("email", "dob", "gender"):
-            if f in data:
-                setattr(u, f, data[f])
-        if "photo_key" in data:
-            u.photo_url = data["photo_key"]
+    on_app = u.first_login_at is not None
+    for f in ("email", "dob", "gender"):
+        if f in data and not (on_app and data[f] is None):
+            setattr(u, f, data[f])
+    if data.get("photo_key"):
+        u.photo_url = data["photo_key"]
     after = ser_member_basic(m, u)
     b, a = diff(before, after)
     action = "member.archive" if a.get("status") == "archived" else "member.update"

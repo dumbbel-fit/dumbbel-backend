@@ -129,7 +129,14 @@ def patch_gym(body: GymPatch, ctx: GymCtx = Depends(perm_ctx("settings.manage"))
     data = body.model_dump(exclude_unset=True)
     if "settings" in data:
         s = gym_settings(g)
-        s.update({k: v for k, v in (data.pop("settings") or {}).items() if v is not None})
+        for k, v in (data.pop("settings") or {}).items():
+            if v is None:  # cleared: text settings become empty, others fall back to the default
+                if isinstance(DEFAULT_SETTINGS.get(k), str):
+                    s[k] = ""
+                else:
+                    s.pop(k, None)
+            else:
+                s[k] = v
         g.settings = s
     if "logo_key" in data:
         g.logo_url = data.pop("logo_key")

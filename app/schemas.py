@@ -271,6 +271,8 @@ class StaffCreate(BaseModel):
 
 
 class StaffPatch(StrictModel):
+    name: str | None = Field(None, min_length=1, max_length=200)
+    phone: Phone | None = Field(None, description="Only before the person first logs in (409 PHONE_LOCKED_AFTER_LOGIN)")
     staff_role: StaffRole | None = None
     permissions: list[str] | None = None
     can_record_payments: bool | None = None
