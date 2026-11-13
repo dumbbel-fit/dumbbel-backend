@@ -55,6 +55,7 @@ class MePatch(StrictModel):
     gender: Gender | None = None
     photo_key: str | None = None
     weekly_goal: int | None = Field(None, ge=2, le=6)
+    show_on_leaderboard: bool | None = None
 
 
 class DeviceTokenIn(BaseModel):
@@ -87,6 +88,8 @@ class GymSettingsIn(BaseModel):
     checkin_static_qr: bool | None = Field(None, description="Allow the printable poster QR (else only the live screen QR)")
     checkin_require_location: bool | None = Field(None, description="Member must be near the gym to check in")
     checkin_radius_m: int | None = Field(None, ge=30, le=2000)
+    capacity: int | None = Field(None, ge=1, le=5000, description="Max people inside at once — makes the crowd % exact")
+    avg_session_min: int | None = Field(None, ge=20, le=240, description="Typical workout length; used by the crowd meter")
     max_freeze_days: int | None = Field(None, ge=0, le=365)
     receipt_footer: str | None = Field(None, max_length=300)
 

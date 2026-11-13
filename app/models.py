@@ -67,6 +67,8 @@ class User(Base):
     gender = mapped_column(Enum("female", "male", "other", name="gender"), nullable=True)
     photo_url: Mapped[str | None] = mapped_column(String(500))
     weekly_goal: Mapped[int] = mapped_column(SmallInteger, default=4, server_default="4", nullable=False)
+    fitness_profile = mapped_column(JSON, nullable=True)  # age, height_cm, weight_kg, goal, diet, activity, allergies…
+    show_on_leaderboard: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1", nullable=False)
     first_login_at = mapped_column(TS, nullable=True)
     last_login_at = mapped_column(TS, nullable=True)
     is_platform_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
@@ -193,6 +195,7 @@ class GymMember(Base):
     joined_on = mapped_column(Date, nullable=False)
     last_checkin_at = mapped_column(TS, nullable=True)
     best_streak: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)  # cache (§4)
+    badges = mapped_column(JSON, nullable=True)  # {badge_key: earned_at ISO} — engagement
     claimed_at = mapped_column(TS, nullable=True)
     claim_disputed_at = mapped_column(TS, nullable=True)
     claim_dispute_note: Mapped[str | None] = mapped_column(Text)
@@ -506,3 +509,23 @@ class CreditApplication(Base):
     reversed_at = mapped_column(TS, nullable=True)  # set when the credit behind it was voided
     created_at = created()
     updated_at = updated()
+
+
+class FoodLog(Base):
+    """Member food & water log (nutrition tab). Macros entered or estimated by the AI from free text."""
+    __tablename__ = "food_logs"
+    id: Mapped[str] = pk()
+    user_id: Mapped[str] = fk("users.id")
+    local_date = mapped_column(Date, nullable=False)
+    meal: Mapped[str] = mapped_column(String(12), nullable=False)  # breakfast|lunch|snack|dinner|water
+    text: Mapped[str | None] = mapped_column(String(300))
+    items = mapped_column(JSON, nullable=True)
+    kcal: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    protein_g: Mapped[float] = mapped_column(Numeric(6, 1), default=0, server_default="0", nullable=False)
+    carbs_g: Mapped[float] = mapped_column(Numeric(6, 1), default=0, server_default="0", nullable=False)
+    fat_g: Mapped[float] = mapped_column(Numeric(6, 1), default=0, server_default="0", nullable=False)
+    water_ml: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    source: Mapped[str] = mapped_column(String(8), default="manual", server_default="manual", nullable=False)  # manual|ai
+    created_at = created()
+    updated_at = updated()
+    __table_args__ = (Index("ix_food_user_date", "user_id", "local_date"),)

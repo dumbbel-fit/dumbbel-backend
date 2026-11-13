@@ -149,6 +149,15 @@ def process_checkin(db: Session, ctx, method: str, *, token: str | None = None,
     member.best_streak = max(member.best_streak or 0, best)
     extra["streak"] = cur
     out = finish("success")
+    try:  # engagement: XP / level / newly earned badges for the celebration screen
+        from app.services.progress import sync_badges
+        u = db.get(User, member.user_id)
+        _, new_badges, lvl = sync_badges(db, member, gym, u.weekly_goal if u else 4)
+        out["level"] = {k: lvl[k] for k in ("level", "name", "xp", "next_level_xp", "next_name", "progress")}
+        out["new_badges"] = [{"key": b["key"], "name": b["name"], "description": b["description"], "icon": b["icon"]}
+                             for b in new_badges]
+    except Exception:  # never block a check-in on gamification
+        pass
     if method != "self":  # the member is looking at the result on their own phone in that case
         enqueue("push.send", send_push, member.user_id, "member", "Checked in",
                 f"Checked in at {gym.name} · day {cur}", {"type": "checkin_success", "gym_id": gym.id})

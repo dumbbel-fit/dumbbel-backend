@@ -70,6 +70,8 @@ TAGS = [
     {"name": "Member app", "description": "Member’s own memberships, rotating QR, history, insights, payments."},
     {"name": "UPI payments", "description": "Members pay straight to the gym’s own UPI ID (0% fees). Request → "
                                             "member pays via QR/intent → submits UTR → staff verify → payment + receipt recorded."},
+    {"name": "Member engagement & AI", "description": "Crowd meter, XP/levels/badges, leaderboard, nutrition & food "
+                                                      "log, AI coach (Groq), daily insight, owner AI briefing."},
     {"name": "Internal console", "description": "Platform admins only: gym approvals, support phone change."},
     {"name": "Files", "description": "Presigned uploads (S3/R2 or local)."},
 ]
@@ -139,11 +141,11 @@ async def request_context(request: Request, call_next):
     return resp
 
 
-from app.routers import auth, checkins, gyms, imports, internal, me, member_app, members, payments, staff, upi  # noqa: E402
+from app.routers import auth, checkins, engage, gyms, imports, internal, me, member_app, members, payments, staff, upi  # noqa: E402
 
 P = settings.api_prefix
 for r in (auth.router, me.public, me.router, member_app.router, gyms.router, members.router, payments.router,
-          checkins.router, checkins.me_router, imports.public, imports.router, staff.router, upi.router, upi.me_router, internal.router,
+          checkins.router, checkins.me_router, engage.me, engage.gym, imports.public, imports.router, staff.router, upi.router, upi.me_router, internal.router,
           internal.uploads):
     app.include_router(r, prefix=P)
 

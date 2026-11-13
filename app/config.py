@@ -44,6 +44,11 @@ class Settings(BaseSettings):
 
     # Which phone login the apps use: "firebase" (SMS sent by the Firebase SDK in the app) or "2factor"
     auth_provider: str = "firebase"
+    # Groq LLM: nutrition coach, food estimates, daily insight, owner briefing
+    groq_api_key: str | None = None
+    groq_model: str | None = None  # default openai/gpt-oss-120b
+    groq_fallback_model: str = "openai/gpt-oss-20b"
+
     # Firebase Phone Auth (alternative to 2Factor; Google sends the SMS, no DLT needed)
     firebase_project_id: str | None = None
     firebase_web_api_key: str | None = None

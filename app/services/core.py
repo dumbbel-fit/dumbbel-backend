@@ -169,7 +169,7 @@ def ser_user(u: User) -> dict:
     return {"id": u.id, "name": u.name, "phone": u.phone, "email": u.email, "dob": dstr(u.dob), "gender": u.gender,
             "photo_url": storage.public_url(u.photo_url), "weekly_goal": u.weekly_goal,
             "first_login_at": iso(u.first_login_at), "deletion_requested_at": iso(u.deletion_requested_at),
-            "is_platform_admin": bool(u.is_platform_admin)}
+            "is_platform_admin": bool(u.is_platform_admin), "show_on_leaderboard": bool(u.show_on_leaderboard)}
 
 
 def ser_gym(g: Gym, full: bool = True) -> dict:
