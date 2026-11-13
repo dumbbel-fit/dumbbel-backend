@@ -4,6 +4,7 @@ import re
 import string
 
 from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -11,9 +12,10 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.deps import GymCtx, current_user, gym_ctx, owner_ctx, perm_ctx
 from app.errors import ApiError
-from app.models import Gym, GymDocument, GymStaff, Membership, Plan, User
+from app.models import Gym, GymDocument, GymPhoto, GymStaff, Membership, Plan, User
 from app.schemas import DocumentIn, GymCreate, GymPatch, PlanCreate, PlanPatch
 from app.services.audit import audit, diff
+from app.services import storage
 from app.services.core import DEFAULT_SETTINGS, gym_settings, ser_gym, ser_plan
 from app.utils import iso, normalize_phone, rupees, today_in, tz, utcnow
 from app.responses import DocRoute, ERRORS, DocumentOut, GymListOut, GymOut, PlanListOut, PlanOut, VerificationOut
@@ -98,8 +100,12 @@ def verification(ctx: GymCtx = Depends(perm_ctx("settings.manage")), db: Session
     docs = db.scalars(select(GymDocument).where(GymDocument.gym_id == g.id).order_by(GymDocument.created_at)).all()
     review_state = {"pending": "in_progress" if docs else "waiting", "active": "done",
                     "rejected": "rejected", "suspended": "suspended"}[g.status]
-    return {"status": g.status,
+    photos = db.scalars(select(GymPhoto).where(GymPhoto.gym_id == g.id).order_by(GymPhoto.created_at)).all()
+    return {"status": g.status, "photos": len(photos), "photos_required": MIN_PHOTOS,
+            "ready_for_review": len(photos) >= MIN_PHOTOS and bool(docs),
             "steps": [{"key": "account", "done_at": iso(g.created_at)},
+                      {"key": "photos", "count": len(photos), "required": MIN_PHOTOS,
+                       "done_at": iso(photos[MIN_PHOTOS - 1].created_at) if len(photos) >= MIN_PHOTOS else None},
                       {"key": "documents", "done_at": iso(docs[-1].created_at) if docs else None,
                        "items": [{"id": d.id, "type": d.type, "status": d.status, "review_note": d.review_note}
                                  for d in docs]},
@@ -108,8 +114,9 @@ def verification(ctx: GymCtx = Depends(perm_ctx("settings.manage")), db: Session
 
 
 @router.get("/gyms/{gymId}", response_model=GymOut, summary="Gym profile (any staff)")
-def get_gym(ctx: GymCtx = Depends(gym_ctx)):
+def get_gym(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
     d = ser_gym(ctx.gym)
+    d["photos"] = _photos(db, ctx.gym.id)
     d["me"] = {"role": ctx.staff.role, "staff_role": ctx.role_name, "can_record_payments": ctx.has("payments.record"),
                "permissions": sorted(ctx.perms)}
     return d
@@ -139,6 +146,59 @@ def patch_gym(body: GymPatch, ctx: GymCtx = Depends(perm_ctx("settings.manage"))
     audit(db, g.id, ctx.user.id, "gym.update", "gym", g.id, "Updated gym profile", b, a)
     db.commit()
     return ser_gym(g)
+
+
+# ---------------- photos ----------------
+MIN_PHOTOS = 3
+MAX_PHOTOS = 12
+
+
+def _photos(db: Session, gym_id: str) -> list[dict]:
+    return [{"id": x.id, "url": storage.public_url(x.file_key), "sort_order": x.sort_order, "created_at": iso(x.created_at)}
+            for x in db.scalars(select(GymPhoto).where(GymPhoto.gym_id == gym_id).order_by(GymPhoto.sort_order, GymPhoto.created_at))]
+
+
+class PhotoIn(BaseModel):
+    file_key: str
+
+
+@router.get("/gyms/{gymId}/photos", summary="Gym photos (any staff)")
+def list_photos(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+    items = _photos(db, ctx.gym.id)
+    return {"items": items, "count": len(items), "required": MIN_PHOTOS, "max": MAX_PHOTOS}
+
+
+@router.post("/gyms/{gymId}/photos", status_code=201, summary="Add a gym photo (settings.manage)",
+             description=f"Upload with POST /uploads/presign purpose `gym_photo` first. At least {MIN_PHOTOS} photos are required "
+                         f"before the DUMBBEL team can approve a gym; up to {MAX_PHOTOS}.")
+def add_photo(body: PhotoIn, ctx: GymCtx = Depends(perm_ctx("settings.manage")), db: Session = Depends(get_db)):
+    if not body.file_key.startswith("gym_photo/"):
+        raise ApiError(422, "VALIDATION", None, {"fields": {"file_key": "Upload with purpose gym_photo first."}})
+    n = db.scalar(select(func.count()).select_from(GymPhoto).where(GymPhoto.gym_id == ctx.gym.id)) or 0
+    if n >= MAX_PHOTOS:
+        raise ApiError(409, "TOO_MANY_PHOTOS", f"You can add up to {MAX_PHOTOS} photos. Remove one first.")
+    ph = GymPhoto(gym_id=ctx.gym.id, file_key=body.file_key, sort_order=n, created_by=ctx.user.id)
+    db.add(ph)
+    db.flush()
+    audit(db, ctx.gym.id, ctx.user.id, "gym.photo_add", "gym", ctx.gym.id, f"Added a gym photo ({n + 1})")
+    db.commit()
+    return {"id": ph.id, "url": storage.public_url(ph.file_key), "count": n + 1, "required": MIN_PHOTOS}
+
+
+@router.delete("/gyms/{gymId}/photos/{photoId}", status_code=204, summary="Remove a gym photo (settings.manage)",
+               description=f"An approved gym must keep at least {MIN_PHOTOS} photos (409 MIN_PHOTOS).")
+def delete_photo(photoId: str, ctx: GymCtx = Depends(perm_ctx("settings.manage")), db: Session = Depends(get_db)):
+    ph = db.get(GymPhoto, photoId)
+    if not ph or ph.gym_id != ctx.gym.id:
+        raise ApiError(404, "NOT_FOUND", "That photo wasn’t found.")
+    n = db.scalar(select(func.count()).select_from(GymPhoto).where(GymPhoto.gym_id == ctx.gym.id)) or 0
+    if ctx.gym.status == "active" and n <= MIN_PHOTOS:
+        raise ApiError(409, "MIN_PHOTOS", f"An approved gym needs at least {MIN_PHOTOS} photos. Add another before removing this one.")
+    db.delete(ph)
+    audit(db, ctx.gym.id, ctx.user.id, "gym.photo_remove", "gym", ctx.gym.id, "Removed a gym photo")
+    db.commit()
+    from fastapi import Response
+    return Response(status_code=204)
 
 
 # ---------------- plans ----------------

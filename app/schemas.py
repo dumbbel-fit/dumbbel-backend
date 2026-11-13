@@ -298,6 +298,6 @@ class ChangePhoneIn(BaseModel):
 
 
 class PresignIn(BaseModel):
-    purpose: Literal["member_photo", "gym_logo", "gym_document", "import_file"]
+    purpose: Literal["member_photo", "gym_logo", "gym_photo", "gym_document", "import_file"]
     content_type: str = Field(..., examples=["image/jpeg"])
     size: int = Field(..., gt=0, examples=[123456])

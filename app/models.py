@@ -529,3 +529,15 @@ class FoodLog(Base):
     created_at = created()
     updated_at = updated()
     __table_args__ = (Index("ix_food_user_date", "user_id", "local_date"),)
+
+
+class GymPhoto(Base):
+    """Photos of the gym (at least 3 are required before a gym can be approved)."""
+    __tablename__ = "gym_photos"
+    id: Mapped[str] = pk()
+    gym_id: Mapped[str] = fk("gyms.id", index=True)
+    file_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(36))
+    created_at = created()
+    updated_at = updated()

@@ -25,6 +25,9 @@ router = APIRouter(prefix="/internal", tags=["Internal console"], route_class=Do
 uploads = APIRouter(tags=["Files"], route_class=DocRoute, responses=ERRORS)
 
 
+MIN_GYM_PHOTOS = 3
+
+
 def _gym_out(db: Session, g: Gym, docs: bool = False) -> dict:
     owner = db.get(User, g.owner_user_id)
     d = {**ser_gym(g), "owner": {"id": owner.id, "name": owner.name, "phone": owner.phone} if owner else None,
@@ -32,6 +35,10 @@ def _gym_out(db: Session, g: Gym, docs: bool = False) -> dict:
                     "staff": db.scalar(select(func.count()).select_from(GymStaff).where(
                         GymStaff.gym_id == g.id, GymStaff.status != "deactivated"))}}
     if docs:
+        from app.models import GymPhoto
+        d["photos"] = [{"id": p.id, "url": storage.public_url(p.file_key)} for p in db.scalars(
+            select(GymPhoto).where(GymPhoto.gym_id == g.id).order_by(GymPhoto.sort_order, GymPhoto.created_at))]
+        d["photos_required"] = MIN_GYM_PHOTOS
         d["documents"] = [{"id": x.id, "type": x.type, "status": x.status, "review_note": x.review_note,
                            "url": storage.signed_get_url(x.file_key, 300), "created_at": iso(x.created_at)}
                           for x in db.scalars(select(GymDocument).where(GymDocument.gym_id == g.id)
@@ -83,6 +90,12 @@ def _transition(action: str):
         if g.status not in allowed:
             raise ApiError(409, "NOT_ACTIVE", f"Can’t {action} a gym that is {g.status}.")
         reason = body.reason if body else None
+        if action == "approve":
+            from app.models import GymPhoto
+            n_photos = db.scalar(select(func.count()).select_from(GymPhoto).where(GymPhoto.gym_id == g.id)) or 0
+            if n_photos < MIN_GYM_PHOTOS:
+                raise ApiError(409, "PHOTOS_REQUIRED", f"This gym has {n_photos} photo{'s' if n_photos != 1 else ''}. "
+                               f"At least {MIN_GYM_PHOTOS} are needed before approval.", {"photos": n_photos, "required": MIN_GYM_PHOTOS})
         if action in ("reject", "suspend") and not reason:
             raise validation({"reason": "A reason is required; it’s shown to the owner."})
         before = g.status
@@ -164,6 +177,7 @@ def remove_admin(userId: str, admin: User = Depends(platform_admin), db: Session
 # ---------------- uploads ----------------
 LIMITS = {"member_photo": ({"image/jpeg", "image/png", "image/webp"}, 5 * 1024 * 1024),
           "gym_logo": ({"image/jpeg", "image/png", "image/webp"}, 5 * 1024 * 1024),
+          "gym_photo": ({"image/jpeg", "image/png", "image/webp"}, 8 * 1024 * 1024),
           "gym_document": ({"application/pdf", "image/jpeg", "image/png"}, 5 * 1024 * 1024),
           "import_file": ({"text/csv", "application/vnd.ms-excel", "application/csv", "text/plain",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}, 10 * 1024 * 1024)}
