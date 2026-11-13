@@ -81,6 +81,11 @@ def my_progress(member_id: str | None = None, user: User = Depends(current_user)
             "week": {"visits": sum(1 for d in days if ws <= d <= today), "goal": user.weekly_goal,
                      "days": [1 if (ws + timedelta(days=i)) in set(days) else 0 for i in range(7)]},
             "month_visits": sum(1 for d in days if d.year == today.year and d.month == today.month),
+            "weeks": [{"start": (ws - timedelta(weeks=k)).isoformat(),
+                       "label": (ws - timedelta(weeks=k)).strftime("%-d %b"),
+                       "visits": sum(1 for d in days if ws - timedelta(weeks=k) <= d < ws - timedelta(weeks=k - 1))}
+                      for k in range(7, -1, -1)],
+            "first_visit": days[0].isoformat() if days else None,
             "milestones": [{"days": t, "label": f"{t}-day streak", "done": met["best_streak"] >= t,
                             "hint": f"{t - met['streak']} to go" if t == nxt else None} for t in MILESTONES],
             "badges": badges_for(met, dict(m.badges or {})),
