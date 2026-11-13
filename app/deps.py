@@ -43,7 +43,10 @@ def get_auth(request: Request, creds: HTTPAuthorizationCredentials | None = Depe
     user = db.get(User, claims["sub"])
     if not user or user.deleted_at:
         raise ApiError(401, "SESSION_EXPIRED")
-    rate_limit(f"user:{user.id}", 120, 60)
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        rate_limit(f"user:r:{user.id}", 600, 60)  # dashboards fan out many reads
+    else:
+        rate_limit(f"user:w:{user.id}", 120, 60)
     request.state.user_id = user.id
     return Auth(user=user, session=sess, app=claims.get("app", sess.app))
 
@@ -54,7 +57,7 @@ def current_user(auth: Auth = Depends(get_auth)) -> User:
 
 def platform_admin(auth: Auth = Depends(get_auth)) -> User:
     if not auth.user.is_platform_admin:
-        raise ApiError(403, "FORBIDDEN")
+        raise ApiError(403, "NOT_PLATFORM_ADMIN", "This account isn’t part of the DUMBBEL team console.")
     return auth.user
 
 
@@ -69,16 +72,34 @@ class GymCtx:
         return self.staff.role == "owner"
 
     @property
+    def perms(self) -> frozenset:
+        from app.permissions import effective_permissions
+        return effective_permissions(self.staff.role, self.staff.staff_role, bool(self.staff.can_record_payments),
+                                     self.staff.permissions)
+
+    @property
+    def role_name(self) -> str:
+        return "owner" if self.is_owner else (self.staff.staff_role or "staff")
+
+    def has(self, perm: str) -> bool:
+        return perm in self.perms
+
+    def require(self, perm: str):
+        if not self.has(perm):
+            code = "PAYMENT_NOT_ALLOWED" if perm.startswith("payments.") else "FORBIDDEN"
+            raise ApiError(403, code, f"Your role doesn’t allow this ({perm}).", {"permission": perm})
+
+    @property
     def can_pay(self) -> bool:
-        return self.is_owner or bool(self.staff.can_record_payments)
+        """Money fields are only returned to roles with payments.view."""
+        return self.has("payments.view")
 
     def require_owner(self):
         if not self.is_owner:
             raise ApiError(403, "OWNER_ONLY")
 
     def require_payments(self):
-        if not self.can_pay:
-            raise ApiError(403, "PAYMENT_NOT_ALLOWED")
+        self.require("payments.record")
 
     def require_approved(self):
         if self.gym.status != "active":
@@ -111,8 +132,17 @@ def owner_ctx(ctx: GymCtx = Depends(gym_ctx)) -> GymCtx:
     return ctx
 
 
+def perm_ctx(perm: str):
+    """Dependency factory: gym context that requires one permission."""
+    def dep(ctx: GymCtx = Depends(gym_ctx)) -> GymCtx:
+        ctx.require(perm)
+        return ctx
+    dep.__name__ = f"require_{perm.replace('.', '_')}"
+    return dep
+
+
 def payments_ctx(ctx: GymCtx = Depends(gym_ctx)) -> GymCtx:
-    ctx.require_payments()
+    ctx.require("payments.view")
     return ctx
 
 

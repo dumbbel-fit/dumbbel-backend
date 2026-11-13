@@ -10,19 +10,20 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.deps import GymCtx, gym_ctx
+from app.deps import GymCtx, gym_ctx, perm_ctx
 from app.errors import ApiError, validation
 from app.models import GymMember, Import, ImportRow, Invite, Plan, User
 from app.schemas import ImportRowPatch, InvitesIn, MappingIn
 from app.services import importer, storage
 from app.services.audit import audit
 from app.services.jobs import enqueue
-from app.services.notify import queue_invite
+from app.services.notify import send_invite_now
+from app.responses import DocRoute, ERRORS, ImportListOut, ImportOut, ImportRowPatchOut, ImportRowsOut, ImportUploadOut, MappingOut, InviteBatchOut, InviteOneOut
 from app.services.rules import LIVE, load_states
 from app.utils import clamp_limit, decode_cursor, encode_cursor, iso, normalize_phone, utcnow, uuid7
 
-router = APIRouter(tags=["Import & invites"])
-public = APIRouter(tags=["Import & invites"])
+router = APIRouter(tags=["Import & invites"], route_class=DocRoute, responses=ERRORS)
+public = APIRouter(tags=["Import & invites"], route_class=DocRoute, responses=ERRORS)
 
 TEMPLATE = ("Name,Mobile,Plan,Start Date,End Date,Paid,Email,DOB,Gender,Notes\r\n"
             "Ravi Teja Naidu,9849011234,Quarterly,01/11/2026,31/01/2027,5400,ravi@example.com,14/02/1995,Male,\r\n")
@@ -43,13 +44,21 @@ def _get_import(db: Session, ctx: GymCtx, import_id: str) -> Import:
 
 
 def ser_import(imp: Import) -> dict:
+    c = imp.counts or {}
+    total = c.get("to_commit") if imp.status in ("committing", "completed") else c.get("rows")
+    processed = c.get("processed", 0) if imp.status in ("committing", "completed") else (
+        c.get("rows", 0) if imp.status not in ("uploaded", "parsing") else 0)
+    progress = 1.0 if imp.status in ("completed", "previewed") else (
+        round(processed / total, 3) if total else 0.0)
     return {"id": imp.id, "status": imp.status, "file_name": imp.file_name, "file_size": imp.file_size,
-            "counts": imp.counts or {}, "columns": imp.column_info if imp.status not in ("uploaded", "parsing") else [],
+            "counts": c, "progress": progress, "processed": processed, "total": total,
+            "columns": imp.column_info if imp.status not in ("uploaded", "parsing") else [],
+            "detected_columns": imp.column_info if imp.status not in ("uploaded", "parsing") else [],
             "mapping": imp.mapping, "error": imp.error, "created_at": iso(imp.created_at),
             "committed_at": iso(imp.committed_at), "completed_at": iso(imp.completed_at)}
 
 
-@router.post("/gyms/{gymId}/imports", status_code=202, summary="Upload member file (multipart `file`, or JSON {file_key})",
+@router.post("/gyms/{gymId}/imports", response_model=ImportUploadOut, status_code=202, summary="Upload member file (multipart `file`, or JSON {file_key})",
              description="CSV / XLS / XLSX, max 10 MB / 5,000 rows. Parsing, auto-mapping and classification run as a job; "
                          "poll GET import until status is `previewed`.",
              openapi_extra={"requestBody": {"content": {
@@ -57,7 +66,7 @@ def ser_import(imp: Import) -> dict:
                      "file": {"type": "string", "format": "binary"}}, "required": ["file"]}},
                  "application/json": {"schema": {"type": "object", "properties": {
                      "file_key": {"type": "string"}, "file_name": {"type": "string"}}, "required": ["file_key"]}}}}})
-async def upload(request: Request, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+async def upload(request: Request, ctx: GymCtx = Depends(perm_ctx("imports.manage")), db: Session = Depends(get_db)):
     ctype = request.headers.get("content-type", "")
     if ctype.startswith("multipart/form-data"):
         form = await request.form()
@@ -100,8 +109,8 @@ async def upload(request: Request, ctx: GymCtx = Depends(gym_ctx), db: Session =
     return {"import_id": imp.id, "status": "parsing", "rows": len(rows)}
 
 
-@router.get("/gyms/{gymId}/imports", summary="Import history")
-def history(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db),
+@router.get("/gyms/{gymId}/imports", response_model=ImportListOut, summary="Import history")
+def history(ctx: GymCtx = Depends(perm_ctx("imports.manage")), db: Session = Depends(get_db),
             limit: int = Query(50, ge=1, le=100), cursor: str | None = None):
     q = select(Import).where(Import.gym_id == ctx.gym.id)
     c = decode_cursor(cursor)
@@ -115,8 +124,8 @@ def history(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db),
                       for r in rows[:lim]], "next_cursor": nxt}
 
 
-@router.get("/gyms/{gymId}/imports/{importId}", summary="Import status, counts and detected columns")
-def get_import(importId: str, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+@router.get("/gyms/{gymId}/imports/{importId}", response_model=ImportOut, summary="Import status, counts and detected columns")
+def get_import(importId: str, ctx: GymCtx = Depends(perm_ctx("imports.manage")), db: Session = Depends(get_db)):
     return ser_import(_get_import(db, ctx, importId))
 
 
@@ -125,8 +134,8 @@ def _require_preview(imp: Import):
         raise ApiError(409, "NOT_ACTIVE", f"This import is {imp.status}; it can’t be changed now.")
 
 
-@router.patch("/gyms/{gymId}/imports/{importId}/mapping", summary="Confirm / change column mapping (re-classifies rows)")
-def patch_mapping(importId: str, body: MappingIn, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+@router.patch("/gyms/{gymId}/imports/{importId}/mapping", response_model=MappingOut, summary="Confirm / change column mapping (re-classifies rows)")
+def patch_mapping(importId: str, body: MappingIn, ctx: GymCtx = Depends(perm_ctx("imports.manage")), db: Session = Depends(get_db)):
     imp = _get_import(db, ctx, importId)
     _require_preview(imp)
     allowed = set(importer.FIELDS)
@@ -161,10 +170,10 @@ def _ser_row(r: ImportRow, existing: dict) -> dict:
     return d
 
 
-@router.get("/gyms/{gymId}/imports/{importId}/rows", summary="Preview rows by outcome")
+@router.get("/gyms/{gymId}/imports/{importId}/rows", response_model=ImportRowsOut, summary="Preview rows by outcome")
 def rows(importId: str, outcome: Literal["ready", "existing", "fix", "skipped", "imported", "failed"] | None = None,
          limit: int = Query(50, ge=1, le=100), cursor: str | None = None,
-         ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+         ctx: GymCtx = Depends(perm_ctx("imports.manage")), db: Session = Depends(get_db)):
     imp = _get_import(db, ctx, importId)
     q = select(ImportRow).where(ImportRow.import_id == imp.id)
     if outcome:
@@ -181,8 +190,8 @@ def rows(importId: str, outcome: Literal["ready", "existing", "fix", "skipped", 
     return {"items": [_ser_row(r, existing) for r in items], "next_cursor": nxt}
 
 
-@router.patch("/gyms/{gymId}/imports/{importId}/rows/{rowId}", summary="Fix / skip a row (re-validated)")
-def patch_row(importId: str, rowId: str, body: ImportRowPatch, ctx: GymCtx = Depends(gym_ctx),
+@router.patch("/gyms/{gymId}/imports/{importId}/rows/{rowId}", response_model=ImportRowPatchOut, summary="Fix / skip a row (re-validated)")
+def patch_row(importId: str, rowId: str, body: ImportRowPatch, ctx: GymCtx = Depends(perm_ctx("imports.manage")),
               db: Session = Depends(get_db)):
     imp = _get_import(db, ctx, importId)
     _require_preview(imp)
@@ -212,35 +221,75 @@ def patch_row(importId: str, rowId: str, body: ImportRowPatch, ctx: GymCtx = Dep
     return {"row": _ser_row(r, existing), "counts": imp.counts}
 
 
-@router.post("/gyms/{gymId}/imports/{importId}/commit", status_code=202, summary="Commit import (job; poll GET import)")
-def commit(importId: str, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
-    imp = _get_import(db, ctx, importId)
-    _require_preview(imp)
+STALE_COMMIT = timedelta(minutes=10)
+
+
+def _start_commit(db: Session, imp: Import) -> int:
     todo = db.scalar(select(func.count()).select_from(ImportRow).where(
         ImportRow.import_id == imp.id, ImportRow.outcome.in_(("ready", "existing"))))
     if not todo:
         raise validation({"rows": "There are no ready rows to import."})
+    c = dict(imp.counts or {})
+    c.update(to_commit=todo, processed=0, imported_before=c.get("imported", 0) if imp.status == "completed" else 0)
+    imp.counts = c
     imp.status, imp.committed_at = "committing", utcnow()
     db.commit()
     enqueue("import.commit", importer.job_commit, imp.id)
-    return {"status": "committing", "rows": todo}
+    return todo
 
 
-@router.post("/gyms/{gymId}/imports/{importId}/cancel", summary="Cancel import (only before commit)")
-def cancel(importId: str, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+@router.post("/gyms/{gymId}/imports/{importId}/commit", response_model=ImportOut, status_code=202,
+             summary="Commit import (job; poll GET import for progress)",
+             description="Safe to call again: rows already imported are never imported twice. If a commit got stuck "
+                         "(no progress for 10 min) calling this resumes it. After completion, rows you fixed later "
+                         "can be committed by calling it again.")
+def commit(importId: str, ctx: GymCtx = Depends(perm_ctx("imports.manage")), db: Session = Depends(get_db)):
+    imp = _get_import(db, ctx, importId)
+    if imp.status == "committing":
+        if imp.updated_at and imp.updated_at > utcnow() - STALE_COMMIT:
+            return ser_import(imp)  # already running: idempotent
+    elif imp.status not in ("previewed", "completed"):
+        raise ApiError(409, "NOT_ACTIVE", f"This import is {imp.status}; it can’t be committed.")
+    _start_commit(db, imp)
+    return ser_import(imp)
+
+
+@router.post("/gyms/{gymId}/imports/{importId}/retry-failed", response_model=ImportOut, status_code=202,
+             summary="Re-validate failed rows and commit the ones that are now OK",
+             description="Rows that failed during commit are re-checked against current data; rows that pass are "
+                         "committed (job). Rows still blocked move to `fix` so you can correct them.")
+def retry_failed(importId: str, ctx: GymCtx = Depends(perm_ctx("imports.manage")), db: Session = Depends(get_db)):
+    imp = _get_import(db, ctx, importId)
+    if imp.status != "completed":
+        raise ApiError(409, "NOT_ACTIVE", "Retry is available once the import has completed.")
+    failed = db.scalars(select(ImportRow).where(ImportRow.import_id == imp.id, ImportRow.outcome == "failed")).all()
+    if not failed:
+        raise validation({"rows": "There are no failed rows."})
+    for r in failed:
+        r.outcome = "fix"
+        r.issues = [i for i in (r.issues or []) if i.get("code") != "COMMIT_FAILED"]
+    db.flush()
+    importer.classify(db, imp)
+    db.flush()
+    _start_commit(db, imp)
+    return ser_import(imp)
+
+
+@router.post("/gyms/{gymId}/imports/{importId}/cancel", response_model=ImportOut, summary="Cancel import (only before commit)")
+def cancel(importId: str, ctx: GymCtx = Depends(perm_ctx("imports.manage")), db: Session = Depends(get_db)):
     imp = _get_import(db, ctx, importId)
     if imp.status not in ("uploaded", "parsing", "previewed", "failed"):
         raise ApiError(409, "NOT_ACTIVE", "This import has already been committed.")
     imp.status = "cancelled"
     audit(db, ctx.gym.id, ctx.user.id, "import.cancel", "import", imp.id, f"Cancelled import of {imp.file_name}")
     db.commit()
-    return {"status": "cancelled"}
+    return ser_import(imp)
 
 
 @router.get("/gyms/{gymId}/imports/{importId}/report.csv", summary="Import report CSV",
             description="Every row with outcome + reason. `?only=failed` = original columns for fix/skipped/failed rows, "
                         "ready to correct and re-upload.", responses={200: {"content": {"text/csv": {}}}})
-def report(importId: str, only: Literal["all", "failed"] = "all", ctx: GymCtx = Depends(gym_ctx),
+def report(importId: str, only: Literal["all", "failed"] = "all", ctx: GymCtx = Depends(perm_ctx("imports.manage")),
            db: Session = Depends(get_db)):
     imp = _get_import(db, ctx, importId)
     q = select(ImportRow).where(ImportRow.import_id == imp.id)
@@ -267,14 +316,23 @@ def report(importId: str, only: Literal["all", "failed"] = "all", ctx: GymCtx = 
 INVITE_GAP = timedelta(days=7)
 
 
-@router.post("/gyms/{gymId}/invites", status_code=202, summary="Send member-app invites (batch)",
-             description="`member_ids` or `filter` (`not_on_app` | `import:{importId}`). Max 1 invite per member per 7 days. "
-                         "Needs an approved gym (423 GYM_PENDING).")
-def send_invites(body: InvitesIn, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+def _recent_invite(db: Session, member_id: str):
+    return db.scalar(select(Invite).where(Invite.member_id == member_id, Invite.kind == "member_app",
+                                          Invite.status.in_(("sent", "joined", "queued")),
+                                          Invite.created_at >= utcnow() - INVITE_GAP)
+                     .order_by(Invite.created_at.desc()).limit(1))
+
+
+@router.post("/gyms/{gymId}/invites", summary="Send member-app invites (batch) — reports exactly what happened",
+             response_model=InviteBatchOut,
+             description="`member_ids` or `filter` (`not_on_app` | `import:{importId}`). Sends now and returns "
+                         "`sent`, `skipped[]` (with reason) and `failed[]` (with reason + a WhatsApp share link). "
+                         "Max 1 invite per member per 7 days. If every send fails → 502 UPSTREAM_SMS with the same "
+                         "lists in `error.details`. Needs an approved gym (423 GYM_PENDING).")
+def send_invites(body: InvitesIn, ctx: GymCtx = Depends(perm_ctx("invites.send")), db: Session = Depends(get_db)):
     ctx.require_approved()
     gym = ctx.gym
-    q = select(GymMember, User).join(User, User.id == GymMember.user_id).where(
-        GymMember.gym_id == gym.id, GymMember.status == "active", GymMember.claim_disputed_at.is_(None))
+    q = select(GymMember, User).join(User, User.id == GymMember.user_id).where(GymMember.gym_id == gym.id)
     if body.member_ids:
         q = q.where(GymMember.id.in_(body.member_ids))
     elif body.filter and body.filter.startswith("import:"):
@@ -282,49 +340,85 @@ def send_invites(body: InvitesIn, ctx: GymCtx = Depends(gym_ctx), db: Session = 
             ImportRow.import_id == body.filter.split(":", 1)[1], ImportRow.member_id.is_not(None))))
     elif body.filter != "not_on_app":
         raise validation({"filter": "Send member_ids or filter=not_on_app|import:{importId}."})
-    targets = [(m, u) for m, u in db.execute(q).all() if u.first_login_at is None and not u.deleted_at]
-    if body.filter == "not_on_app":
-        states = load_states(db, gym, [m.id for m, _ in targets])
-        targets = [(m, u) for m, u in targets if states[m.id].status in LIVE]
-    recent = set(db.scalars(select(Invite.member_id).where(
-        Invite.gym_id == gym.id, Invite.kind == "member_app", Invite.created_at >= utcnow() - INVITE_GAP,
-        Invite.status != "failed")))
+    rows = db.execute(q).all()
+    states = load_states(db, gym, [m.id for m, _ in rows]) if body.filter == "not_on_app" else {}
+    found = {m.id for m, _ in rows}
+    skipped = [{"member_id": mid, "name": None, "reason": "NOT_FOUND"} for mid in (body.member_ids or []) if mid not in found]
+    targets = []
+    for m, u in rows:
+        reason = None
+        if m.status != "active":
+            reason = "ARCHIVED"
+        elif m.claim_disputed_at:
+            reason = "CLAIM_DISPUTED"
+        elif u.first_login_at is not None:
+            reason = "ALREADY_ON_APP"
+        elif u.deleted_at:
+            reason = "ACCOUNT_DELETED"
+        elif states and states[m.id].status not in LIVE:
+            reason = "NO_ACTIVE_MEMBERSHIP"
+        if not reason:
+            recent = _recent_invite(db, m.id)
+            if recent:
+                skipped.append({"member_id": m.id, "name": m.display_name, "reason": "INVITED_RECENTLY",
+                                "next_allowed_at": iso(recent.created_at + INVITE_GAP)})
+                continue
+        if reason:
+            skipped.append({"member_id": m.id, "name": m.display_name, "reason": reason})
+        else:
+            targets.append((m, u))
     batch = uuid7()
-    queued, skipped = [], 0
-    for m, u in targets:
-        if m.id in recent:
-            skipped += 1
-            continue
+    sent, failed = [], []
+    for m, u in targets[:500]:
         inv = Invite(gym_id=gym.id, member_id=m.id, kind="member_app", phone=u.phone, status="queued", batch_id=batch)
         db.add(inv)
-        queued.append(inv)
-    db.flush()
+        db.flush()
+        res = send_invite_now(db, inv)
+        item = {"member_id": m.id, "name": m.display_name, "invite_id": inv.id, "whatsapp_url": res["whatsapp_url"]}
+        if res["status"] == "sent":
+            sent.append(item)
+        else:
+            failed.append({**item, "reason": res["reason"], "detail": res.get("detail")})
+    for m, _ in targets[500:]:
+        skipped.append({"member_id": m.id, "name": m.display_name, "reason": "BATCH_LIMIT_500"})
     audit(db, gym.id, ctx.user.id, "invite.batch", "invite_batch", batch,
-          f"Sent {len(queued)} app invites ({skipped} skipped, invited in the last 7 days)")
+          f"App invites: {len(sent)} sent, {len(failed)} failed, {len(skipped)} skipped")
     db.commit()
-    for inv in queued:
-        queue_invite(inv.id)
-    return {"batch_id": batch, "queued": len(queued), "skipped_recent": skipped}
+    out = {"batch_id": batch, "sent": len(sent), "sent_items": sent, "skipped": skipped, "failed": failed,
+           "queued": len(sent), "skipped_recent": sum(1 for x in skipped if x["reason"] == "INVITED_RECENTLY")}
+    if failed and not sent:
+        raise ApiError(502, "UPSTREAM_SMS", "Invites couldn’t be sent by SMS. Share them on WhatsApp instead.", out)
+    return out
 
 
-@router.post("/gyms/{gymId}/members/{memberId}/invite", status_code=202, summary="Invite one member to the app",
-             description="429 INVITE_TOO_SOON {next_allowed_at} if invited in the last 7 days.")
-def invite_one(memberId: str, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+@router.post("/gyms/{gymId}/members/{memberId}/invite", summary="Invite one member to the app",
+             response_model=InviteOneOut,
+             description="Sends now. 200 `{invite, status:'sent'}` · 429 INVITE_TOO_SOON {next_allowed_at} · "
+                         "409 ALREADY_ON_APP · 502 UPSTREAM_SMS {reason, whatsapp_url} when the SMS can’t be sent.")
+def invite_one(memberId: str, ctx: GymCtx = Depends(perm_ctx("invites.send")), db: Session = Depends(get_db)):
     ctx.require_approved()
     m = db.get(GymMember, memberId)
     if not m or m.gym_id != ctx.gym.id:
         raise ApiError(404, "NOT_FOUND", "That member wasn’t found.")
     u = db.get(User, m.user_id)
-    last = db.scalar(select(Invite).where(Invite.member_id == m.id, Invite.kind == "member_app",
-                                          Invite.status != "failed").order_by(Invite.created_at.desc()).limit(1))
-    if last and last.created_at > utcnow() - INVITE_GAP:
-        nxt = last.created_at + INVITE_GAP
+    if u.first_login_at is not None:
+        raise ApiError(409, "ALREADY_ON_APP", f"{m.display_name} is already using the app.")
+    recent = _recent_invite(db, m.id)
+    if recent:
+        nxt = recent.created_at + INVITE_GAP
         raise ApiError(429, "INVITE_TOO_SOON", None, {"next_allowed_at": iso(nxt),
                                                        "retry_after_sec": int((nxt - utcnow()).total_seconds())})
     inv = Invite(gym_id=ctx.gym.id, member_id=m.id, kind="member_app", phone=u.phone, status="queued")
     db.add(inv)
     db.flush()
-    audit(db, ctx.gym.id, ctx.user.id, "invite.send", "invite", inv.id, f"Sent app invite to {m.display_name}")
+    res = send_invite_now(db, inv)
+    audit(db, ctx.gym.id, ctx.user.id, "invite.send", "invite", inv.id,
+          f"App invite to {m.display_name}: {res['status']}" + (f" ({res.get('reason')})" if res["status"] != "sent" else ""))
     db.commit()
-    queue_invite(inv.id)
-    return {"invite": {"id": inv.id, "status": inv.status, "phone": inv.phone, "created_at": iso(inv.created_at)}}
+    invite = {"id": inv.id, "status": inv.status, "phone": inv.phone, "created_at": iso(inv.created_at),
+              "sent_at": iso(inv.sent_at), "error": inv.error}
+    if res["status"] != "sent":
+        raise ApiError(502, "UPSTREAM_SMS", "The invite SMS couldn’t be sent. Share it on WhatsApp instead.",
+                       {"reason": res["reason"], "detail": res.get("detail"), "whatsapp_url": res["whatsapp_url"],
+                        "message": res["message"], "invite": invite})
+    return {"invite": invite, "status": "sent", "whatsapp_url": res["whatsapp_url"]}

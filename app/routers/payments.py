@@ -1,4 +1,6 @@
 """§9 — payments list, record, void, receipt."""
+import csv
+import io
 from datetime import date, datetime, timedelta
 from typing import Literal
 
@@ -8,8 +10,8 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.deps import GymCtx, Idem, current_user, idem_header, load_gym_ctx, payments_ctx
-from app.errors import ApiError
+from app.deps import GymCtx, Idem, current_user, idem_header, load_gym_ctx, payments_ctx, perm_ctx
+from app.errors import ApiError, validation
 from app.models import Gym, GymMember, Membership, Payment, User
 from app.schemas import PaymentCreate, VoidIn
 from app.services.audit import audit
@@ -17,17 +19,31 @@ from app.services.core import (add_payment, check_duplicate_reference, gym_setti
                                validate_paid_at, validate_reference)
 from app.services.receipt import render_receipt_pdf
 from app.services.rules import membership_due
-from app.utils import amount_in_words, clamp_limit, decode_cursor, encode_cursor, local_midnight_utc, rupees, tz, \
+from app.utils import today_in, amount_in_words, clamp_limit, decode_cursor, encode_cursor, local_midnight_utc, rupees, tz, \
     utcnow
 
-router = APIRouter(tags=["Payments"])
+from app.responses import DocRoute, ERRORS, PaymentCreateOut, PaymentListOut, PaymentStatsOut, PaymentWrapOut
+
+router = APIRouter(tags=["Payments"], route_class=DocRoute, responses=ERRORS)
 
 
-@router.get("/gyms/{gymId}/payments", summary="Payments list with totals (payments permission)",
+def _q_filter(gym_id: str, q: str):
+    from app.routers.members import phone_digits
+    ql = q.strip()
+    like = f"%{ql}%"
+    member_q = select(GymMember.id).join(User, User.id == GymMember.user_id).where(GymMember.gym_id == gym_id)
+    d = phone_digits(ql)
+    who = or_(GymMember.display_name.ilike(like), GymMember.member_code.ilike(like),
+              *([User.phone.like(f"%{d}%")] if len(d) >= 3 else []))
+    return or_(Payment.member_id.in_(member_q.where(who)), Payment.reference.ilike(like), Payment.receipt_no.ilike(like))
+
+
+@router.get("/gyms/{gymId}/payments", response_model=PaymentListOut, summary="Payments list with totals (payments permission)",
             description="`from`/`to` are dates (YYYY-MM-DD, gym timezone, inclusive). Totals cover recorded payments matching the filters.")
 def list_payments(from_: date | None = Query(None, alias="from"), to: date | None = None,
                   method: Literal["cash", "upi", "card", "bank"] | None = None, member_id: str | None = None,
                   status: Literal["recorded", "voided"] | None = None, source: Literal["manual", "import", "app"] | None = None,
+                  q: str | None = Query(None, description="Member name, phone, UTR/reference or receipt no"),
                   limit: int = Query(50, ge=1, le=100), cursor: str | None = None,
                   ctx: GymCtx = Depends(payments_ctx), db: Session = Depends(get_db)):
     gym = ctx.gym
@@ -42,6 +58,8 @@ def list_payments(from_: date | None = Query(None, alias="from"), to: date | Non
         conds.append(Payment.member_id == member_id)
     if source:
         conds.append(Payment.source == source)
+    if q and q.strip():
+        conds.append(_q_filter(gym.id, q))
     base = list(conds)
     if status:
         conds.append(Payment.status == status)
@@ -76,11 +94,11 @@ def list_payments(from_: date | None = Query(None, alias="from"), to: date | Non
             "next_cursor": nxt}
 
 
-@router.post("/gyms/{gymId}/payments", status_code=201, summary="Record payment (payments permission)",
+@router.post("/gyms/{gymId}/payments", response_model=PaymentCreateOut, status_code=201, summary="Record payment (payments permission)",
              description="Requires `Idempotency-Key`. 409 DUPLICATE_REFERENCE (same UTR/ref) · 409 POSSIBLE_DUPLICATE "
                          "(same member + amount within 10 min; resend with confirm_duplicate=true) · 422 OVERPAYMENT "
                          "(unless as_credit=true: the extra becomes member credit). Omit membership_id for an advance/credit.")
-def record_payment(body: PaymentCreate, ctx: GymCtx = Depends(payments_ctx), db: Session = Depends(get_db),
+def record_payment(body: PaymentCreate, ctx: GymCtx = Depends(perm_ctx("payments.record")), db: Session = Depends(get_db),
                    idempotency_key: str | None = Depends(idem_header)):
     idem = Idem(db, ctx.user, idempotency_key, f"POST /gyms/{ctx.gym.id}/payments")
     if idem.replay:
@@ -138,11 +156,11 @@ def _payment_ctx(db: Session, user: User, payment_id: str):
     return p
 
 
-@router.post("/payments/{id}/void", summary="Void payment (owner only). Voided payments stay visible")
+@router.post("/payments/{id}/void", response_model=PaymentWrapOut, summary="Void payment (owner only). Voided payments stay visible")
 def void_payment(id: str, body: VoidIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
     p = _payment_ctx(db, user, id)
     ctx = load_gym_ctx(db, user, p.gym_id)
-    ctx.require_owner()
+    ctx.require("payments.void")
     if p.status == "voided":
         raise ApiError(409, "NOT_ACTIVE", "This payment is already voided.")
     p.status, p.void_reason, p.voided_by, p.voided_at = "voided", body.reason, user.id, utcnow()
@@ -165,7 +183,7 @@ def receipt(id: str, format: Literal["pdf", "json"] = "pdf", user: User = Depend
     member = db.get(GymMember, p.member_id)
     if member.user_id != user.id:
         ctx = load_gym_ctx(db, user, p.gym_id)
-        ctx.require_payments()
+        ctx.require("payments.view")
     gym = db.get(Gym, p.gym_id)
     ms = db.get(Membership, p.membership_id) if p.membership_id else None
     recorder = db.get(User, p.recorded_by) if p.recorded_by else None
@@ -184,3 +202,116 @@ def receipt(id: str, format: Literal["pdf", "json"] = "pdf", user: User = Depend
     pdf = render_receipt_pdf(d)
     fname = p.receipt_no.replace("/", "-")
     return Response(pdf, media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="{fname}.pdf"'})
+
+
+# ---------------- revenue stats & export ----------------
+def _periods(range_: str, group: str, today: date) -> list[tuple[date, date, str]]:
+    n, unit = int(range_[:-1]), range_[-1]
+    if unit == "m":
+        first = date(today.year, today.month, 1)
+        y, mo = first.year, first.month - (n - 1)
+        while mo <= 0:
+            y, mo = y - 1, mo + 12
+        start = date(y, mo, 1)
+    else:
+        start = today - timedelta(days=n - 1)
+    out, cur = [], start
+    while cur <= today:
+        if group == "month":
+            nxt = date(cur.year + (cur.month == 12), cur.month % 12 + 1, 1)
+            out.append((cur, nxt, cur.strftime("%Y-%m")))
+        elif group == "week":
+            ws = cur - timedelta(days=cur.weekday())
+            nxt = ws + timedelta(days=7)
+            out.append((max(cur, ws), nxt, ws.isoformat()))
+        else:
+            nxt = cur + timedelta(days=1)
+            out.append((cur, nxt, cur.isoformat()))
+        cur = nxt
+    return out
+
+
+@router.get("/gyms/{gymId}/payments/stats", response_model=PaymentStatsOut,
+            summary="Revenue time-series: totals per period by method and source (payments.view)",
+            description="`range`: 7d · 30d · 90d · 3m · 6m · 12m · 24m. `group`: day · week · month. "
+                        "Recorded (non-voided) payments; periods in the gym’s timezone. "
+                        "`totals.collected_excl_import_paise` leaves imported history out.")
+def payment_stats(range: Literal["7d", "30d", "90d", "3m", "6m", "12m", "24m"] = "12m",
+                  group: Literal["day", "week", "month"] = "month",
+                  ctx: GymCtx = Depends(payments_ctx), db: Session = Depends(get_db)):
+    gym = ctx.gym
+    today = today_in(gym.timezone)
+    periods = _periods(range, group, today)
+    if group == "day" and len(periods) > 400:
+        raise validation({"group": "Too many days; use week or month for long ranges."})
+    start_utc = local_midnight_utc(periods[0][0], gym.timezone)
+    rows = db.execute(select(Payment.paid_at, Payment.amount_paise, Payment.method, Payment.source).where(
+        Payment.gym_id == gym.id, Payment.status == "recorded", Payment.paid_at >= start_utc)).all()
+    z = tz(gym.timezone)
+    series = [{"period": label, "start": s.isoformat(), "collected_paise": 0, "count": 0,
+               "by_method": {"cash": 0, "upi": 0, "card": 0, "bank": 0}, "by_source": {"manual": 0, "import": 0, "app": 0}}
+              for s, _, label in periods]
+    starts = [s for s, _, _ in periods]
+    import bisect
+    for paid_at, amt, mth, src in rows:
+        d = paid_at.astimezone(z).date()
+        i = bisect.bisect_right(starts, d) - 1
+        if i < 0 or d >= periods[i][1]:
+            continue
+        pt = series[i]
+        pt["collected_paise"] += amt
+        pt["count"] += 1
+        pt["by_method"][mth] += amt
+        pt["by_source"][src] += amt
+    tot = sum(p["collected_paise"] for p in series)
+    imp = sum(p["by_source"]["import"] for p in series)
+    return {"range": range, "group": group, "from": periods[0][0].isoformat(), "to": today.isoformat(),
+            "series": series,
+            "totals": {"collected_paise": tot, "collected_excl_import_paise": tot - imp,
+                       "count": sum(p["count"] for p in series),
+                       "by_method": {k: sum(p["by_method"][k] for p in series) for k in ("cash", "upi", "card", "bank")},
+                       "by_source": {k: sum(p["by_source"][k] for p in series) for k in ("manual", "import", "app")}}}
+
+
+@router.get("/gyms/{gymId}/payments/export.csv", summary="Export payments CSV (payments.view + reports.export)",
+            description="Same filters as the payments list; exports every matching row.",
+            responses={200: {"content": {"text/csv": {}}}})
+def export_payments(from_: date | None = Query(None, alias="from"), to: date | None = None,
+                    method: Literal["cash", "upi", "card", "bank"] | None = None, member_id: str | None = None,
+                    status: Literal["recorded", "voided"] | None = None,
+                    source: Literal["manual", "import", "app"] | None = None, q: str | None = None,
+                    ctx: GymCtx = Depends(payments_ctx), db: Session = Depends(get_db)):
+    ctx.require("reports.export")
+    gym = ctx.gym
+    conds = [Payment.gym_id == gym.id]
+    if from_:
+        conds.append(Payment.paid_at >= local_midnight_utc(from_, gym.timezone))
+    if to:
+        conds.append(Payment.paid_at < local_midnight_utc(to + timedelta(days=1), gym.timezone))
+    for col, val in ((Payment.method, method), (Payment.member_id, member_id), (Payment.status, status),
+                     (Payment.source, source)):
+        if val:
+            conds.append(col == val)
+    if q and q.strip():
+        conds.append(_q_filter(gym.id, q))
+    rows = db.scalars(select(Payment).where(*conds).order_by(Payment.paid_at.desc()).limit(50000)).all()
+    members = {m.id: m for m in db.scalars(select(GymMember).where(GymMember.id.in_({p.member_id for p in rows} or {""})))}
+    plans = {m.id: m.plan_name for m in db.scalars(select(Membership).where(
+        Membership.id.in_({p.membership_id for p in rows if p.membership_id} or {""})))}
+    names = user_names(db, [p.recorded_by for p in rows])
+    z = tz(gym.timezone)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Receipt no", "Paid at", "Member code", "Member", "Plan", "Amount (₹)", "Method", "Reference",
+                "Source", "Status", "Void reason", "Recorded by", "Note"])
+    for p in rows:
+        m = members.get(p.member_id)
+        w.writerow([p.receipt_no, p.paid_at.astimezone(z).strftime("%Y-%m-%d %H:%M"), m.member_code if m else "",
+                    m.display_name if m else "", plans.get(p.membership_id, "Advance / credit"),
+                    f"{p.amount_paise / 100:.2f}", p.method, p.reference or "", p.source, p.status,
+                    p.void_reason or "", names.get(p.recorded_by) or "", p.note or ""])
+    audit(db, gym.id, ctx.user.id, "export.payments", None, None, f"Exported {len(rows)} payments")
+    db.commit()
+    name = f"{gym.code_prefix}-payments-{today_in(gym.timezone).isoformat()}.csv"
+    return Response("\ufeff" + buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})

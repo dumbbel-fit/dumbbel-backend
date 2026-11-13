@@ -132,6 +132,7 @@ class Gym(Base):
     approved_at = mapped_column(TS, nullable=True)
     approved_by: Mapped[str | None] = fk("users.id", nullable=True)
     settings = mapped_column(JSON, nullable=True)
+    org_id: Mapped[str | None] = mapped_column(String(36), index=True)  # branches of one business share an org_id
     member_seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     receipt_seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     created_at = created()
@@ -166,6 +167,8 @@ class GymStaff(Base):
     invited_at = mapped_column(TS, nullable=True)
     joined_at = mapped_column(TS, nullable=True)
     deactivated_at = mapped_column(TS, nullable=True)
+    staff_role: Mapped[str | None] = mapped_column(String(20), server_default="staff")  # manager|receptionist|trainer|staff
+    permissions = mapped_column(JSON, nullable=True)  # explicit permission list; overrides the role preset
     owner_guard = mapped_column(SmallInteger, Computed("IF(role = 'owner', 1, NULL)", persisted=True))
     created_at = created()
     updated_at = updated()
@@ -210,6 +213,16 @@ class Plan(Base):
     price_paise: Mapped[int] = mapped_column(Integer, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1", nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    offer_price_paise: Mapped[int | None] = mapped_column(Integer)  # when set, this is what members pay
+    joining_fee_paise: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    gst_mode: Mapped[str] = mapped_column(String(10), default="inclusive", server_default="inclusive", nullable=False)
+    gst_rate: Mapped[int] = mapped_column(SmallInteger, default=18, server_default="18", nullable=False)
+    facilities = mapped_column(JSON, nullable=True)
+    description: Mapped[str | None] = mapped_column(Text)
+    freeze_allowed: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1", nullable=False)
+    max_freeze_days: Mapped[int | None] = mapped_column(Integer)  # per-plan override of the gym setting
+    cancellation_policy: Mapped[str | None] = mapped_column(Text)
+    refund_policy: Mapped[str | None] = mapped_column(Text)
     active_name_key = mapped_column(String(120), Computed("IF(active, LOWER(name), NULL)", persisted=True))
     created_at = created()
     updated_at = updated()
@@ -234,6 +247,11 @@ class Membership(Base):
     refund_note: Mapped[str | None] = mapped_column(Text)
     source = mapped_column(Enum("manual", "import", name="membership_source"), default="manual", nullable=False)
     created_by: Mapped[str | None] = fk("users.id", nullable=True)
+    joining_fee_paise: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    gst_paise: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    suspended_at = mapped_column(TS, nullable=True)  # access paused, days keep running
+    suspended_by: Mapped[str | None] = mapped_column(String(36))
+    suspend_reason: Mapped[str | None] = mapped_column(Text)
     created_at = created()
     updated_at = updated()
     __table_args__ = (Index("ix_ms_gym_end", "gym_id", "end_date"),)
@@ -292,7 +310,8 @@ class Checkin(Base):
     local_date = mapped_column(Date, nullable=False)
     method = mapped_column(Enum("qr", "manual", name="checkin_method"), nullable=False)
     result = mapped_column(Enum("success", "duplicate", "expired", "frozen", "cancelled", "not_started",
-                                "not_member", "invalid_token", "gym_inactive", name="checkin_result"), nullable=False)
+                                "not_member", "invalid_token", "gym_inactive", "suspended",
+                                name="checkin_result"), nullable=False)
     staff_user_id: Mapped[str | None] = fk("users.id", nullable=True)
     token_jti: Mapped[str | None] = mapped_column(String(64))
     device_id: Mapped[str | None] = mapped_column(String(120))
@@ -402,3 +421,62 @@ class IdempotencyKey(Base):
     response = mapped_column(JSON, nullable=False)
     created_at = created()
     __table_args__ = (UniqueConstraint("user_id", "key", name="uq_idem_user_key"),)
+
+
+class MemberNote(Base):
+    """Dated note history on a member (staff only, never shown to the member)."""
+    __tablename__ = "member_notes"
+    id: Mapped[str] = pk()
+    gym_id: Mapped[str] = fk("gyms.id")
+    member_id: Mapped[str] = fk("gym_members.id", index=True)
+    author_id: Mapped[str | None] = fk("users.id", nullable=True)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    deleted_at = mapped_column(TS, nullable=True)
+    created_at = created()
+    updated_at = updated()
+
+
+class GymUpiAccount(Base):
+    """The gym's own UPI IDs; members pay straight to the gym (0% fees, no aggregator)."""
+    __tablename__ = "gym_upi_accounts"
+    id: Mapped[str] = pk()
+    gym_id: Mapped[str] = fk("gyms.id", index=True)
+    vpa: Mapped[str] = mapped_column(String(120), nullable=False)
+    payee_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    label: Mapped[str | None] = mapped_column(String(60))
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1", nullable=False)
+    created_by: Mapped[str | None] = fk("users.id", nullable=True)
+    created_at = created()
+    updated_at = updated()
+    __table_args__ = (UniqueConstraint("gym_id", "vpa", name="uq_gym_vpa"),)
+
+
+class UpiPaymentRequest(Base):
+    """A UPI collection: QR / intent with exact amount -> member submits UTR -> staff verify -> Payment recorded.
+    A UTR is a claim, not proof: staff must confirm the credit in their bank app (see YouPI-PG guidance)."""
+    __tablename__ = "upi_payment_requests"
+    id: Mapped[str] = pk()
+    gym_id: Mapped[str] = fk("gyms.id")
+    member_id: Mapped[str] = fk("gym_members.id", index=True)
+    membership_id: Mapped[str | None] = fk("memberships.id", nullable=True)
+    upi_account_id: Mapped[str] = fk("gym_upi_accounts.id")
+    vpa: Mapped[str] = mapped_column(String(120), nullable=False)  # snapshot
+    payee_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    amount_paise: Mapped[int] = mapped_column(Integer, nullable=False)
+    ref: Mapped[str] = mapped_column(String(35), nullable=False, unique=True)  # UPI tr
+    note: Mapped[str | None] = mapped_column(String(80))
+    status = mapped_column(Enum("pending", "claimed", "verified", "rejected", "expired", "cancelled",
+                                name="upi_req_status"), default="pending", nullable=False)
+    created_via = mapped_column(Enum("staff", "member", name="upi_req_via"), nullable=False)
+    created_by: Mapped[str | None] = fk("users.id", nullable=True)
+    utr: Mapped[str | None] = mapped_column(String(40))
+    claimed_at = mapped_column(TS, nullable=True)
+    decided_by: Mapped[str | None] = fk("users.id", nullable=True)
+    decided_at = mapped_column(TS, nullable=True)
+    reject_reason: Mapped[str | None] = mapped_column(Text)
+    payment_id: Mapped[str | None] = fk("payments.id", nullable=True)
+    expires_at = mapped_column(TS, nullable=False)
+    created_at = created()
+    updated_at = updated()
+    __table_args__ = (Index("ix_upi_gym_status", "gym_id", "status", "created_at"),)

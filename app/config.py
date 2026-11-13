@@ -48,7 +48,10 @@ class Settings(BaseSettings):
     auth_provider: str = "firebase"
     # Firebase Phone Auth (alternative to 2Factor; Google sends the SMS, no DLT needed)
     firebase_project_id: str | None = None
-    firebase_web_api_key: str | None = None  # Web app apiKey; only used by the /dev/firebase-test page
+    firebase_web_api_key: str | None = None
+    firebase_web_app_id: str | None = None
+    firebase_messaging_sender_id: str | None = None
+    firebase_storage_bucket: str | None = None  # Web app apiKey; only used by the /dev/firebase-test page
     firebase_credentials_file: str | None = None  # service-account JSON path (optional for token verification)
 
     # Object storage (S3/R2). Without bucket config, local disk storage is used.
@@ -74,7 +77,9 @@ class Settings(BaseSettings):
     # Jobs
     run_scheduler: bool = True
 
-    cors_origins: str = "*"
+    # Comma-separated exact origins (e.g. https://admin.dumbbel.fit). localhost/127.0.0.1 on any port is always allowed.
+    cors_origins: str = ""
+    cors_allow_localhost: bool = True
 
     @property
     def is_prod(self) -> bool:

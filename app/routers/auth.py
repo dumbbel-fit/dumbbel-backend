@@ -11,13 +11,15 @@ from app.deps import Auth, get_auth
 from app.errors import ApiError
 from app.models import Gym, GymMember, GymStaff, Invite, OtpCode, Session as DbSession, User
 from app.schemas import FirebaseLoginIn, OtpSendIn, OtpVerifyIn, RefreshIn
+from app.permissions import effective_permissions
 from app.security import gen_otp, hash_otp, hash_token, make_access_token, make_refresh_token, verify_otp
 from app.services import sms
 from app.services.cache import cache, rate_limit
 from app.services.core import ser_user
 from app.utils import iso, normalize_phone, utcnow
+from app.responses import DocRoute, ERRORS, LoginOut, OtpSendOut, TokensOut
 
-router = APIRouter(prefix="/auth", tags=["Auth"])
+router = APIRouter(prefix="/auth", tags=["Auth"], route_class=DocRoute, responses=ERRORS)
 
 LOCK_SEC = 15 * 60
 
@@ -33,7 +35,7 @@ def _client_ip(request: Request) -> str:
     return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "")
 
 
-@router.post("/otp/send", summary="Send login OTP (2Factor SMS)",
+@router.post("/otp/send", response_model=OtpSendOut, summary="Send login OTP (2Factor SMS)",
              description="Only when AUTH_PROVIDER=2factor (else 409 USE_FIREBASE). "
                          "Public. Rate limits: 1/30 s and 5/hour per phone, 20/hour per IP. "
                          "Never reveals whether the phone is registered.")
@@ -82,8 +84,11 @@ def staff_of(db: Session, user_id: str, activate: bool = False) -> list[dict]:
     for st, g in rows:
         if activate and st.status == "invited":
             st.status, st.joined_at = "active", utcnow()
+        perms = effective_permissions(st.role, st.staff_role, bool(st.can_record_payments), st.permissions)
         out.append({"gym_id": g.id, "gym_name": g.name, "gym_status": g.status, "status_reason": g.status_reason,
-                    "role": st.role, "can_record_payments": st.role == "owner" or st.can_record_payments})
+                    "org_id": g.org_id or g.id, "role": st.role,
+                    "staff_role": "owner" if st.role == "owner" else (st.staff_role or "staff"),
+                    "can_record_payments": "payments.record" in perms, "permissions": sorted(perms)})
     return out
 
 
@@ -99,7 +104,7 @@ def create_session(db: Session, user: User, app: str, device_name=None, platform
             "expires_in_sec": settings.access_token_ttl_sec}
 
 
-@router.post("/otp/verify", summary="Verify OTP and log in",
+@router.post("/otp/verify", response_model=LoginOut, summary="Verify OTP and log in",
              description="Max 5 wrong attempts per code; 3 failed codes in 15 min locks the phone for 15 min. "
                          "Admin app: returns `staff_of` (403 NOT_GYM_STAFF if none). "
                          "Member app: returns `memberships_summary` + `new_claims` (auto-claim).")
@@ -170,7 +175,7 @@ def complete_login(db: Session, phone: str, app: str, device) -> dict:
     return resp
 
 
-@router.post("/refresh", summary="Rotate refresh token",
+@router.post("/refresh", response_model=TokensOut, summary="Rotate refresh token",
              description="Refresh tokens rotate on every use. Re-using an old refresh token revokes the whole session.")
 def refresh(body: RefreshIn, db: Session = Depends(get_db)):
     sid = body.refresh_token.split(".", 1)[0]
@@ -200,7 +205,7 @@ def logout(auth: Auth = Depends(get_auth), db: Session = Depends(get_db)):
     return Response(status_code=204)
 
 
-@router.post("/firebase", summary="Log in with Firebase Phone Auth",
+@router.post("/firebase", response_model=LoginOut, summary="Log in with Firebase Phone Auth",
              description="The app verifies the phone with Firebase (SMS sent by Google), then sends the Firebase "
                          "`id_token` here. Response is identical to /auth/otp/verify.")
 def firebase_login(body: FirebaseLoginIn, db: Session = Depends(get_db)):

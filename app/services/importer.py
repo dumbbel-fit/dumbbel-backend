@@ -22,7 +22,7 @@ MAX_ROWS = 5000
 MAX_BYTES = 10 * 1024 * 1024
 BATCH = 200
 
-FIELDS = ["name", "phone", "plan", "start_date", "end_date", "paid", "email", "dob", "gender", "notes"]
+FIELDS = ["name", "phone", "plan", "start_date", "end_date", "paid", "paid_on", "email", "dob", "gender", "notes"]
 SYNONYMS = {
     "name": ["name", "member name", "full name", "customer", "client", "customer name", "client name"],
     "phone": ["mobile", "phone", "contact", "mobile no", "whatsapp", "number", "mobile number", "phone number",
@@ -32,6 +32,7 @@ SYNONYMS = {
     "end_date": ["end", "expiry", "valid till", "to", "due date", "end date", "expiry date", "expires", "valid upto",
                  "valid until"],
     "paid": ["paid", "amount", "amount paid", "fees paid", "fee paid", "fees", "paid amount"],
+    "paid_on": ["paid on", "payment date", "paid date", "date of payment", "payment on", "receipt date"],
     "email": ["email", "mail", "mail id", "email id", "e-mail"],
     "dob": ["dob", "birthday", "date of birth", "birth date"],
     "gender": ["gender", "sex"],
@@ -378,6 +379,12 @@ def normalize_row(raw: dict, mapping: dict, overrides: dict, plans: list[Plan], 
         n["price_paise"] = plan.price_paise
         n["due_paise"] = max(0, plan.price_paise - n["paid_paise"])
 
+    po = val.get("paid_on", "")
+    paid_on = parse_date(po, order) if str(po or "").strip() else None
+    if str(po or "").strip() and not paid_on:
+        issues.append(issue("paid_on", "DATE_INVALID", po))
+    n["paid_on"] = paid_on.isoformat() if paid_on else None
+
     email = (ov.get("email") or val.get("email") or "").strip()
     if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         issues.append(issue("email", "EMAIL_INVALID", email))
@@ -450,7 +457,7 @@ def column_info(imp: Import, rows: list[ImportRow], plans: list[Plan]) -> list[d
         elif f is None:
             note = "Not imported"
         out.append({"header": h, "field": f, "confidence": conf.get(h) or ("high" if f else None),
-                    "example": vals[0] if vals else None, "note": note})
+                    "example": vals[0] if vals else None, "examples": vals[:3], "note": note})
     return out
 
 
@@ -513,7 +520,10 @@ def _commit_row(db: Session, gym: Gym, imp: Import, r: ImportRow, plans_by_id: d
                                    price_paise=n.get("paid_paise") or 0, source="import")
     paid = int(n.get("paid_paise") or 0)
     if paid > 0:
-        paid_at = local_midnight_utc(date.fromisoformat(n["start_date"]), gym.timezone) if n.get("start_date") else utcnow()
+        pay_day = n.get("paid_on") or n.get("start_date")
+        paid_at = (local_midnight_utc(date.fromisoformat(pay_day), gym.timezone) + timedelta(hours=12)) if pay_day else utcnow()
+        if paid_at > utcnow():
+            paid_at = utcnow()
         to_ms = min(paid, ms.price_paise) if ms else 0
         if to_ms > 0:
             add_payment(db, gym, imp.created_by, member, ms, to_ms, "cash", paid_at=paid_at, source="import",
@@ -570,13 +580,17 @@ def job_commit(import_id: str):
                                                         "blocking": True}]
         with session_scope() as db:
             imp = db.get(Import, import_id)
-            imp.counts = {**(imp.counts or {}), "imported": imported, "failed": failed}
+            c = dict(imp.counts or {})
+            c.update(imported=c.get("imported_before", 0) + imported, failed=failed, processed=imported + failed)
+            imp.counts = c
 
     with session_scope() as db:
         imp = db.get(Import, import_id)
         imp.status = "completed"
         imp.completed_at = utcnow()
-        imp.counts = {**(imp.counts or {}), "imported": imported, "failed": failed}
+        c = dict(imp.counts or {})
+        c.update(imported=c.get("imported_before", 0) + imported, failed=failed, processed=imported + failed)
+        imp.counts = c
         audit(db, gym_id, creator, "import.commit", "import", import_id,
               f"Imported {imported} members from {imp.file_name}" + (f" ({failed} failed)" if failed else ""))
     if creator:

@@ -1,9 +1,10 @@
-"""SMS jobs with retry ×3 (spec §18): invites and gym status updates."""
+"""Invites (sent synchronously so the API can report exactly what happened) and gym-status SMS."""
 import logging
-import time
+from urllib.parse import quote
+
+from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.db import session_scope
 from app.models import Gym, Invite, User
 from app.services import sms
 from app.services.jobs import enqueue
@@ -12,39 +13,42 @@ from app.utils import utcnow
 log = logging.getLogger("dumbbel.notify")
 
 
-def _send_invite(invite_id: str):
-    with session_scope() as db:
-        inv = db.get(Invite, invite_id)
-        if not inv or inv.status not in ("queued", "failed"):
-            return
-        gym = db.get(Gym, inv.gym_id)
+def invite_vars(db: Session, inv: Invite) -> dict:
+    gym = db.get(Gym, inv.gym_id)
+    if inv.kind == "staff":
         owner = db.get(User, gym.owner_user_id)
-        phone, kind = inv.phone, inv.kind
-        vars = ({"owner": owner.name or "Your gym owner", "gym": gym.name, "link": settings.admin_app_link}
-                if kind == "staff" else {"gym": gym.name, "link": settings.member_app_link})
-    err = None
-    for attempt in range(3):
-        try:
-            mid = sms.send_template(phone, "staff_invite" if kind == "staff" else "member_invite", vars)
-            with session_scope() as db:
-                inv = db.get(Invite, invite_id)
-                if inv.status != "joined":
-                    inv.status = "sent"
-                inv.provider_message_id, inv.sent_at, inv.error = mid, utcnow(), None
-            return
-        except Exception as e:
-            err = str(e)[:500]
-            time.sleep(2 * (attempt + 1))
-    with session_scope() as db:
-        inv = db.get(Invite, invite_id)
-        inv.status, inv.error = "failed", err
+        return {"owner": owner.name or "Your gym owner", "gym": gym.name, "link": settings.admin_app_link}
+    return {"gym": gym.name, "link": settings.member_app_link}
 
 
-def queue_invite(invite_id: str):
-    enqueue("sms.send", _send_invite, invite_id)
+def whatsapp_share(inv: Invite, text: str) -> str:
+    return f"https://wa.me/{inv.phone.lstrip('+')}?text={quote(text)}"
+
+
+def send_invite_now(db: Session, inv: Invite) -> dict:
+    """Try to send one invite SMS. Updates the invite row (caller commits).
+    Returns {status: sent|failed, reason?, provider_message_id?, whatsapp_url}."""
+    kind = "staff_invite" if inv.kind == "staff" else "member_invite"
+    vars = invite_vars(db, inv)
+    text = sms.render(kind, vars)
+    out = {"whatsapp_url": whatsapp_share(inv, text), "message": text}
+    try:
+        mid = sms.send_template(inv.phone, kind, vars)
+        inv.status = "sent" if inv.status != "joined" else "joined"
+        inv.provider_message_id, inv.sent_at, inv.error = mid, utcnow(), None
+        out.update(status="sent", provider_message_id=mid)
+    except sms.SmsNotConfigured as e:
+        inv.status, inv.error = "failed", str(e)[:500]
+        out.update(status="failed", reason="SMS_NOT_CONFIGURED", detail=str(e))
+    except sms.SmsFailed as e:
+        inv.status, inv.error = "failed", str(e)[:500]
+        out.update(status="failed", reason="SMS_PROVIDER_ERROR", detail=str(e))
+    return out
 
 
 def queue_gym_status_sms(gym_id: str, kind: str, reason: str | None):
+    from app.db import session_scope
+
     def run():
         with session_scope() as db:
             g = db.get(Gym, gym_id)
@@ -54,7 +58,9 @@ def queue_gym_status_sms(gym_id: str, kind: str, reason: str | None):
                 why = f"{reason}. " if reason else ""
             else:
                 why = reason or "—"
-            vars = {"gym": g.name, "reason": why,
-                    "support": settings.support_phone}
-        sms.send_template(phone, kind, vars)
+            vars = {"gym": g.name, "reason": why, "support": settings.support_phone}
+        try:
+            sms.send_template(phone, kind, vars)
+        except sms.SmsNotConfigured:
+            pass  # already logged; nothing to retry
     enqueue("sms.send", run, retries=2)

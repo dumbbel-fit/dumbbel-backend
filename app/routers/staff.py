@@ -9,66 +9,122 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.deps import GymCtx, gym_ctx, owner_ctx
-from app.errors import ApiError
-from app.models import AuditLog, Checkin, GymMember, GymStaff, Invite, Payment, Plan, Session as DbSession, User
+from app.deps import GymCtx, gym_ctx, owner_ctx, perm_ctx
+from app.errors import ApiError, validation
+from app.models import UpiPaymentRequest, AuditLog, Checkin, Gym, GymMember, GymStaff, Invite, Membership, MembershipFreeze, Payment, Plan, Session as DbSession, User
 from app.schemas import StaffCreate, StaffPatch
 from app.services.audit import audit
+from app.services.storage import public_url
 from app.services.core import get_or_create_user
-from app.services.notify import queue_invite
+from app.services.notify import send_invite_now
+from app.services.cache import rate_limit
+from app.permissions import PERMISSIONS, ROLE_PRESETS, effective_permissions
 from app.services.rules import LIVE, days_left, hour_label, load_states
 from app.utils import (clamp_limit, decode_cursor, encode_cursor, first_name, iso, local_midnight_utc,
                        normalize_phone, rupees, today_in, tz, utcnow)
 
-router = APIRouter(tags=["Staff, insights & activity"])
+from app.responses import DocRoute, ERRORS, ActivityOut, RemindersOut, RolesOut, StaffListOut, StaffOut, SummaryOut
+
+router = APIRouter(tags=["Staff, insights & activity"], route_class=DocRoute, responses=ERRORS)
 
 
 # ---------------- staff ----------------
-def ser_staff(st: GymStaff, u: User, last_action: AuditLog | None = None) -> dict:
-    return {"id": st.id, "user": {"id": u.id, "name": u.name, "phone": u.phone}, "role": st.role,
-            "can_record_payments": st.role == "owner" or st.can_record_payments, "status": st.status,
-            "invited_at": iso(st.invited_at), "joined_at": iso(st.joined_at), "deactivated_at": iso(st.deactivated_at),
-            "last_active_at": iso(max([t for t in (u.last_login_at, last_action.at if last_action else None) if t],
-                                      default=None)),
-            "last_action": {"at": iso(last_action.at), "summary": last_action.summary} if last_action else None}
+def ser_staff(st: GymStaff, u: User, last_action: AuditLog | None = None, branches: list | None = None,
+              invite: dict | None = None) -> dict:
+    perms = sorted(effective_permissions(st.role, st.staff_role, bool(st.can_record_payments), st.permissions))
+    d = {"id": st.id, "user": {"id": u.id, "name": u.name, "phone": u.phone}, "role": st.role,
+         "staff_role": "owner" if st.role == "owner" else (st.staff_role or "staff"), "permissions": perms,
+         "can_record_payments": "payments.record" in perms, "status": st.status,
+         "invited_at": iso(st.invited_at), "joined_at": iso(st.joined_at), "deactivated_at": iso(st.deactivated_at),
+         "last_active_at": iso(max([t for t in (u.last_login_at, last_action.at if last_action else None) if t],
+                                   default=None)),
+         "last_action": {"at": iso(last_action.at), "summary": last_action.summary} if last_action else None}
+    if branches is not None:
+        d["branches"] = branches
+    if invite is not None:
+        d["invite"] = invite
+    return d
 
 
-@router.get("/gyms/{gymId}/staff", summary="List staff (owner)")
-def list_staff(ctx: GymCtx = Depends(owner_ctx), db: Session = Depends(get_db)):
+def _validate_perms(perms: list[str] | None):
+    if perms:
+        bad = [p for p in perms if p not in PERMISSIONS]
+        if bad:
+            raise validation({"permissions": f"Unknown permission(s): {', '.join(bad)}"})
+
+
+@router.get("/gyms/{gymId}/roles", response_model=RolesOut, summary="Roles and what each can do")
+def roles(ctx: GymCtx = Depends(gym_ctx)):
+    return {"roles": {"owner": sorted(PERMISSIONS), **{k: sorted(v) for k, v in ROLE_PRESETS.items()}},
+            "permissions": PERMISSIONS}
+
+
+@router.get("/gyms/{gymId}/staff", response_model=StaffListOut, summary="List staff (staff.manage)")
+def list_staff(ctx: GymCtx = Depends(perm_ctx("staff.manage")), db: Session = Depends(get_db)):
     rows = db.execute(select(GymStaff, User).join(User, User.id == GymStaff.user_id)
                       .where(GymStaff.gym_id == ctx.gym.id).order_by(GymStaff.role, GymStaff.created_at)).all()
     last_ids = dict(db.execute(select(AuditLog.actor_user_id, func.max(AuditLog.id)).where(
         AuditLog.gym_id == ctx.gym.id, AuditLog.actor_user_id.in_([u.id for _, u in rows] or [""]))
         .group_by(AuditLog.actor_user_id)).all())
     logs = {a.actor_user_id: a for a in db.scalars(select(AuditLog).where(AuditLog.id.in_(list(last_ids.values()) or [0])))}
-    return {"items": [ser_staff(st, u, logs.get(u.id)) for st, u in rows]}
+    branches = {}
+    if ctx.gym.org_id:
+        for st2, g2 in db.execute(select(GymStaff, Gym).join(Gym, Gym.id == GymStaff.gym_id).where(
+                Gym.org_id == ctx.gym.org_id, GymStaff.user_id.in_([u.id for _, u in rows] or [""]),
+                GymStaff.status != "deactivated")).all():
+            branches.setdefault(st2.user_id, []).append({"gym_id": g2.id, "name": g2.name})
+    return {"items": [ser_staff(st, u, logs.get(u.id), branches.get(u.id)) for st, u in rows]}
 
 
-@router.post("/gyms/{gymId}/staff", status_code=201, summary="Invite staff (owner). Sends SMS",
-             description="409 ALREADY_STAFF if already invited/active here.")
-def add_staff(body: StaffCreate, ctx: GymCtx = Depends(owner_ctx), db: Session = Depends(get_db)):
-    phone = normalize_phone(body.phone)
-    user, _ = get_or_create_user(db, phone, body.name.strip())
-    st = db.scalar(select(GymStaff).where(GymStaff.gym_id == ctx.gym.id, GymStaff.user_id == user.id))
-    now = utcnow()
-    if st and st.status != "deactivated":
-        raise ApiError(409, "ALREADY_STAFF")
-    if st:
-        st.status, st.can_record_payments, st.invited_by, st.invited_at, st.deactivated_at = \
-            "invited", body.can_record_payments, ctx.user.id, now, None
-    else:
-        st = GymStaff(gym_id=ctx.gym.id, user_id=user.id, role="staff", can_record_payments=body.can_record_payments,
-                      status="invited", invited_by=ctx.user.id, invited_at=now)
-        db.add(st)
-    db.flush()
-    inv = Invite(gym_id=ctx.gym.id, staff_id=st.id, kind="staff", phone=phone, status="queued")
+def _invite_staff(db: Session, ctx: GymCtx, st: GymStaff, phone: str) -> dict:
+    inv = Invite(gym_id=st.gym_id, staff_id=st.id, kind="staff", phone=phone, status="queued")
     db.add(inv)
     db.flush()
-    audit(db, ctx.gym.id, ctx.user.id, "staff.invite", "staff", st.id,
-          f"Invited {user.name or phone} as staff" + (" with payments access" if body.can_record_payments else ""))
+    res = send_invite_now(db, inv)
+    return {"id": inv.id, "status": res["status"], "reason": res.get("reason"), "detail": res.get("detail"),
+            "whatsapp_url": res["whatsapp_url"], "message": res["message"]}
+
+
+@router.post("/gyms/{gymId}/staff", response_model=StaffOut, status_code=201,
+             summary="Add staff with a role (staff.manage). Sends invite SMS",
+             description="Roles: manager · receptionist · trainer · staff (see GET /roles). `permissions` overrides the "
+                         "preset. `branch_ids` adds access to other branches of the same business. The response has "
+                         "`invite.status` = sent|failed (+ `whatsapp_url` to share manually). 409 ALREADY_STAFF.")
+def add_staff(body: StaffCreate, ctx: GymCtx = Depends(perm_ctx("staff.manage")), db: Session = Depends(get_db)):
+    _validate_perms(body.permissions)
+    phone = normalize_phone(body.phone)
+    user, _ = get_or_create_user(db, phone, body.name.strip())
+    gym_ids = [ctx.gym.id]
+    for bid in body.branch_ids or []:
+        g2 = db.get(Gym, bid)
+        if not g2 or not ctx.gym.org_id or g2.org_id != ctx.gym.org_id:
+            raise validation({"branch_ids": "Only branches of this business can be added."})
+        if bid not in gym_ids:
+            gym_ids.append(bid)
+    now = utcnow()
+    main = None
+    for gid in gym_ids:
+        st = db.scalar(select(GymStaff).where(GymStaff.gym_id == gid, GymStaff.user_id == user.id))
+        if st and st.status != "deactivated":
+            if gid == ctx.gym.id:
+                raise ApiError(409, "ALREADY_STAFF")
+            continue
+        if st:
+            st.status, st.invited_by, st.invited_at, st.deactivated_at = "invited", ctx.user.id, now, None
+        else:
+            st = GymStaff(gym_id=gid, user_id=user.id, role="staff", status="invited", invited_by=ctx.user.id,
+                          invited_at=now)
+            db.add(st)
+        st.staff_role, st.permissions, st.can_record_payments = body.staff_role, body.permissions, body.can_record_payments
+        db.flush()
+        if gid == ctx.gym.id:
+            main = st
+    invite = _invite_staff(db, ctx, main, phone)
+    audit(db, ctx.gym.id, ctx.user.id, "staff.invite", "staff", main.id,
+          f"Added {user.name or phone} as {body.staff_role}" + (f" (+{len(gym_ids) - 1} branches)" if len(gym_ids) > 1 else "")
+          + f" · invite {invite['status']}")
     db.commit()
-    queue_invite(inv.id)
-    return ser_staff(st, user)
+    return ser_staff(main, user, invite=invite)
 
 
 def _get_staff(db: Session, ctx: GymCtx, staff_id: str) -> tuple[GymStaff, User]:
@@ -88,26 +144,48 @@ def _revoke_admin_sessions(db: Session, user_id: str):
                                            DbSession.revoked_at.is_(None)).values(revoked_at=utcnow()))
 
 
-@router.patch("/gyms/{gymId}/staff/{staffId}", summary="Change payments access / (de)activate (owner)")
-def patch_staff(staffId: str, body: StaffPatch, ctx: GymCtx = Depends(owner_ctx), db: Session = Depends(get_db)):
+@router.patch("/gyms/{gymId}/staff/{staffId}", response_model=StaffOut,
+              summary="Change role / permissions / payments access / (de)activate (staff.manage)")
+def patch_staff(staffId: str, body: StaffPatch, ctx: GymCtx = Depends(perm_ctx("staff.manage")), db: Session = Depends(get_db)):
     st, u = _get_staff(db, ctx, staffId)
-    before = {"can_record_payments": st.can_record_payments, "status": st.status}
-    if body.can_record_payments is not None:
-        st.can_record_payments = body.can_record_payments
+    _validate_perms(body.permissions)
+    before = {"staff_role": st.staff_role, "permissions": st.permissions, "can_record_payments": st.can_record_payments,
+              "status": st.status}
+    data = body.model_dump(exclude_unset=True)
+    for k in ("staff_role", "permissions", "can_record_payments"):
+        if k in data:
+            setattr(st, k, data[k])
     if body.status == "deactivated" and st.status != "deactivated":
         st.status, st.deactivated_at = "deactivated", utcnow()
         db.flush()
         _revoke_admin_sessions(db, u.id)
     elif body.status == "active" and st.status == "deactivated":
         st.status, st.deactivated_at = ("active" if st.joined_at else "invited"), None
-    audit(db, ctx.gym.id, ctx.user.id, "staff.update", "staff", st.id, f"Updated {u.name or u.phone}’s access",
-          before, {"can_record_payments": st.can_record_payments, "status": st.status})
+    audit(db, ctx.gym.id, ctx.user.id, "staff.update", "staff", st.id, f"Updated {u.name or u.phone}’s access", before,
+          {"staff_role": st.staff_role, "permissions": st.permissions, "can_record_payments": st.can_record_payments,
+           "status": st.status})
     db.commit()
     return ser_staff(st, u)
 
 
+@router.post("/gyms/{gymId}/staff/{staffId}/resend-invite", response_model=StaffOut,
+             summary="Resend the staff invite SMS (staff.manage)",
+             description="Allowed while the staff member hasn’t joined yet. Returns `invite.status` sent|failed "
+                         "and a `whatsapp_url` to share manually. 409 NOT_ACTIVE if they already joined.")
+def resend_invite(staffId: str, ctx: GymCtx = Depends(perm_ctx("staff.manage")), db: Session = Depends(get_db)):
+    st, u = _get_staff(db, ctx, staffId)
+    if st.status != "invited":
+        raise ApiError(409, "NOT_ACTIVE", "This person has already joined (or is deactivated).")
+    rate_limit(f"staffinvite:{st.id}", 3, 3600)
+    invite = _invite_staff(db, ctx, st, u.phone)
+    audit(db, ctx.gym.id, ctx.user.id, "staff.invite", "staff", st.id,
+          f"Resent invite to {u.name or u.phone} · {invite['status']}")
+    db.commit()
+    return ser_staff(st, u, invite=invite)
+
+
 @router.delete("/gyms/{gymId}/staff/{staffId}", status_code=204, summary="Remove staff (deactivate + revoke sessions)")
-def remove_staff(staffId: str, ctx: GymCtx = Depends(owner_ctx), db: Session = Depends(get_db)):
+def remove_staff(staffId: str, ctx: GymCtx = Depends(perm_ctx("staff.manage")), db: Session = Depends(get_db)):
     st, u = _get_staff(db, ctx, staffId)
     st.status, st.deactivated_at = "deactivated", utcnow()
     db.flush()
@@ -193,30 +271,83 @@ def build_insights(db: Session, ctx: GymCtx) -> dict:
             "away": away, "today": today}
 
 
-@router.get("/gyms/{gymId}/summary", summary="Home numbers, “Needs attention” insights, expiring list",
-            description="Money fields only with payments permission. Imported payments are excluded from collected_month_paise.")
+INSIDE_WINDOW_MIN = 90
+
+
+def _sum_paid(db: Session, gym_id: str, start, end=None, exclude_import: bool = False) -> int:
+    q = select(func.coalesce(func.sum(Payment.amount_paise), 0)).where(
+        Payment.gym_id == gym_id, Payment.status == "recorded", Payment.paid_at >= start)
+    if end is not None:
+        q = q.where(Payment.paid_at < end)
+    if exclude_import:
+        q = q.where(Payment.source != "import")
+    return int(db.scalar(q) or 0)
+
+
+@router.get("/gyms/{gymId}/summary", response_model=SummaryOut,
+            summary="Home: numbers, “Needs attention” insights, expiring list",
+            description="Money fields (`*_paise`, dues) only with payments.view. "
+                        "`collected_month_paise` includes imported payments; `collected_month_excl_import_paise` doesn’t. "
+                        f"`inside_now` = members with a successful check-in in the last {INSIDE_WINDOW_MIN} min.")
 def summary(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
     gym = ctx.gym
     data = build_insights(db, ctx)
     today = data["today"]
-    checkins_today = db.scalar(select(func.count(func.distinct(Checkin.member_id))).where(
-        Checkin.gym_id == gym.id, Checkin.local_date == today, Checkin.result == "success")) or 0
-    numbers = {"active_members": len(data["live"]), "total_members": len(data["rows"]), "checkins_today": checkins_today}
+    now = utcnow()
+    states = data["states"]
+    ok_today = [Checkin.gym_id == gym.id, Checkin.local_date == today, Checkin.result == "success"]
+    checkins_today = db.scalar(select(func.count(func.distinct(Checkin.member_id))).where(*ok_today)) or 0
+    visits_today = db.scalar(select(func.count()).select_from(Checkin).where(*ok_today)) or 0
+    inside_now = db.scalar(select(func.count(func.distinct(Checkin.member_id))).where(
+        Checkin.gym_id == gym.id, Checkin.result == "success",
+        Checkin.at >= now - timedelta(minutes=INSIDE_WINDOW_MIN))) or 0
+    m_first = today.replace(day=1)
+    status_counts = Counter(states[m.id].status for m, _ in data["rows"])
+    expiring_7d = sum(1 for m, _ in data["rows"] if states[m.id].current and states[m.id].status in LIVE
+                      and (states[m.id].current.end_date - today).days <= 7)
+    month_start_utc = local_midnight_utc(m_first, gym.timezone)
+    new_members_month = db.scalar(select(func.count()).select_from(GymMember).where(
+        GymMember.gym_id == gym.id, GymMember.created_at >= month_start_utc, GymMember.source != "import")) or 0
+    month_ms = db.execute(select(Membership.member_id, Membership.created_at).where(
+        Membership.gym_id == gym.id, Membership.created_at >= month_start_utc, Membership.source == "manual",
+        Membership.state != "cancelled")).all()
+    renewals_month = 0
+    for mid, created in month_ms:
+        if db.scalar(select(Membership.id).where(Membership.member_id == mid, Membership.created_at < created,
+                                                 Membership.state != "cancelled").limit(1)):
+            renewals_month += 1
+    numbers = {"active_members": len(data["live"]), "total_members": len(data["rows"]),
+               "checkins_today": checkins_today, "visits_today": visits_today, "inside_now": inside_now,
+               "inside_now_window_min": INSIDE_WINDOW_MIN,
+               "new_members_month": new_members_month, "renewals_month": renewals_month,
+               "expiring_7d": expiring_7d, "expired_count": status_counts.get("expired", 0),
+               "frozen_count": status_counts.get("frozen", 0), "suspended_count": status_counts.get("suspended", 0),
+               "upcoming_count": status_counts.get("upcoming", 0), "no_plan_count": status_counts.get("no_plan", 0),
+               "dues_count": len(data["dues"]), "dues_members": len(data["dues"])}
     if ctx.can_pay:
-        m_start = local_midnight_utc(today.replace(day=1), gym.timezone)
-        numbers["collected_month_paise"] = int(db.scalar(select(func.coalesce(func.sum(Payment.amount_paise), 0)).where(
-            Payment.gym_id == gym.id, Payment.status == "recorded", Payment.source != "import",
-            Payment.paid_at >= m_start)) or 0)
-        numbers["dues_paise"] = sum(s.due_paise for *_, s in data["dues"])
-        numbers["dues_members"] = len(data["dues"])
+        day_start = local_midnight_utc(today, gym.timezone)
+        lw_start = local_midnight_utc(today - timedelta(days=7), gym.timezone)
+        numbers.update({
+            "collected_month_paise": _sum_paid(db, gym.id, month_start_utc),
+            "collected_month_excl_import_paise": _sum_paid(db, gym.id, month_start_utc, exclude_import=True),
+            "today_collected_paise": _sum_paid(db, gym.id, day_start),
+            "last_week_same_day_paise": _sum_paid(db, gym.id, lw_start, lw_start + timedelta(days=1)),
+            "last_week_same_time_paise": _sum_paid(db, gym.id, lw_start, now - timedelta(days=7)),
+            "dues_paise": sum(s.due_paise for *_, s in data["dues"]),
+            "upi_to_verify": db.scalar(select(func.count()).select_from(UpiPaymentRequest).where(
+                UpiPaymentRequest.gym_id == gym.id, UpiPaymentRequest.status == "claimed")) or 0,
+        })
     expiring = []
     for m, u in data["rows"]:
-        s = data["states"][m.id]
-        c = s.current
-        if c and s.status != "cancelled" and today - timedelta(days=10) <= c.end_date <= today + timedelta(days=7):
-            expiring.append({"member_id": m.id, "name": m.display_name, "phone": u.phone, "plan_name": c.plan_name,
-                             "end_date": c.end_date.isoformat(), "days_left": days_left(c, s.status, today),
-                             "status": s.status})
+        st = states[m.id]
+        c = st.current
+        if c and st.status != "cancelled" and today - timedelta(days=10) <= c.end_date <= today + timedelta(days=7):
+            it = {"member_id": m.id, "name": m.display_name, "phone": u.phone, "member_code": m.member_code,
+                  "plan_name": c.plan_name, "end_date": c.end_date.isoformat(), "days_left": days_left(c, st.status, today),
+                  "status": st.status, "photo_url": public_url(u.photo_url)}
+            if ctx.can_pay:
+                it["due_paise"] = st.due_paise
+            expiring.append(it)
     expiring.sort(key=lambda x: x["end_date"])
     return {"date": today.isoformat(), "gym": {"id": gym.id, "name": gym.name, "status": gym.status},
             "numbers": numbers, "insights": data["insights"], "expiring": expiring[:20]}
@@ -230,7 +361,7 @@ TEMPLATES = {
 }
 
 
-@router.get("/gyms/{gymId}/reminders", summary="WhatsApp reminder links (server-side templates)")
+@router.get("/gyms/{gymId}/reminders", response_model=RemindersOut, summary="WhatsApp reminder links (server-side templates)")
 def reminders(type: Literal["expiring", "dues", "away"] = "expiring", ctx: GymCtx = Depends(gym_ctx),
               db: Session = Depends(get_db)):
     if type == "dues":
@@ -264,9 +395,9 @@ def reminders(type: Literal["expiring", "dues", "away"] = "expiring", ctx: GymCt
     return {"type": type, "items": items}
 
 
-@router.get("/gyms/{gymId}/activity", summary="Activity log (owner)")
+@router.get("/gyms/{gymId}/activity", response_model=ActivityOut, summary="Activity log (owner)")
 def activity(actor_id: str | None = None, entity_type: str | None = None, limit: int = Query(50, ge=1, le=100),
-             cursor: str | None = None, ctx: GymCtx = Depends(owner_ctx), db: Session = Depends(get_db)):
+             cursor: str | None = None, ctx: GymCtx = Depends(perm_ctx("activity.view")), db: Session = Depends(get_db)):
     q = select(AuditLog).where(AuditLog.gym_id == ctx.gym.id)
     if actor_id:
         q = q.where(AuditLog.actor_user_id == actor_id)

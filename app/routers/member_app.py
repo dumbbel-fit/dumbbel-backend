@@ -18,8 +18,9 @@ from app.services.jobs import enqueue
 from app.services.push import send_push
 from app.services.rules import days_left, hour_label, load_states, member_visit_stats, usual_hour, week_start
 from app.utils import first_name, iso, month_bounds, today_in, utcnow
+from app.responses import DocRoute, ERRORS, InsightsOut, MyCheckinsOut, MyMembershipsOut, MyPaymentsOut, QrOut
 
-router = APIRouter(prefix="/me", tags=["Member app"])
+router = APIRouter(prefix="/me", tags=["Member app"], route_class=DocRoute, responses=ERRORS)
 
 
 def _my_rows(db: Session, user: User):
@@ -60,19 +61,20 @@ def _resolve(db: Session, user: User, member_id: str | None) -> tuple[GymMember,
     return rows[0]
 
 
-@router.get("/memberships", summary="My gyms, current plan and visit stats")
+@router.get("/memberships", response_model=MyMembershipsOut, summary="My gyms, current plan and visit stats")
 def my_memberships(user: User = Depends(current_user), db: Session = Depends(get_db)):
     return {"items": member_cards(db, user)}
 
 
 QR_MESSAGES = {"expired": "Your membership has ended. Renew at the front desk to check in.",
                "frozen": "Your membership is frozen right now.",
+               "suspended": "Your membership is on hold. Please talk to the front desk.",
                "cancelled": "This membership was cancelled.",
                "upcoming": "Your membership hasn’t started yet.",
                "no_plan": "No active membership. Ask the front desk to add one."}
 
 
-@router.get("/qr", summary="Rotating check-in QR token (refresh every 30 s)",
+@router.get("/qr", response_model=QrOut, summary="Rotating check-in QR token (refresh every 30 s)",
             description="Token only issued when status allows entry; otherwise `token` is null and `message` explains why.")
 def my_qr(member_id: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
     gm, g = _resolve(db, user, member_id)
@@ -93,7 +95,7 @@ def my_qr(member_id: str | None = None, user: User = Depends(current_user), db: 
     return {**base, "token": None, "expires_at": None, "status": status, "message": QR_MESSAGES.get(status)}
 
 
-@router.get("/checkins", summary="My visit calendar for a month + totals")
+@router.get("/checkins", response_model=MyCheckinsOut, summary="My visit calendar for a month + totals")
 def my_checkins(member_id: str | None = None, month: str | None = Query(None, examples=["2026-11"]),
                 user: User = Depends(current_user), db: Session = Depends(get_db)):
     gm, g = _resolve(db, user, member_id)
@@ -110,7 +112,7 @@ def my_checkins(member_id: str | None = None, month: str | None = Query(None, ex
                        "streak": stats["streak"], "best_streak": max(stats["best_streak"], gm.best_streak or 0)}}
 
 
-@router.get("/insights", summary="Personal insights: weekly goal, usual time, membership end")
+@router.get("/insights", response_model=InsightsOut, summary="Personal insights: weekly goal, usual time, membership end")
 def my_insights(member_id: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
     gm, g = _resolve(db, user, member_id)
     today = today_in(g.timezone)
@@ -142,7 +144,7 @@ def my_insights(member_id: str | None = None, user: User = Depends(current_user)
     return {"items": items}
 
 
-@router.get("/payments", summary="My payments and dues at a gym")
+@router.get("/payments", response_model=MyPaymentsOut, summary="My payments and dues at a gym")
 def my_payments(member_id: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
     gm, g = _resolve(db, user, member_id)
     st = load_states(db, g, [gm.id])[gm.id]

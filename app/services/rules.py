@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.models import Checkin, Gym, Membership, MembershipFreeze, Payment
 from app.utils import local_date_of, today_in, tz
 
-LIVE = ("active", "expiring", "frozen")
+LIVE = ("active", "expiring", "frozen", "suspended")
 
 
 def freeze_covers(fr: MembershipFreeze, d: date) -> bool:
@@ -19,6 +19,8 @@ def freeze_covers(fr: MembershipFreeze, d: date) -> bool:
 def membership_status(m: Membership, today: date, freezes: list[MembershipFreeze] | None = None) -> str:
     if m.state == "cancelled":
         return "cancelled"
+    if getattr(m, "suspended_at", None) and m.end_date >= today:
+        return "suspended"
     if freezes is not None:
         if any(freeze_covers(f, today) for f in freezes):
             return "frozen"

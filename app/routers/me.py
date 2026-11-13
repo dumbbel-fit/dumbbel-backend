@@ -14,18 +14,19 @@ from app.routers.auth import staff_of
 from app.schemas import DeviceTokenIn, MePatch
 from app.services.core import ser_user
 from app.utils import today_in, utcnow
+from app.responses import DocRoute, ERRORS, ConfigOut, DeletionOut, HealthOut, MeOut, UserWrapOut
 
-router = APIRouter(tags=["Me"])
-public = APIRouter(tags=["Common"])
+router = APIRouter(tags=["Me"], route_class=DocRoute, responses=ERRORS)
+public = APIRouter(tags=["Common"], route_class=DocRoute, responses=ERRORS)
 
 
-@router.get("/me", summary="Current user, gyms they staff, weekly goal")
+@router.get("/me", response_model=MeOut, summary="Current user, gyms they staff, weekly goal")
 def get_me(auth: Auth = Depends(get_auth), db: Session = Depends(get_db)):
     u = auth.user
     return {"user": ser_user(u), "staff_of": staff_of(db, u.id), "weekly_goal": u.weekly_goal}
 
 
-@router.patch("/me", summary="Update profile / weekly goal")
+@router.patch("/me", response_model=UserWrapOut, summary="Update profile / weekly goal")
 def patch_me(body: MePatch, user: User = Depends(current_user), db: Session = Depends(get_db)):
     data = body.model_dump(exclude_unset=True)
     if "photo_key" in data:
@@ -36,7 +37,7 @@ def patch_me(body: MePatch, user: User = Depends(current_user), db: Session = De
     return {"user": ser_user(user)}
 
 
-@router.delete("/me", status_code=202, summary="Request account deletion (processed within 30 days)",
+@router.delete("/me", response_model=DeletionOut, status_code=202, summary="Request account deletion (processed within 30 days)",
                description="Staff must be removed from every gym first (409 STAFF_MUST_BE_REMOVED).")
 def delete_me(user: User = Depends(current_user), db: Session = Depends(get_db)):
     active_staff = db.scalar(select(GymStaff).where(GymStaff.user_id == user.id,
@@ -71,7 +72,7 @@ def remove_device(token: str, user: User = Depends(current_user), db: Session = 
     return Response(status_code=204)
 
 
-@public.get("/health", summary="Uptime check")
+@public.get("/health", response_model=HealthOut, summary="Uptime check")
 def health(db: Session = Depends(get_db)):
     err = None
     try:
@@ -85,10 +86,17 @@ def health(db: Session = Depends(get_db)):
     return out
 
 
-@public.get("/config", summary="Min app versions, support phone, maintenance flag, login provider",
+@public.get("/config", response_model=ConfigOut, summary="Min app versions, support phone, maintenance flag, login provider",
             description="`auth_provider`: `firebase` → use Firebase SDK then POST /auth/firebase; `2factor` → /auth/otp/send + /auth/otp/verify.")
 def config():
     return {"min_app_version": {"admin": settings.min_admin_version, "member": settings.min_member_version},
             "support_phone": settings.support_phone, "maintenance": settings.maintenance,
             "auth_provider": settings.auth_provider.lower(),
-            "firebase_project_id": settings.firebase_project_id}
+            "firebase_project_id": settings.firebase_project_id,
+            "firebase": {"apiKey": settings.firebase_web_api_key,
+                         "authDomain": f"{settings.firebase_project_id}.firebaseapp.com" if settings.firebase_project_id else None,
+                         "projectId": settings.firebase_project_id, "appId": settings.firebase_web_app_id,
+                         "messagingSenderId": settings.firebase_messaging_sender_id
+                         or ((settings.firebase_web_app_id or "").split(":")[1] if (settings.firebase_web_app_id or "").count(":") >= 2 else None),
+                         "storageBucket": settings.firebase_storage_bucket
+                         or (f"{settings.firebase_project_id}.firebasestorage.app" if settings.firebase_project_id else None)}}

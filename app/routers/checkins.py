@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.deps import GymCtx, Idem, gym_ctx, idem_header
+from app.deps import GymCtx, Idem, gym_ctx, idem_header, perm_ctx
 from app.errors import ApiError
 from app.models import Checkin, GymMember, Membership, User
 from app.schemas import ManualCheckinIn, ScanIn
@@ -21,21 +21,23 @@ from app.services.jobs import enqueue
 from app.services.push import send_push
 from app.services.rules import days_left, member_state, streaks, visit_days
 from app.utils import iso, local_date_of, local_midnight_utc, today_in, tz, utcnow
+from app.responses import DocRoute, ERRORS, CheckinFeedOut, CheckinResultOut, CheckinStatsOut
 
-router = APIRouter(tags=["Check-ins & QR"])
+router = APIRouter(tags=["Check-ins & QR"], route_class=DocRoute, responses=ERRORS)
 
 MESSAGES = {
     "success": "Checked in. Have a great session!",
     "duplicate": "Already checked in a little while ago.",
     "expired": "Membership has expired. Renew to check in.",
     "frozen": "Membership is frozen right now.",
+    "suspended": "Membership is suspended. Please talk to the front desk.",
     "cancelled": "Membership was cancelled.",
     "not_started": "Membership hasn’t started yet.",
     "not_member": "Not a member of this gym.",
     "invalid_token": "This QR isn’t valid. Ask the member to refresh it.",
     "gym_inactive": "QR check-in unlocks once the gym is approved. Use manual check-in.",
 }
-STATUS_TO_RESULT = {"cancelled": "cancelled", "frozen": "frozen", "upcoming": "not_started",
+STATUS_TO_RESULT = {"cancelled": "cancelled", "frozen": "frozen", "suspended": "suspended", "upcoming": "not_started",
                     "expired": "expired", "no_plan": "expired"}
 
 
@@ -119,11 +121,11 @@ def process_checkin(db: Session, ctx: GymCtx, method: str, *, token: str | None 
     return out
 
 
-@router.post("/gyms/{gymId}/checkins/scan", summary="Scan member QR",
+@router.post("/gyms/{gymId}/checkins/scan", response_model=CheckinResultOut, summary="Scan member QR",
              description="Requires `Idempotency-Key`. Always 200 for a processed scan — `result` drives the screen: "
                          "success | duplicate | expired | frozen | cancelled | not_started | not_member | invalid_token | gym_inactive. "
                          "Rate limit 60/min per staff device.")
-def scan(body: ScanIn, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db),
+def scan(body: ScanIn, ctx: GymCtx = Depends(perm_ctx("checkins.manage")), db: Session = Depends(get_db),
          idempotency_key: str | None = Depends(idem_header)):
     idem = Idem(db, ctx.user, idempotency_key, f"POST /gyms/{ctx.gym.id}/checkins/scan")
     if idem.replay:
@@ -133,9 +135,9 @@ def scan(body: ScanIn, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get
     return idem.respond(200, out)
 
 
-@router.post("/gyms/{gymId}/checkins/manual", summary="Manual check-in (fallback; works for pending gyms)",
+@router.post("/gyms/{gymId}/checkins/manual", response_model=CheckinResultOut, summary="Manual check-in (fallback; works for pending gyms)",
              description="Requires `Idempotency-Key`. Same response shape as scan with method `manual`.")
-def manual(body: ManualCheckinIn, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db),
+def manual(body: ManualCheckinIn, ctx: GymCtx = Depends(perm_ctx("checkins.manage")), db: Session = Depends(get_db),
            idempotency_key: str | None = Depends(idem_header)):
     idem = Idem(db, ctx.user, idempotency_key, f"POST /gyms/{ctx.gym.id}/checkins/manual")
     if idem.replay:
@@ -147,7 +149,7 @@ def manual(body: ManualCheckinIn, ctx: GymCtx = Depends(gym_ctx), db: Session = 
     return idem.respond(200, out)
 
 
-@router.get("/gyms/{gymId}/checkins", summary="Check-in feed (poll every 10 s with `since`)")
+@router.get("/gyms/{gymId}/checkins", response_model=CheckinFeedOut, summary="Check-in feed (poll every 10 s with `since`)")
 def feed(date: str | None = Query(None, examples=["2026-11-12"]), result: Literal["success", "denied"] | None = None,
          since: datetime | None = Query(None, description="Only items after this timestamp (polling)"),
          limit: int = Query(100, ge=1, le=200), ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
@@ -182,7 +184,9 @@ def feed(date: str | None = Query(None, examples=["2026-11-12"]), result: Litera
             "server_time": iso(utcnow())}
 
 
-@router.get("/gyms/{gymId}/checkins/stats", summary="Check-in stats: totals, by hour, by day, peak hour")
+@router.get("/gyms/{gymId}/checkins/stats", response_model=CheckinStatsOut,
+            summary="Check-in stats: totals, unique members, by result, by hour, by day, peak hour",
+            description="`range`: today · week (Mon→today) · month (1st→today). `by_day` has one entry per day in the range.")
 def stats(range: Literal["today", "week", "month"] = "today", ctx: GymCtx = Depends(gym_ctx),
           db: Session = Depends(get_db)):
     gym = ctx.gym
@@ -201,6 +205,10 @@ def stats(range: Literal["today", "week", "month"] = "today", ctx: GymCtx = Depe
         by_day.append({"date": d.isoformat(), "count": per_day.get(d, 0)})
         d += timedelta(days=1)
     peak = max(range_ := list(enumerate(by_hour)), key=lambda x: x[1])[0] if ok else None
+    by_result = {k: 0 for k in ("success", "duplicate", "expired", "frozen", "suspended", "cancelled", "not_started",
+                                "not_member", "invalid_token", "gym_inactive")}
+    for r in rows:
+        by_result[r.result] = by_result.get(r.result, 0) + 1
     return {"range": range, "from": start.isoformat(), "to": today.isoformat(), "total": len(ok),
-            "unique_members": len({r.member_id for r in ok}), "denied": len(rows) - len(ok),
+            "unique_members": len({r.member_id for r in ok}), "denied": len(rows) - len(ok), "by_result": by_result,
             "by_hour": by_hour, "by_day": by_day, "peak_hour": peak}

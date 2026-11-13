@@ -69,13 +69,21 @@ def default_start(db: Session, gym: Gym, member_id: str) -> date:
 def create_membership(db: Session, gym: Gym, actor_id: str | None, member: GymMember, *, plan: Plan | None,
                       start: date, end: date | None = None, discount_paise: int = 0, plan_name: str | None = None,
                       price_paise: int | None = None, source: str = "manual") -> Membership:
+    joining_fee = gst = 0
     if plan:
         if not plan.active:
             raise ApiError(422, "PLAN_INACTIVE")
-        if discount_paise < 0 or discount_paise > plan.price_paise:
+        base = plan_price(plan)
+        if discount_paise < 0 or discount_paise > base:
             raise validation({"discount_paise": "Discount can’t be more than the plan price."})
         end = end or start + timedelta(days=plan.duration_days - 1)
-        price = plan.price_paise - discount_paise
+        if plan.joining_fee_paise and source == "manual" and not db.scalar(
+                select(Membership.id).where(Membership.member_id == member.id).limit(1)):
+            joining_fee = plan.joining_fee_paise
+        taxable = base - discount_paise + joining_fee
+        if plan.gst_mode == "exclusive" and plan.gst_rate:
+            gst = round(taxable * plan.gst_rate / 100)
+        price = taxable + gst
         name = plan.name
     else:
         if not end:
@@ -90,7 +98,8 @@ def create_membership(db: Session, gym: Gym, actor_id: str | None, member: GymMe
                        {"membership_id": clash.id, "start_date": dstr(clash.start_date), "end_date": dstr(clash.end_date)})
     today = today_in(gym.timezone)
     m = Membership(gym_id=gym.id, member_id=member.id, plan_id=plan.id if plan else None, plan_name=name,
-                   price_paise=price, discount_paise=discount_paise, start_date=start, end_date=end,
+                   price_paise=price, discount_paise=discount_paise, joining_fee_paise=joining_fee, gst_paise=gst,
+                   start_date=start, end_date=end,
                    state="scheduled" if start > today else "active", source=source, created_by=actor_id)
     db.add(m)
     db.flush()
@@ -157,13 +166,14 @@ def add_payment(db: Session, gym: Gym, actor_id: str | None, member: GymMember, 
 def ser_user(u: User) -> dict:
     return {"id": u.id, "name": u.name, "phone": u.phone, "email": u.email, "dob": dstr(u.dob), "gender": u.gender,
             "photo_url": storage.public_url(u.photo_url), "weekly_goal": u.weekly_goal,
-            "first_login_at": iso(u.first_login_at), "deletion_requested_at": iso(u.deletion_requested_at)}
+            "first_login_at": iso(u.first_login_at), "deletion_requested_at": iso(u.deletion_requested_at),
+            "is_platform_admin": bool(u.is_platform_admin)}
 
 
 def ser_gym(g: Gym, full: bool = True) -> dict:
     d = {"id": g.id, "name": g.name, "code_prefix": g.code_prefix, "status": g.status,
          "status_reason": g.status_reason, "area": g.area, "city": g.city, "logo_url": storage.public_url(g.logo_url),
-         "phone": g.phone}
+         "phone": g.phone, "org_id": g.org_id or g.id}
     if full:
         d.update({"owner_user_id": g.owner_user_id, "email": g.email, "address_line": g.address_line,
                   "state": g.state, "pincode": g.pincode, "lat": float(g.lat) if g.lat is not None else None,
@@ -173,9 +183,17 @@ def ser_gym(g: Gym, full: bool = True) -> dict:
     return d
 
 
+def plan_price(p: Plan) -> int:
+    return p.offer_price_paise if p.offer_price_paise is not None else p.price_paise
+
+
 def ser_plan(p: Plan, active_members: int | None = None) -> dict:
     d = {"id": p.id, "name": p.name, "duration_days": p.duration_days, "price_paise": p.price_paise,
-         "active": p.active, "sort_order": p.sort_order}
+         "offer_price_paise": p.offer_price_paise, "effective_price_paise": plan_price(p),
+         "joining_fee_paise": p.joining_fee_paise, "gst_mode": p.gst_mode, "gst_rate": p.gst_rate,
+         "facilities": p.facilities or [], "description": p.description, "freeze_allowed": p.freeze_allowed,
+         "max_freeze_days": p.max_freeze_days, "cancellation_policy": p.cancellation_policy,
+         "refund_policy": p.refund_policy, "active": p.active, "sort_order": p.sort_order}
     if active_members is not None:
         d["active_members"] = active_members
     return d
@@ -190,13 +208,16 @@ def ser_membership(m: Membership, gym: Gym, db: Session | None = None, status: s
     d = {"id": m.id, "member_id": m.member_id, "plan_id": m.plan_id, "plan_name": m.plan_name,
          "start_date": dstr(m.start_date), "end_date": dstr(m.end_date), "state": m.state, "status": st,
          "days_left": days_left(m, st, today), "source": m.source, "cancelled_at": iso(m.cancelled_at),
-         "cancel_reason": m.cancel_reason, "created_at": iso(m.created_at)}
+         "cancel_reason": m.cancel_reason, "suspended_at": iso(m.suspended_at), "suspend_reason": m.suspend_reason,
+         "created_at": iso(m.created_at)}
     if freezes is not None:
         d["freezes"] = [{"id": f.id, "from_date": dstr(f.from_date), "to_date": dstr(f.to_date), "days": f.days,
                          "reason": f.reason, "note": f.note, "ended_at": iso(f.ended_at)} for f in freezes]
     if can_pay:
         d["price_paise"] = m.price_paise
         d["discount_paise"] = m.discount_paise
+        d["joining_fee_paise"] = m.joining_fee_paise
+        d["gst_paise"] = m.gst_paise
         if due is not None:
             d["due_paise"] = due
     return d
@@ -215,7 +236,8 @@ def ser_member_basic(m: GymMember, u: User, include_notes: bool = True) -> dict:
     d = {"id": m.id, "member_code": m.member_code, "name": m.display_name, "phone": u.phone, "email": u.email,
          "dob": dstr(u.dob), "gender": u.gender, "photo_url": storage.public_url(u.photo_url),
          "emergency_contact": m.emergency_contact, "status": m.status, "source": m.source,
-         "joined_on": dstr(m.joined_on), "last_checkin_at": iso(m.last_checkin_at), "on_app": u.first_login_at is not None,
+         "joined_on": dstr(m.joined_on), "joined_at": dstr(m.joined_on), "last_checkin_at": iso(m.last_checkin_at),
+         "last_visit_at": iso(m.last_checkin_at), "on_app": u.first_login_at is not None,
          "claimed_at": iso(m.claimed_at), "claim_disputed_at": iso(m.claim_disputed_at), "created_at": iso(m.created_at)}
     if include_notes:
         d["notes"] = m.notes

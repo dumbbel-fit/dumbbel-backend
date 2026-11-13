@@ -11,15 +11,18 @@ from app.db import get_db
 from app.deps import current_user, platform_admin
 from app.errors import ApiError, validation
 from app.models import Gym, GymDocument, GymMember, GymStaff, Session as DbSession, User
-from app.schemas import ChangePhoneIn, PresignIn, ReasonIn
+from app.schemas import AdminIn, ChangePhoneIn, PresignIn, ReasonIn
 from app.services import storage
 from app.services.audit import audit
 from app.services.core import ser_gym, ser_user
 from app.services.notify import queue_gym_status_sms
 from app.utils import clamp_limit, decode_cursor, encode_cursor, iso, normalize_phone, utcnow, uuid7
+from app.responses import DocRoute, ERRORS, AdminsOut, GymListOut, GymOut, PresignOut, UserWrapOut
 
-router = APIRouter(prefix="/internal", tags=["Internal console"])
-uploads = APIRouter(tags=["Files"])
+router = APIRouter(prefix="/internal", tags=["Internal console"], route_class=DocRoute, responses=ERRORS)
+"""Console access = users.is_platform_admin. Grant it with POST /internal/admins (by an existing admin) or
+`python -m scripts.make_admin <phone>`. Everyone else gets 403 NOT_PLATFORM_ADMIN on /internal/*."""
+uploads = APIRouter(tags=["Files"], route_class=DocRoute, responses=ERRORS)
 
 
 def _gym_out(db: Session, g: Gym, docs: bool = False) -> dict:
@@ -36,7 +39,7 @@ def _gym_out(db: Session, g: Gym, docs: bool = False) -> dict:
     return d
 
 
-@router.get("/gyms", summary="List gyms for review")
+@router.get("/gyms", response_model=GymListOut, summary="List gyms for review")
 def list_gyms(status: Literal["pending", "active", "suspended", "rejected"] | None = None, q: str | None = None,
               limit: int = Query(50, ge=1, le=100), cursor: str | None = None,
               admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
@@ -56,7 +59,7 @@ def list_gyms(status: Literal["pending", "active", "suspended", "rejected"] | No
     return {"items": [_gym_out(db, g, docs=True) for g in rows[:lim]], "next_cursor": nxt}
 
 
-@router.get("/gyms/{id}", summary="Gym detail with documents (signed URLs, 5 min)")
+@router.get("/gyms/{id}", response_model=GymOut, summary="Gym detail with documents (signed URLs, 5 min)")
 def get_gym(id: str, admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
     g = db.get(Gym, id)
     if not g:
@@ -103,10 +106,11 @@ def _transition(action: str):
 
 
 for _a in TRANSITIONS:
-    router.add_api_route(f"/gyms/{{id}}/{_a}", _transition(_a), methods=["POST"], summary=f"{_a.title()} gym (SMS to owner)")
+    router.add_api_route(f"/gyms/{{id}}/{_a}", _transition(_a), methods=["POST"], response_model=GymOut,
+                         summary=f"{_a.title()} gym (SMS to owner)")
 
 
-@router.post("/users/{id}/change-phone", summary="Support-only phone change (revokes sessions)")
+@router.post("/users/{id}/change-phone", response_model=UserWrapOut, summary="Support-only phone change (revokes sessions)")
 def change_phone(id: str, body: ChangePhoneIn, admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
     u = db.get(User, id)
     if not u or u.deleted_at:
@@ -123,6 +127,40 @@ def change_phone(id: str, body: ChangePhoneIn, admin: User = Depends(platform_ad
     return {"user": ser_user(u)}
 
 
+# ---------------- console admins ----------------
+@router.get("/admins", response_model=AdminsOut, summary="Who has console access (platform admins)")
+def list_admins(admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
+    rows = db.scalars(select(User).where(User.is_platform_admin.is_(True), User.deleted_at.is_(None))).all()
+    return {"items": [{**ser_user(u), "is_platform_admin": True} for u in rows]}
+
+
+@router.post("/admins", response_model=UserWrapOut, summary="Grant console access to a phone number")
+def add_admin(body: AdminIn, admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
+    phone = normalize_phone(body.phone)
+    u = db.scalar(select(User).where(User.phone == phone))
+    if not u:
+        u = User(phone=phone, name=body.name)
+        db.add(u)
+        db.flush()
+    u.is_platform_admin = True
+    audit(db, None, admin.id, "admin.grant", "user", u.id, f"Granted console access to {u.name or phone}")
+    db.commit()
+    return {"user": {**ser_user(u), "is_platform_admin": True}}
+
+
+@router.delete("/admins/{userId}", status_code=204, summary="Revoke console access")
+def remove_admin(userId: str, admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
+    u = db.get(User, userId)
+    if not u or not u.is_platform_admin:
+        raise ApiError(404, "NOT_FOUND", "That admin wasn’t found.")
+    if u.id == admin.id:
+        raise ApiError(409, "NOT_ACTIVE", "You can’t remove your own console access.")
+    u.is_platform_admin = False
+    audit(db, None, admin.id, "admin.revoke", "user", u.id, f"Revoked console access from {u.name or u.phone}")
+    db.commit()
+    return Response(status_code=204)
+
+
 # ---------------- uploads ----------------
 LIMITS = {"member_photo": ({"image/jpeg", "image/png", "image/webp"}, 5 * 1024 * 1024),
           "gym_logo": ({"image/jpeg", "image/png", "image/webp"}, 5 * 1024 * 1024),
@@ -134,7 +172,7 @@ EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "applicati
        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx"}
 
 
-@uploads.post("/uploads/presign", summary="Get a presigned upload URL",
+@uploads.post("/uploads/presign", response_model=PresignOut, summary="Get a presigned upload URL",
               description="PUT the file bytes to `upload_url` with the same Content-Type, then pass `file_key` to the API. "
                           "Limits: images 5 MB (jpg/png/webp) · documents 5 MB (pdf/jpg/png) · import 10 MB (csv/xls/xlsx).")
 def presign(body: PresignIn, user: User = Depends(current_user)):

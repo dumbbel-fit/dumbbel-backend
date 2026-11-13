@@ -38,9 +38,9 @@ async def lifespan(app: FastAPI):
     if settings.auto_create_tables:
         # Never block startup on the DB: if it's unreachable, log why and keep serving (/v1/health shows db=false).
         try:
-            from app.db import Base, engine
-            import app.models  # noqa: F401
-            Base.metadata.create_all(engine)
+            from app.db import engine
+            from app.migrate import auto_migrate
+            auto_migrate(engine)
             log.info("database ready")
         except Exception as e:
             log.error("DATABASE NOT REACHABLE at startup: %s: %s", type(e).__name__, str(e)[:500])
@@ -67,6 +67,8 @@ TAGS = [
     {"name": "Import & invites", "description": "4-step member import and app invites."},
     {"name": "Staff, insights & activity", "description": "Staff management, home summary, reminders, audit log."},
     {"name": "Member app", "description": "Member’s own memberships, rotating QR, history, insights, payments."},
+    {"name": "UPI payments", "description": "Members pay straight to the gym’s own UPI ID (0% fees). Request → "
+                                            "member pays via QR/intent → submits UTR → staff verify → payment + receipt recorded."},
     {"name": "Internal console", "description": "Platform admins only: gym approvals, support phone change."},
     {"name": "Files", "description": "Presigned uploads (S3/R2 or local)."},
 ]
@@ -90,9 +92,12 @@ app = FastAPI(title="DUMBBEL.fit API", version="1.0.0", description=DESCRIPTION,
               swagger_ui_parameters={"persistAuthorization": True, "displayRequestDuration": True,
                                      "docExpansion": "none", "filter": True})
 
-app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in settings.cors_origins.split(",")],
+_origins = [o.strip().rstrip("/") for o in settings.cors_origins.split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=_origins,
+                   allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$" if settings.cors_allow_localhost else None,
                    allow_credentials=False, allow_methods=["*"], allow_headers=["*"],
-                   expose_headers=["X-Request-Id", "Retry-After", "Idempotent-Replayed"])
+                   expose_headers=["X-Request-Id", "Retry-After", "Idempotent-Replayed", "Content-Disposition"],
+                   max_age=600)
 
 app.add_exception_handler(ApiError, api_error_handler)
 app.add_exception_handler(RequestValidationError, validation_handler)
@@ -106,6 +111,8 @@ VERSION_EXEMPT = ("/v1/config", "/v1/health", "/docs", "/redoc", "/openapi.json"
 async def request_context(request: Request, call_next):
     rid = request.headers.get("x-request-id") or uuid.uuid4().hex
     request.state.request_id = rid
+    from app.context import request_id_var
+    request_id_var.set(rid)
     start = time.perf_counter()
     path = request.url.path
     x_app = (request.headers.get("x-app") or "").lower()
@@ -128,11 +135,12 @@ async def request_context(request: Request, call_next):
     return resp
 
 
-from app.routers import auth, checkins, gyms, imports, internal, me, member_app, members, payments, staff  # noqa: E402
+from app.routers import auth, checkins, gyms, imports, internal, me, member_app, members, payments, staff, upi  # noqa: E402
 
 P = settings.api_prefix
 for r in (auth.router, me.public, me.router, member_app.router, gyms.router, members.router, payments.router,
-          checkins.router, imports.public, imports.router, staff.router, internal.router, internal.uploads):
+          checkins.router, imports.public, imports.router, staff.router, upi.router, upi.me_router, internal.router,
+          internal.uploads):
     app.include_router(r, prefix=P)
 
 

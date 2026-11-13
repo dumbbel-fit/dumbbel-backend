@@ -106,14 +106,28 @@ class GymPatch(StrictModel):
     settings: GymSettingsIn | None = None
 
 
-class PlanCreate(BaseModel):
+class PlanExtras(BaseModel):
+    offer_price_paise: int | None = Field(None, ge=0, description="When set, members pay this instead of price_paise")
+    joining_fee_paise: int | None = Field(None, ge=0, description="Added to a member’s first membership at this gym")
+    gst_mode: Literal["inclusive", "exclusive"] | None = Field(None, description="exclusive = GST added on top")
+    gst_rate: int | None = Field(None, ge=0, le=28)
+    facilities: list[str] | None = Field(None, examples=[["Cardio", "Weights", "Steam"]])
+    description: str | None = None
+    freeze_allowed: bool | None = None
+    max_freeze_days: int | None = Field(None, ge=0, le=365, description="Overrides the gym’s max_freeze_days")
+    cancellation_policy: str | None = None
+    refund_policy: str | None = None
+
+
+class PlanCreate(PlanExtras):
     name: str = Field(..., min_length=1, max_length=120, examples=["Quarterly"])
     duration_days: int = Field(..., ge=1, le=730, examples=[92])
     price_paise: int = Field(..., ge=0, examples=[540000])
     sort_order: int | None = None
 
 
-class PlanPatch(StrictModel):
+class PlanPatch(PlanExtras):
+    model_config = ConfigDict(extra="forbid")
     name: str | None = Field(None, min_length=1, max_length=120)
     duration_days: int | None = Field(None, ge=1, le=730)
     price_paise: int | None = Field(None, ge=0)
@@ -172,6 +186,14 @@ class FreezeIn(BaseModel):
     days: int | None = Field(None, ge=1, le=365, description="Omit for an open-ended freeze")
     reason: Literal["travel", "medical", "other"]
     note: str | None = None
+
+
+class SuspendIn(BaseModel):
+    reason: str = Field(..., min_length=1, examples=["Payment pending / misconduct"])
+
+
+class NoteIn(BaseModel):
+    body: str = Field(..., min_length=1, max_length=4000)
 
 
 class CancelIn(BaseModel):
@@ -235,13 +257,21 @@ class InvitesIn(BaseModel):
 
 
 # ---------- staff ----------
+StaffRole = Literal["manager", "receptionist", "trainer", "staff"]
+
+
 class StaffCreate(BaseModel):
     name: str = Field(..., min_length=1)
     phone: Phone
+    staff_role: StaffRole = "staff"
+    permissions: list[str] | None = Field(None, description="Optional explicit permission list (overrides the role preset)")
     can_record_payments: bool = False
+    branch_ids: list[str] | None = Field(None, description="Also give access to these branches of the same business")
 
 
 class StaffPatch(StrictModel):
+    staff_role: StaffRole | None = None
+    permissions: list[str] | None = None
     can_record_payments: bool | None = None
     status: Literal["deactivated", "active"] | None = None
 
@@ -254,6 +284,11 @@ class DisputeIn(BaseModel):
 # ---------- internal ----------
 class ReasonIn(BaseModel):
     reason: str | None = None
+
+
+class AdminIn(BaseModel):
+    phone: Phone
+    name: str | None = None
 
 
 class ChangePhoneIn(BaseModel):

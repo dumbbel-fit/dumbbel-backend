@@ -9,8 +9,8 @@ from app.models import User
 from app.utils import normalize_phone
 
 if __name__ == "__main__":
-    import app.models  # noqa: F401
-    Base.metadata.create_all(engine)
+    from app.migrate import auto_migrate
+    auto_migrate(engine)
     phone = normalize_phone(sys.argv[1])
     with session_scope() as db:
         u = db.scalar(select(User).where(User.phone == phone))
