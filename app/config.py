@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     support_phone: str = "+914048552210"
     maintenance: bool = False
     admin_app_link: str = "https://dumbbel.fit/admin"
+    checkin_url_base: str = "https://dumbbel.fit/checkin"  # gym QR codes open this page (member app)
     member_app_link: str = "https://dumbbel.fit/app"
 
     # Jobs

@@ -11,7 +11,9 @@ from app.services import storage
 from app.services.rules import days_left, membership_status, freezes_of
 from app.utils import dstr, financial_year, iso, local_date_of, today_in, utcnow
 
-DEFAULT_SETTINGS = {"checkin_cooldown_min": 120, "max_freeze_days": 30, "receipt_footer": "Thank you for training with us!"}
+DEFAULT_SETTINGS = {"checkin_cooldown_min": 120, "max_freeze_days": 30, "receipt_footer": "Thank you for training with us!",
+                    # member scans the gym's QR: printed poster allowed? location required? radius in metres
+                    "checkin_static_qr": True, "checkin_require_location": True, "checkin_radius_m": 150}
 
 
 def gym_settings(gym: Gym) -> dict:

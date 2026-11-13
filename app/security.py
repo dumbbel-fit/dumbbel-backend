@@ -115,3 +115,53 @@ def parse_qr_token(token: str) -> dict | None:
         return data
     except Exception:
         return None
+
+
+# ---------- Gym check-in QR (member scans the gym) ----------
+# Live screen QR: "DBG2.<b64 payload {g, iat, exp, j}>.<b64 hmac>", valid GYM_QR_TTL s, refreshed every 20 s.
+# Printed poster QR: static signature over (gym id, gym.checkin_secret); rotate the secret to revoke old posters.
+GYM_QR_TTL = 60
+
+
+def _kid_secret(kid: str | None = None) -> tuple[str, str]:
+    keys = _qr_keys()
+    kid = kid or settings.qr_current_kid
+    return kid, keys[kid]
+
+
+def gym_static_sig(gym_id: str, checkin_secret: str) -> str:
+    _, secret = _kid_secret()
+    return _b64e(hmac.new(secret.encode(), f"DBGS:{gym_id}:{checkin_secret}".encode(), hashlib.sha256).digest()[:18])
+
+
+def make_gym_display_token(gym_id: str) -> tuple[str, int]:
+    _, secret = _kid_secret()
+    now = int(time.time())
+    payload = _b64e(json.dumps({"g": gym_id, "iat": now, "exp": now + GYM_QR_TTL, "j": secrets.token_hex(6)},
+                               separators=(",", ":")).encode())
+    sig = _b64e(hmac.new(secret.encode(), f"DBG2.{payload}".encode(), hashlib.sha256).digest()[:18])
+    return f"DBG2.{payload}.{sig}", now + GYM_QR_TTL
+
+
+def parse_gym_display_token(token: str) -> dict | None:
+    try:
+        ver, payload, sig = token.strip().split(".")
+    except ValueError:
+        return None
+    if ver != "DBG2":
+        return None
+    for kid, secret in _qr_keys().items():
+        if kid != settings.qr_current_kid and not (settings.qr_previous_kid_valid_until
+                                                   and time.time() <= settings.qr_previous_kid_valid_until):
+            continue
+        expect = _b64e(hmac.new(secret.encode(), f"DBG2.{payload}".encode(), hashlib.sha256).digest()[:18])
+        if hmac.compare_digest(expect, sig):
+            try:
+                data = json.loads(_b64d(payload))
+            except Exception:
+                return None
+            now = time.time()
+            if now > data["exp"] + QR_SKEW or now < data["iat"] - QR_SKEW:
+                return None
+            return data
+    return None

@@ -445,6 +445,16 @@ class CheckinResultOut(Out):
     previous_at: str | None = None
     streak: int | None = None
     due_paise: int | None = None
+    gym: dict[str, Any] | None = None
+    distance_m: int | None = None
+
+
+class GymQrOut(Out):
+    gym: dict[str, Any]
+    display: dict[str, Any]
+    poster: dict[str, Any]
+    settings: dict[str, Any]
+    location: dict[str, Any]
 
 
 class CheckinFeedOut(Out):

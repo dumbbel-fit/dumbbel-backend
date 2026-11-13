@@ -172,6 +172,21 @@ Each note: `{id, body, author{id,name}, created_at}`. (The old single `notes` fi
 - Requests have `purpose` (`dues`|`renewal`), `plan_id`, `plan_name` and `result_membership_id`. Show "Renewal · Monthly" in the queue.
 - Staff with `payments.record` (not only the owner) get a push when a member submits a UTR.
 
+## 3c. Check-in = member scans the gym's QR (v1.3)
+- **Admin → Check-in QR** (`checkins.manage`): `GET /gyms/{id}/checkin-qr` →
+  `display.url` (live QR; refetch every `refresh_in_sec`=20, each token valid ~60 s), `poster.url` (fixed printable QR),
+  `settings{require_location, radius_m, static_qr}`, `location{set, lat, lng}`.
+  `POST /gyms/{id}/checkin-qr/rotate` (`settings.manage`) revokes printed posters.
+  Rules: `PATCH /gyms/{id} {lat, lng, settings:{checkin_require_location, checkin_radius_m, checkin_static_qr}}`.
+- **Member:** the QR is a link (`https://dumbbel.fit/checkin?g=…&t=…` or `&k=…`), so the phone camera opens
+  `/checkin`, which logs in if needed, gets the GPS location, and calls
+  `POST /me/checkin {code: <full URL>, lat, lng, accuracy_m}`. The in-app "Scan gym QR" does the same.
+- Results (always 200): `success | duplicate | expired | frozen | suspended | cancelled | not_started | not_member |
+  invalid_token (old / forged / revoked QR) | too_far (distance_m) | location_required | gym_inactive`.
+  404 `INVALID_QR` = not a DUMBBEL QR at all.
+- The location check applies only when the gym has saved its location; allowance = radius + GPS accuracy (max 100 m).
+- Feed / stats: method `self` = member scanned the gym QR. Staff scan of the member's QR and manual check-in still work.
+
 ## 4. Config / setup
 - `GET /config` now returns `firebase{apiKey, authDomain, projectId, appId, messagingSenderId, storageBucket}`.
   **Initialise Firebase from this** instead of hard-coded `VITE_FIREBASE_*` (keep the env values as a fallback).

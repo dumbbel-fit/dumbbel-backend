@@ -143,7 +143,7 @@ from app.routers import auth, checkins, gyms, imports, internal, me, member_app,
 
 P = settings.api_prefix
 for r in (auth.router, me.public, me.router, member_app.router, gyms.router, members.router, payments.router,
-          checkins.router, imports.public, imports.router, staff.router, upi.router, upi.me_router, internal.router,
+          checkins.router, checkins.me_router, imports.public, imports.router, staff.router, upi.router, upi.me_router, internal.router,
           internal.uploads):
     app.include_router(r, prefix=P)
 

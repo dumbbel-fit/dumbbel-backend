@@ -84,6 +84,9 @@ class DocumentIn(BaseModel):
 
 class GymSettingsIn(BaseModel):
     checkin_cooldown_min: int | None = Field(None, ge=0, le=1440)
+    checkin_static_qr: bool | None = Field(None, description="Allow the printable poster QR (else only the live screen QR)")
+    checkin_require_location: bool | None = Field(None, description="Member must be near the gym to check in")
+    checkin_radius_m: int | None = Field(None, ge=30, le=2000)
     max_freeze_days: int | None = Field(None, ge=0, le=365)
     receipt_footer: str | None = Field(None, max_length=300)
 

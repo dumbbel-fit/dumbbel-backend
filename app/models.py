@@ -133,6 +133,7 @@ class Gym(Base):
     approved_by: Mapped[str | None] = fk("users.id", nullable=True)
     settings = mapped_column(JSON, nullable=True)
     org_id: Mapped[str | None] = mapped_column(String(36), index=True)  # branches of one business share an org_id
+    checkin_secret: Mapped[str | None] = mapped_column(String(64))  # signs the printed check-in QR; rotate to revoke
     member_seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     receipt_seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     created_at = created()
@@ -308,13 +309,14 @@ class Checkin(Base):
     membership_id: Mapped[str | None] = fk("memberships.id", nullable=True)
     at = mapped_column(TS, nullable=False)
     local_date = mapped_column(Date, nullable=False)
-    method = mapped_column(Enum("qr", "manual", name="checkin_method"), nullable=False)
+    method = mapped_column(Enum("qr", "manual", "self", name="checkin_method"), nullable=False)  # self = member scanned gym QR
     result = mapped_column(Enum("success", "duplicate", "expired", "frozen", "cancelled", "not_started",
                                 "not_member", "invalid_token", "gym_inactive", "suspended",
-                                name="checkin_result"), nullable=False)
+                                "too_far", "location_required", name="checkin_result"), nullable=False)
     staff_user_id: Mapped[str | None] = fk("users.id", nullable=True)
     token_jti: Mapped[str | None] = mapped_column(String(64))
     device_id: Mapped[str | None] = mapped_column(String(120))
+    distance_m: Mapped[int | None] = mapped_column(Integer)  # self check-in: member's distance from the gym
     note: Mapped[str | None] = mapped_column(Text)
     created_at = created()
     __table_args__ = (Index("ix_ci_gym_at", "gym_id", "at"),
