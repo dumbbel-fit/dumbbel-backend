@@ -229,7 +229,7 @@ class ManualCheckinIn(BaseModel):
     note: str | None = None
 
 
-# ---------- imports / invites ----------
+# ---------- imports ----------
 class ImportFromKey(BaseModel):
     file_key: str
     file_name: str | None = None
@@ -249,11 +249,6 @@ class ImportRowPatch(StrictModel):
     paid_paise: int | None = Field(None, ge=0)
     email: str | None = None
     skip: bool | None = None
-
-
-class InvitesIn(BaseModel):
-    member_ids: list[str] | None = None
-    filter: str | None = Field(None, examples=["not_on_app", "import:<importId>"])
 
 
 # ---------- staff ----------

@@ -40,8 +40,6 @@ class Settings(BaseSettings):
     twofactor_otp_route: str = "v1"
     twofactor_sender_id: str = "DMBL"
     # Transactional (non-OTP) templates registered on DLT via 2Factor; empty = log only
-    twofactor_tpl_staff_invite: str | None = None
-    twofactor_tpl_member_invite: str | None = None
     twofactor_tpl_gym_status: str | None = None
 
     # Which phone login the apps use: "firebase" (SMS sent by the Firebase SDK in the app) or "2factor"

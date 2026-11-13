@@ -1,4 +1,4 @@
-"""§11 — import (4 steps) and invites."""
+"""§11 — member import (4 steps)."""
 import csv
 import io
 from datetime import timedelta
@@ -12,18 +12,17 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.deps import GymCtx, gym_ctx, perm_ctx
 from app.errors import ApiError, validation
-from app.models import GymMember, Import, ImportRow, Invite, Plan, User
-from app.schemas import ImportRowPatch, InvitesIn, MappingIn
+from app.models import GymMember, Import, ImportRow, Plan, User
+from app.schemas import ImportRowPatch, MappingIn
 from app.services import importer, storage
 from app.services.audit import audit
 from app.services.jobs import enqueue
-from app.services.notify import send_invite_now
-from app.responses import DocRoute, ERRORS, ImportListOut, ImportOut, ImportRowPatchOut, ImportRowsOut, ImportUploadOut, MappingOut, InviteBatchOut, InviteOneOut
+from app.responses import DocRoute, ERRORS, ImportListOut, ImportOut, ImportRowPatchOut, ImportRowsOut, ImportUploadOut, MappingOut
 from app.services.rules import LIVE, load_states
 from app.utils import clamp_limit, decode_cursor, encode_cursor, iso, normalize_phone, utcnow, uuid7
 
-router = APIRouter(tags=["Import & invites"], route_class=DocRoute, responses=ERRORS)
-public = APIRouter(tags=["Import & invites"], route_class=DocRoute, responses=ERRORS)
+router = APIRouter(tags=["Import"], route_class=DocRoute, responses=ERRORS)
+public = APIRouter(tags=["Import"], route_class=DocRoute, responses=ERRORS)
 
 TEMPLATE = ("Name,Mobile,Plan,Start Date,End Date,Paid,Email,DOB,Gender,Notes\r\n"
             "Ravi Teja Naidu,9849011234,Quarterly,01/11/2026,31/01/2027,5400,ravi@example.com,14/02/1995,Male,\r\n")
@@ -310,115 +309,3 @@ def report(importId: str, only: Literal["all", "failed"] = "all", ctx: GymCtx = 
     name = (imp.file_name or "import").rsplit(".", 1)[0]
     return Response("﻿" + buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": f'attachment; filename="{name}-{only}-report.csv"'})
-
-
-# ---------------- invites ----------------
-INVITE_GAP = timedelta(days=7)
-
-
-def _recent_invite(db: Session, member_id: str):
-    return db.scalar(select(Invite).where(Invite.member_id == member_id, Invite.kind == "member_app",
-                                          Invite.status.in_(("sent", "joined", "queued")),
-                                          Invite.created_at >= utcnow() - INVITE_GAP)
-                     .order_by(Invite.created_at.desc()).limit(1))
-
-
-@router.post("/gyms/{gymId}/invites", summary="Send member-app invites (batch) — reports exactly what happened",
-             response_model=InviteBatchOut,
-             description="`member_ids` or `filter` (`not_on_app` | `import:{importId}`). Sends now and returns "
-                         "`sent`, `skipped[]` (with reason) and `failed[]` (with reason + a WhatsApp share link). "
-                         "Max 1 invite per member per 7 days. If every send fails → 502 UPSTREAM_SMS with the same "
-                         "lists in `error.details`. Needs an approved gym (423 GYM_PENDING).")
-def send_invites(body: InvitesIn, ctx: GymCtx = Depends(perm_ctx("invites.send")), db: Session = Depends(get_db)):
-    ctx.require_approved()
-    gym = ctx.gym
-    q = select(GymMember, User).join(User, User.id == GymMember.user_id).where(GymMember.gym_id == gym.id)
-    if body.member_ids:
-        q = q.where(GymMember.id.in_(body.member_ids))
-    elif body.filter and body.filter.startswith("import:"):
-        q = q.where(GymMember.id.in_(select(ImportRow.member_id).where(
-            ImportRow.import_id == body.filter.split(":", 1)[1], ImportRow.member_id.is_not(None))))
-    elif body.filter != "not_on_app":
-        raise validation({"filter": "Send member_ids or filter=not_on_app|import:{importId}."})
-    rows = db.execute(q).all()
-    states = load_states(db, gym, [m.id for m, _ in rows]) if body.filter == "not_on_app" else {}
-    found = {m.id for m, _ in rows}
-    skipped = [{"member_id": mid, "name": None, "reason": "NOT_FOUND"} for mid in (body.member_ids or []) if mid not in found]
-    targets = []
-    for m, u in rows:
-        reason = None
-        if m.status != "active":
-            reason = "ARCHIVED"
-        elif m.claim_disputed_at:
-            reason = "CLAIM_DISPUTED"
-        elif u.first_login_at is not None:
-            reason = "ALREADY_ON_APP"
-        elif u.deleted_at:
-            reason = "ACCOUNT_DELETED"
-        elif states and states[m.id].status not in LIVE:
-            reason = "NO_ACTIVE_MEMBERSHIP"
-        if not reason:
-            recent = _recent_invite(db, m.id)
-            if recent:
-                skipped.append({"member_id": m.id, "name": m.display_name, "reason": "INVITED_RECENTLY",
-                                "next_allowed_at": iso(recent.created_at + INVITE_GAP)})
-                continue
-        if reason:
-            skipped.append({"member_id": m.id, "name": m.display_name, "reason": reason})
-        else:
-            targets.append((m, u))
-    batch = uuid7()
-    sent, failed = [], []
-    for m, u in targets[:500]:
-        inv = Invite(gym_id=gym.id, member_id=m.id, kind="member_app", phone=u.phone, status="queued", batch_id=batch)
-        db.add(inv)
-        db.flush()
-        res = send_invite_now(db, inv)
-        item = {"member_id": m.id, "name": m.display_name, "invite_id": inv.id, "whatsapp_url": res["whatsapp_url"]}
-        if res["status"] == "sent":
-            sent.append(item)
-        else:
-            failed.append({**item, "reason": res["reason"], "detail": res.get("detail")})
-    for m, _ in targets[500:]:
-        skipped.append({"member_id": m.id, "name": m.display_name, "reason": "BATCH_LIMIT_500"})
-    audit(db, gym.id, ctx.user.id, "invite.batch", "invite_batch", batch,
-          f"App invites: {len(sent)} sent, {len(failed)} failed, {len(skipped)} skipped")
-    db.commit()
-    out = {"batch_id": batch, "sent": len(sent), "sent_items": sent, "skipped": skipped, "failed": failed,
-           "queued": len(sent), "skipped_recent": sum(1 for x in skipped if x["reason"] == "INVITED_RECENTLY")}
-    if failed and not sent:
-        raise ApiError(502, "UPSTREAM_SMS", "Invites couldn’t be sent by SMS. Share them on WhatsApp instead.", out)
-    return out
-
-
-@router.post("/gyms/{gymId}/members/{memberId}/invite", summary="Invite one member to the app",
-             response_model=InviteOneOut,
-             description="Sends now. 200 `{invite, status:'sent'}` · 429 INVITE_TOO_SOON {next_allowed_at} · "
-                         "409 ALREADY_ON_APP · 502 UPSTREAM_SMS {reason, whatsapp_url} when the SMS can’t be sent.")
-def invite_one(memberId: str, ctx: GymCtx = Depends(perm_ctx("invites.send")), db: Session = Depends(get_db)):
-    ctx.require_approved()
-    m = db.get(GymMember, memberId)
-    if not m or m.gym_id != ctx.gym.id:
-        raise ApiError(404, "NOT_FOUND", "That member wasn’t found.")
-    u = db.get(User, m.user_id)
-    if u.first_login_at is not None:
-        raise ApiError(409, "ALREADY_ON_APP", f"{m.display_name} is already using the app.")
-    recent = _recent_invite(db, m.id)
-    if recent:
-        nxt = recent.created_at + INVITE_GAP
-        raise ApiError(429, "INVITE_TOO_SOON", None, {"next_allowed_at": iso(nxt),
-                                                       "retry_after_sec": int((nxt - utcnow()).total_seconds())})
-    inv = Invite(gym_id=ctx.gym.id, member_id=m.id, kind="member_app", phone=u.phone, status="queued")
-    db.add(inv)
-    db.flush()
-    res = send_invite_now(db, inv)
-    audit(db, ctx.gym.id, ctx.user.id, "invite.send", "invite", inv.id,
-          f"App invite to {m.display_name}: {res['status']}" + (f" ({res.get('reason')})" if res["status"] != "sent" else ""))
-    db.commit()
-    invite = {"id": inv.id, "status": inv.status, "phone": inv.phone, "created_at": iso(inv.created_at),
-              "sent_at": iso(inv.sent_at), "error": inv.error}
-    if res["status"] != "sent":
-        raise ApiError(502, "UPSTREAM_SMS", "The invite SMS couldn’t be sent. Share it on WhatsApp instead.",
-                       {"reason": res["reason"], "detail": res.get("detail"), "whatsapp_url": res["whatsapp_url"],
-                        "message": res["message"], "invite": invite})
-    return {"invite": invite, "status": "sent", "whatsapp_url": res["whatsapp_url"]}

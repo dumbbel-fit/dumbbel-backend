@@ -2,7 +2,7 @@
 
 OTP:   v1 -> GET https://2factor.in/API/V1/{key}/SMS/{10-digit phone}/{otp}/{template}  (falls back to a voice call
              when the DLT template isn't mapped)   |  r1 -> transactional SMS only (never a call)
-Other: Transactional DLT SMS  POST https://2factor.in/API/R1/  module=TRANS_SMS  (invites, gym status).
+Other: Transactional DLT SMS  POST https://2factor.in/API/R1/  module=TRANS_SMS  (optional gym-status SMS).
        These need a DLT-approved template per message; without one, operators silently drop the SMS,
        so we refuse to send (SmsNotConfigured) instead of pretending it worked.
 Every send is logged with the provider response and the request id.
@@ -65,8 +65,6 @@ def send_otp(phone_e164: str, code: str) -> str | None:
 
 
 TEMPLATES = {
-    "staff_invite": "{owner} added you to {gym} on DUMBBEL.fit Admin. Download: {link} and log in with this number.",
-    "member_invite": "{gym} is now on DUMBBEL.fit. Get your membership QR: {link}. Log in with this number.",
     "gym_approved": "Good news! {gym} is approved on DUMBBEL.fit. {reason}Help: {support}",
     "gym_rejected": "{gym} couldn’t be approved on DUMBBEL.fit. Reason: {reason}. Help: {support}",
     "gym_suspended": "{gym} has been suspended on DUMBBEL.fit. Reason: {reason}. Help: {support}",
@@ -79,10 +77,6 @@ def render(kind: str, vars: dict) -> str:
 
 
 def _dlt_template(kind: str) -> str | None:
-    if kind == "staff_invite":
-        return settings.twofactor_tpl_staff_invite
-    if kind == "member_invite":
-        return settings.twofactor_tpl_member_invite
     if kind.startswith("gym_"):
         return settings.twofactor_tpl_gym_status
     return None

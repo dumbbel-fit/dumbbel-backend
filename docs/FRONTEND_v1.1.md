@@ -9,16 +9,18 @@ Errors are always `{ "error": { code, message, details, request_id } }`, includi
 
 ## 1. Must change (behaviour changed)
 
-### Invites (single and bulk)
-- `POST /gyms/{id}/invites` now **sends immediately** and returns
-  `{ batch_id, sent, sent_items[], skipped[{member_id, name, reason, next_allowed_at?}], failed[{member_id, name, reason, whatsapp_url}] }`.
-  - Skip reasons: `ALREADY_ON_APP`, `INVITED_RECENTLY`, `ARCHIVED`, `CLAIM_DISPUTED`, `NO_ACTIVE_MEMBERSHIP`, `NOT_FOUND`, `BATCH_LIMIT_500`.
-  - Fail reasons: `SMS_NOT_CONFIGURED` (the DLT template isn't set up yet), `SMS_PROVIDER_ERROR`.
-  - If **every** send fails, the API returns **502 `UPSTREAM_SMS`**, with the same lists in `error.details`.
-- `POST /gyms/{id}/members/{mid}/invite`: `200 {invite, status:"sent"}`, or **502** with
-  `details.whatsapp_url` + `details.message`, **409 `ALREADY_ON_APP`**, or **429 `INVITE_TOO_SOON`** `{next_allowed_at}`.
-- **UI:** show a result sheet ("12 sent · 3 skipped · 2 failed"). For failed rows, show a **"Share on WhatsApp"** button
-  that opens `whatsapp_url`. Until invite SMS templates are approved on DLT, WhatsApp is the way to invite.
+### Invites are REMOVED — delete every invite button/screen
+`POST /gyms/{id}/invites`, `POST /gyms/{id}/members/{mid}/invite` and `POST /gyms/{id}/staff/{sid}/resend-invite`
+no longer exist (404). Firebase can only send login codes, not custom messages, and you don't need an invite anyway:
+- **Member:** staff add them with their phone number → the person opens the **member app** → logs in with that number
+  (Firebase OTP) → their gym, membership and QR appear automatically (`new_claims` on first login).
+- **Staff:** owner adds them with their phone number + role → they log in to the **admin app** with that number →
+  linked automatically. Staff list: `status: invited` + `logged_in: false` = "hasn't logged in yet" → `active` after first login.
+- **Same person as staff and member:** add the number in both places; one login works in both apps.
+- UI copy suggestion after adding someone: *"Ask them to download the DUMBBEL app and log in with {phone}."*
+- The "not on app" insight now opens the member list (`action.type = open_members`, `filter = not_on_app`).
+- Member detail: the `invites` field is gone; `insights` has `app_status` = `on_app` | `not_on_app`.
+- Permission `invites.send` no longer exists.
 
 ### Rate limits
 Reads: 600/min. Writes: 120/min. Every 429 has a `Retry-After` header (already handled).
@@ -37,7 +39,7 @@ Login (`staff_of[]`), `GET /me`, and `GET /gyms/{id}` (`me`) now return `staff_r
 | `memberships.manage` / `memberships.cancel` | assign, renew, freeze, suspend / cancel |
 | `payments.view` / `payments.record` / `payments.void` | see money / record payments + verify UPI / void |
 | `checkins.manage` | scan + manual check-in |
-| `imports.manage`, `invites.send` | import screens, invite buttons |
+| `imports.manage` | import screens |
 | `plans.manage`, `staff.manage`, `settings.manage` | settings tabs (settings also covers UPI IDs + branches) |
 | `activity.view`, `reports.export` | activity log, CSV export buttons |
 
@@ -116,9 +118,9 @@ Statuses: `pending → claimed → verified | rejected`; `pending → expired | 
 ### Roles & staff
 - `GET /gyms/{id}/roles` → role presets + permission labels (build the role picker / permission checklist from it).
 - `POST /gyms/{id}/staff {name, phone, staff_role: manager|receptionist|trainer|staff, permissions?, can_record_payments?, branch_ids?}`
-  → the response has `invite.status` (`sent|failed`) + `invite.whatsapp_url`.
+  → no SMS; the response has `status: invited` and `logged_in: false` until they log in to the admin app.
 - `PATCH /gyms/{id}/staff/{sid} {staff_role?, permissions?, can_record_payments?, status?}`
-- `POST /gyms/{id}/staff/{sid}/resend-invite` (max 3/hour) · list items include `last_active_at`, `last_action`, `branches[]`.
+- Staff list items include `logged_in`, `last_active_at`, `last_action`, `branches[]`.
 
 ### Branches
 - `GET /gyms/{id}/branches` → every branch of the business, with `has_access`. Build the **branch switcher** from this or

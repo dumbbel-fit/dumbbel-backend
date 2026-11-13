@@ -49,8 +49,8 @@ app/routers/*          one file per spec section
 - Branches (`/gyms/{id}/branches`), membership suspend/resume, member notes history, plan offer price / joining fee /
   GST inclusive|exclusive / per-plan freeze & policies, revenue stats (`/payments/stats`), CSV exports,
   import progress / resumable commit / retry-failed, console admin management (`/internal/admins`).
-- Invites send synchronously and report `sent / skipped / failed` (+ WhatsApp share link). Invite SMS need
-  DLT-approved templates (`TWOFACTOR_TPL_*`); until then they fail honestly instead of pretending.
+- **No invites.** Members and staff are added by phone number and linked automatically when they log in
+  (Firebase OTP) to the member or admin app. Gym approval/rejection reaches the owner as a push notification.
 - Every response has a schema in Swagger. Schema changes are applied automatically and additively on startup
   (`app/migrate.py`: new tables, new columns, new enum values; never drops anything).
 

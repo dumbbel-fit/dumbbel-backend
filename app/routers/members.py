@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.deps import GymCtx, Idem, current_user, gym_ctx, idem_header, load_gym_ctx, perm_ctx
 from app.errors import ApiError, validation
-from app.models import (Checkin, GymMember, GymStaff, Invite, MemberNote, Membership, MembershipFreeze, Payment, Plan,
+from app.models import (Checkin, GymMember, GymStaff, MemberNote, Membership, MembershipFreeze, Payment, Plan,
                         User)
 from app.schemas import CancelIn, FreezeIn, MemberCreate, MemberPatch, MembershipCreate, NoteIn, SuspendIn
 from app.services.storage import public_url
@@ -269,7 +269,7 @@ def gym_avg_rate_8w(db: Session, ctx: GymCtx) -> float:
     return val
 
 
-@router.get("/gyms/{gymId}/members/{memberId}", response_model=MemberDetailOut, summary="Member detail: memberships, payments*, stats, insights, invites")
+@router.get("/gyms/{gymId}/members/{memberId}", response_model=MemberDetailOut, summary="Member detail: memberships, payments*, stats, insights, notes")
 def member_detail(memberId: str, ctx: GymCtx = Depends(perm_ctx("members.view")), db: Session = Depends(get_db)):
     gym = ctx.gym
     m, u = get_member(db, ctx, memberId)
@@ -297,15 +297,12 @@ def member_detail(memberId: str, ctx: GymCtx = Depends(perm_ctx("members.view"))
                          "rule": f"Only {v30} check-in{'s' if v30 != 1 else ''} in the last 30 days"})
     insights.append({"key": "visit_rate", "value": rate, "gym_avg": avg,
                      "rule": f"{rate}/week over the last 8 weeks vs gym average {avg}/week"})
-    invites = db.scalars(select(Invite).where(Invite.member_id == m.id).order_by(Invite.created_at.desc())).all()
     if u.first_login_at:
         app_status = {"key": "app_status", "value": "on_app", "since": iso(u.first_login_at),
                       "rule": "Logged in to the member app"}
-    elif invites:
-        app_status = {"key": "app_status", "value": "invited", "since": iso(invites[0].sent_at or invites[0].created_at),
-                      "rule": "Invite sent, not logged in yet"}
     else:
-        app_status = {"key": "app_status", "value": "not_invited", "rule": "Never invited to the app"}
+        app_status = {"key": "app_status", "value": "not_on_app",
+                      "rule": "Hasn’t logged in to the member app yet — they just log in with this phone number"}
     insights.append(app_status)
 
     member_out = ser_member_basic(m, u)
@@ -318,9 +315,7 @@ def member_detail(memberId: str, ctx: GymCtx = Depends(perm_ctx("members.view"))
            "current_membership": current, "memberships": memberships,
            "stats": {"visits_total": len(days), "visits_30d": v30, "visit_rate_8w": rate, "gym_avg_rate_8w": avg,
                      "first_visit": dstr(days[0]) if days else None, "last_visit": dstr(days[-1]) if days else None},
-           "insights": insights,
-           "invites": [{"id": i.id, "sent_at": iso(i.sent_at), "status": i.status, "created_at": iso(i.created_at)}
-                       for i in invites]}
+           "insights": insights}
     if ctx.can_pay:
         pays = db.scalars(select(Payment).where(Payment.member_id == m.id).order_by(Payment.paid_at.desc())).all()
         names = user_names(db, [p.recorded_by for p in pays])

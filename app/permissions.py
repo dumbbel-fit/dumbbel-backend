@@ -12,7 +12,6 @@ PERMISSIONS = {
     "payments.void": "Void payments",
     "checkins.manage": "Scan QR and manual check-in",
     "imports.manage": "Import members",
-    "invites.send": "Send app invites",
     "plans.manage": "Create and edit plans",
     "staff.manage": "Manage staff and roles",
     "settings.manage": "Gym profile, UPI accounts, branches",
@@ -24,10 +23,9 @@ ALL = frozenset(PERMISSIONS)
 ROLE_PRESETS = {
     "manager": ALL - {"staff.manage", "settings.manage"},
     "receptionist": frozenset({"members.view", "members.edit", "memberships.manage", "payments.view", "payments.record",
-                               "checkins.manage", "imports.manage", "invites.send"}),
+                               "checkins.manage", "imports.manage"}),
     "trainer": frozenset({"members.view", "checkins.manage"}),
-    "staff": frozenset({"members.view", "members.edit", "memberships.manage", "checkins.manage", "imports.manage",
-                        "invites.send"}),
+    "staff": frozenset({"members.view", "members.edit", "memberships.manage", "checkins.manage", "imports.manage"}),
 }
 ROLES = ["owner", *ROLE_PRESETS.keys()]
 MONEY = {"payments.view", "payments.record"}

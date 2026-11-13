@@ -64,7 +64,8 @@ TAGS = [
     {"name": "Members & memberships", "description": "Members, assign/renew, freeze, unfreeze, cancel."},
     {"name": "Payments", "description": "Record, list, void, receipts. Money fields need payments permission."},
     {"name": "Check-ins & QR", "description": "QR scan, manual check-in, live feed, stats."},
-    {"name": "Import & invites", "description": "4-step member import and app invites."},
+    {"name": "Import", "description": "4-step member import. No invites needed: members and staff are linked "
+                                      "automatically when they log in with their phone number."},
     {"name": "Staff, insights & activity", "description": "Staff management, home summary, reminders, audit log."},
     {"name": "Member app", "description": "Member’s own memberships, rotating QR, history, insights, payments."},
     {"name": "UPI payments", "description": "Members pay straight to the gym’s own UPI ID (0% fees). Request → "

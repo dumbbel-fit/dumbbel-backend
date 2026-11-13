@@ -44,7 +44,6 @@ DEFAULT_MESSAGES = {
     "APP_UPDATE_REQUIRED": "Please update the app to continue.",
     "OTP_RATE_LIMITED": "Please wait before requesting another code.",
     "RATE_LIMITED": "Slow down a little and try again.",
-    "INVITE_TOO_SOON": "An invite was sent recently. Try again later.",
     "INTERNAL": "Something went wrong on our side. Please try again.",
     "UPSTREAM_SMS": "We couldn’t send the SMS. Please try again.",
 }

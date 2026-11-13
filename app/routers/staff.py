@@ -11,12 +11,11 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.deps import GymCtx, gym_ctx, owner_ctx, perm_ctx
 from app.errors import ApiError, validation
-from app.models import UpiPaymentRequest, AuditLog, Checkin, Gym, GymMember, GymStaff, Invite, Membership, MembershipFreeze, Payment, Plan, Session as DbSession, User
+from app.models import UpiPaymentRequest, AuditLog, Checkin, Gym, GymMember, GymStaff, Membership, MembershipFreeze, Payment, Plan, Session as DbSession, User
 from app.schemas import StaffCreate, StaffPatch
 from app.services.audit import audit
 from app.services.storage import public_url
 from app.services.core import get_or_create_user
-from app.services.notify import send_invite_now
 from app.services.cache import rate_limit
 from app.permissions import PERMISSIONS, ROLE_PRESETS, effective_permissions
 from app.services.rules import LIVE, days_left, hour_label, load_states
@@ -29,20 +28,18 @@ router = APIRouter(tags=["Staff, insights & activity"], route_class=DocRoute, re
 
 
 # ---------------- staff ----------------
-def ser_staff(st: GymStaff, u: User, last_action: AuditLog | None = None, branches: list | None = None,
-              invite: dict | None = None) -> dict:
+def ser_staff(st: GymStaff, u: User, last_action: AuditLog | None = None, branches: list | None = None) -> dict:
     perms = sorted(effective_permissions(st.role, st.staff_role, bool(st.can_record_payments), st.permissions))
     d = {"id": st.id, "user": {"id": u.id, "name": u.name, "phone": u.phone}, "role": st.role,
          "staff_role": "owner" if st.role == "owner" else (st.staff_role or "staff"), "permissions": perms,
          "can_record_payments": "payments.record" in perms, "status": st.status,
+         "logged_in": st.joined_at is not None or st.status == "active",
          "invited_at": iso(st.invited_at), "joined_at": iso(st.joined_at), "deactivated_at": iso(st.deactivated_at),
          "last_active_at": iso(max([t for t in (u.last_login_at, last_action.at if last_action else None) if t],
                                    default=None)),
          "last_action": {"at": iso(last_action.at), "summary": last_action.summary} if last_action else None}
     if branches is not None:
         d["branches"] = branches
-    if invite is not None:
-        d["invite"] = invite
     return d
 
 
@@ -76,20 +73,12 @@ def list_staff(ctx: GymCtx = Depends(perm_ctx("staff.manage")), db: Session = De
     return {"items": [ser_staff(st, u, logs.get(u.id), branches.get(u.id)) for st, u in rows]}
 
 
-def _invite_staff(db: Session, ctx: GymCtx, st: GymStaff, phone: str) -> dict:
-    inv = Invite(gym_id=st.gym_id, staff_id=st.id, kind="staff", phone=phone, status="queued")
-    db.add(inv)
-    db.flush()
-    res = send_invite_now(db, inv)
-    return {"id": inv.id, "status": res["status"], "reason": res.get("reason"), "detail": res.get("detail"),
-            "whatsapp_url": res["whatsapp_url"], "message": res["message"]}
-
-
 @router.post("/gyms/{gymId}/staff", response_model=StaffOut, status_code=201,
-             summary="Add staff with a role (staff.manage). Sends invite SMS",
-             description="Roles: manager · receptionist · trainer · staff (see GET /roles). `permissions` overrides the "
-                         "preset. `branch_ids` adds access to other branches of the same business. The response has "
-                         "`invite.status` = sent|failed (+ `whatsapp_url` to share manually). 409 ALREADY_STAFF.")
+             summary="Add staff with a role (staff.manage)",
+             description="No SMS is sent. The person simply logs in to the Admin app with this phone number "
+                         "(Firebase OTP) and is linked automatically; `status` goes `invited` → `active` on first login. "
+                         "Roles: manager · receptionist · trainer · staff (see GET /roles). `permissions` overrides the "
+                         "preset. `branch_ids` adds access to other branches of the same business. 409 ALREADY_STAFF.")
 def add_staff(body: StaffCreate, ctx: GymCtx = Depends(perm_ctx("staff.manage")), db: Session = Depends(get_db)):
     _validate_perms(body.permissions)
     phone = normalize_phone(body.phone)
@@ -119,12 +108,10 @@ def add_staff(body: StaffCreate, ctx: GymCtx = Depends(perm_ctx("staff.manage"))
         db.flush()
         if gid == ctx.gym.id:
             main = st
-    invite = _invite_staff(db, ctx, main, phone)
-    audit(db, ctx.gym.id, ctx.user.id, "staff.invite", "staff", main.id,
-          f"Added {user.name or phone} as {body.staff_role}" + (f" (+{len(gym_ids) - 1} branches)" if len(gym_ids) > 1 else "")
-          + f" · invite {invite['status']}")
+    audit(db, ctx.gym.id, ctx.user.id, "staff.add", "staff", main.id,
+          f"Added {user.name or phone} as {body.staff_role}" + (f" (+{len(gym_ids) - 1} branches)" if len(gym_ids) > 1 else ""))
     db.commit()
-    return ser_staff(main, user, invite=invite)
+    return ser_staff(main, user)
 
 
 def _get_staff(db: Session, ctx: GymCtx, staff_id: str) -> tuple[GymStaff, User]:
@@ -166,22 +153,6 @@ def patch_staff(staffId: str, body: StaffPatch, ctx: GymCtx = Depends(perm_ctx("
            "status": st.status})
     db.commit()
     return ser_staff(st, u)
-
-
-@router.post("/gyms/{gymId}/staff/{staffId}/resend-invite", response_model=StaffOut,
-             summary="Resend the staff invite SMS (staff.manage)",
-             description="Allowed while the staff member hasn’t joined yet. Returns `invite.status` sent|failed "
-                         "and a `whatsapp_url` to share manually. 409 NOT_ACTIVE if they already joined.")
-def resend_invite(staffId: str, ctx: GymCtx = Depends(perm_ctx("staff.manage")), db: Session = Depends(get_db)):
-    st, u = _get_staff(db, ctx, staffId)
-    if st.status != "invited":
-        raise ApiError(409, "NOT_ACTIVE", "This person has already joined (or is deactivated).")
-    rate_limit(f"staffinvite:{st.id}", 3, 3600)
-    invite = _invite_staff(db, ctx, st, u.phone)
-    audit(db, ctx.gym.id, ctx.user.id, "staff.invite", "staff", st.id,
-          f"Resent invite to {u.name or u.phone} · {invite['status']}")
-    db.commit()
-    return ser_staff(st, u, invite=invite)
 
 
 @router.delete("/gyms/{gymId}/staff/{staffId}", status_code=204, summary="Remove staff (deactivate + revoke sessions)")
@@ -258,9 +229,10 @@ def build_insights(db: Session, ctx: GymCtx) -> dict:
                          "action": {"type": "open_members", "filter": "away"}})
     if not_on_app:
         insights.append({"key": "not_on_app", "title": f"{len(not_on_app)} member{'s' if len(not_on_app) != 1 else ''} not on the app",
-                         "detail": "Invite them to get their QR", "count": len(not_on_app),
+                         "detail": "They get their QR by logging in to the member app with their number",
+                         "count": len(not_on_app),
                          "rule": "Active members who have never logged in to the member app.",
-                         "action": {"type": "send_invites", "filter": "not_on_app"}})
+                         "action": {"type": "open_members", "filter": "not_on_app"}})
     if hours:
         h, n = hours.most_common(1)[0]
         insights.append({"key": "peak_hour", "title": f"Busiest around {hour_label(h)} on {today.strftime('%A')}s",

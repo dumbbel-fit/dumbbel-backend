@@ -343,7 +343,6 @@ class MemberDetailOut(Out):
     credit_paise: int | None = None
     stats: dict[str, Any] | None = None
     insights: list[dict[str, Any]] | None = None
-    invites: list[dict[str, Any]] | None = None
     notes_history: list[dict[str, Any]] | None = None
 
 
@@ -466,7 +465,7 @@ class CheckinStatsOut(Out):
     peak_hour: int | None = None
 
 
-# ---------- import / invites ----------
+# ---------- import ----------
 class ImportUploadOut(Out):
     import_id: str
     status: str
@@ -521,22 +520,6 @@ class MappingOut(Out):
     columns: list[dict[str, Any]]
 
 
-class InviteBatchOut(Out):
-    batch_id: str
-    sent: int
-    sent_items: list[dict[str, Any]]
-    skipped: list[dict[str, Any]]
-    failed: list[dict[str, Any]]
-    queued: int | None = None
-    skipped_recent: int | None = None
-
-
-class InviteOneOut(Out):
-    invite: dict[str, Any]
-    status: str
-    whatsapp_url: str | None = None
-
-
 # ---------- staff / home ----------
 class StaffOut(Out):
     id: str
@@ -552,7 +535,7 @@ class StaffOut(Out):
     deactivated_at: str | None = None
     last_active_at: str | None = None
     last_action: dict[str, Any] | None = None
-    invite: dict[str, Any] | None = None
+    logged_in: bool | None = None
 
 
 class StaffListOut(Out):

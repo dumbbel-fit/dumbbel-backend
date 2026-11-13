@@ -1,66 +1,34 @@
-"""Invites (sent synchronously so the API can report exactly what happened) and gym-status SMS."""
+"""Owner notifications for gym status changes: push to the Admin app (+ SMS only if a DLT template is set up).
+App invites were removed: people are linked automatically when they log in with their phone number."""
 import logging
-from urllib.parse import quote
-
-from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Gym, Invite, User
+from app.db import session_scope
+from app.models import Gym
 from app.services import sms
 from app.services.jobs import enqueue
-from app.utils import utcnow
+from app.services.push import send_push
 
 log = logging.getLogger("dumbbel.notify")
 
-
-def invite_vars(db: Session, inv: Invite) -> dict:
-    gym = db.get(Gym, inv.gym_id)
-    if inv.kind == "staff":
-        owner = db.get(User, gym.owner_user_id)
-        return {"owner": owner.name or "Your gym owner", "gym": gym.name, "link": settings.admin_app_link}
-    return {"gym": gym.name, "link": settings.member_app_link}
-
-
-def whatsapp_share(inv: Invite, text: str) -> str:
-    return f"https://wa.me/{inv.phone.lstrip('+')}?text={quote(text)}"
-
-
-def send_invite_now(db: Session, inv: Invite) -> dict:
-    """Try to send one invite SMS. Updates the invite row (caller commits).
-    Returns {status: sent|failed, reason?, provider_message_id?, whatsapp_url}."""
-    kind = "staff_invite" if inv.kind == "staff" else "member_invite"
-    vars = invite_vars(db, inv)
-    text = sms.render(kind, vars)
-    out = {"whatsapp_url": whatsapp_share(inv, text), "message": text}
-    try:
-        mid = sms.send_template(inv.phone, kind, vars)
-        inv.status = "sent" if inv.status != "joined" else "joined"
-        inv.provider_message_id, inv.sent_at, inv.error = mid, utcnow(), None
-        out.update(status="sent", provider_message_id=mid)
-    except sms.SmsNotConfigured as e:
-        inv.status, inv.error = "failed", str(e)[:500]
-        out.update(status="failed", reason="SMS_NOT_CONFIGURED", detail=str(e))
-    except sms.SmsFailed as e:
-        inv.status, inv.error = "failed", str(e)[:500]
-        out.update(status="failed", reason="SMS_PROVIDER_ERROR", detail=str(e))
-    return out
+TITLES = {"gym_approved": "Your gym is approved 🎉", "gym_rejected": "Gym verification needs attention",
+          "gym_suspended": "Your gym is suspended", "gym_reinstated": "Your gym is active again"}
 
 
 def queue_gym_status_sms(gym_id: str, kind: str, reason: str | None):
-    from app.db import session_scope
-
     def run():
         with session_scope() as db:
             g = db.get(Gym, gym_id)
-            owner = db.get(User, g.owner_user_id)
-            phone = owner.phone
-            if kind == "gym_approved":
-                why = f"{reason}. " if reason else ""
-            else:
-                why = reason or "—"
-            vars = {"gym": g.name, "reason": why, "support": settings.support_phone}
-        try:
-            sms.send_template(phone, kind, vars)
-        except sms.SmsNotConfigured:
-            pass  # already logged; nothing to retry
-    enqueue("sms.send", run, retries=2)
+            owner_id, name = g.owner_user_id, g.name
+            from app.models import User
+            phone = db.get(User, owner_id).phone
+        why = (f"{reason}. " if reason else "") if kind == "gym_approved" else (reason or "—")
+        vars = {"gym": name, "reason": why, "support": settings.support_phone}
+        send_push(owner_id, "admin", TITLES.get(kind, "Gym update"), sms.render(kind, vars),
+                  {"type": kind, "gym_id": gym_id})
+        if sms.is_configured(kind):
+            try:
+                sms.send_template(phone, kind, vars)
+            except Exception as e:  # logged inside sms
+                log.warning("gym status SMS failed: %s", e)
+    enqueue("notify.gym_status", run)
