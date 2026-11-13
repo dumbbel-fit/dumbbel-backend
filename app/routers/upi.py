@@ -39,15 +39,23 @@ UTR_RE = re.compile(r"^\d{12}$")
 
 
 # ---------------- schemas ----------------
+AccountType = Literal["personal", "merchant"]
+
+
 class UpiAccountIn(BaseModel):
     vpa: str = Field(..., examples=["musclemen@okhdfcbank"], description="UPI ID that receives the money")
     payee_name: str = Field(..., min_length=2, max_length=120, description="Name on the bank account (shown in UPI apps)")
     label: str | None = Field(None, max_length=60, examples=["HDFC current a/c"])
+    account_type: AccountType = Field("personal", description="merchant = business UPI ID (one-tap app links work); "
+                                                                "personal = individual UPI ID (members pay by QR / UPI ID)")
+    merchant_code: str | None = Field(None, pattern=r"^\d{4}$", description="MCC for merchant IDs; default 7997")
     is_default: bool = True
 
 
 class UpiAccountPatch(BaseModel):
     payee_name: str | None = Field(None, min_length=2, max_length=120)
+    account_type: AccountType | None = None
+    merchant_code: str | None = Field(None, pattern=r"^\d{4}$")
     label: str | None = Field(None, max_length=60)
     is_default: bool | None = None
     active: bool | None = None
@@ -102,14 +110,23 @@ def clean_utr(u: str) -> str:
     return u
 
 
-def upi_links(r: UpiPaymentRequest) -> tuple[str, dict]:
-    params = {"pa": r.vpa, "pn": r.payee_name, "am": f"{r.amount_paise / 100:.2f}", "cu": "INR", "tr": r.ref}
+def upi_links(r: UpiPaymentRequest) -> tuple[str, dict | None]:
+    """Personal UPI IDs: plain P2P QR (pa, pn, am, cu, tn) — UPI apps decline "tap to pay" links to personal IDs,
+    so no app links; members scan the QR in their UPI app or pay to the UPI ID.
+    Merchant UPI IDs: merchant intent (+ tr, mc) with one-tap app links."""
+    merchant = (getattr(r, "account_type", None) or "personal") == "merchant"
+    params = {"pa": r.vpa, "pn": r.payee_name, "am": f"{r.amount_paise / 100:.2f}", "cu": "INR"}
+    if merchant:
+        params["tr"] = r.ref
+        params["mc"] = r.merchant_code or "7997"
     if r.note:
         params["tn"] = r.note
     qs = urlencode(params, quote_via=lambda v, *a: quote(v, safe="@"))  # UPI apps expect a literal @
-    return f"upi://pay?{qs}", {"generic": f"upi://pay?{qs}", "gpay": f"tez://upi/pay?{qs}",
-                               "phonepe": f"phonepe://pay?{qs}", "paytm": f"paytmmp://pay?{qs}",
-                               "bhim": f"bhim://upi/pay?{qs}"}
+    uri = f"upi://pay?{qs}"
+    if not merchant:
+        return uri, None
+    return uri, {"generic": uri, "gpay": f"tez://upi/pay?{qs}", "phonepe": f"phonepe://pay?{qs}",
+                 "paytm": f"paytmmp://pay?{qs}", "bhim": f"bhim://upi/pay?{qs}"}
 
 
 def refresh_status(r: UpiPaymentRequest) -> UpiPaymentRequest:
@@ -128,9 +145,13 @@ def ser_req(r: UpiPaymentRequest, member: GymMember | None = None, receipt_no: s
         plan_name = p.name if p else None
     uri, links = upi_links(r)
     payable = r.status in ("pending", "expired")
+    merchant = (r.account_type or "personal") == "merchant"
     return {"id": r.id, "status": r.status, "amount_paise": r.amount_paise, "vpa": r.vpa, "payee_name": r.payee_name,
             "ref": r.ref, "note": r.note, "upi_uri": uri if payable else None, "qr_payload": uri if payable else None,
-            "app_links": links if payable else None, "membership_id": r.membership_id,
+            "app_links": links if payable else None, "account_type": r.account_type or "personal",
+            # intent = one-tap buttons work · qr = scan the QR inside a UPI app (or save it & "scan from gallery")
+            # or pay to the UPI ID manually, then submit the UTR
+            "pay_mode": "intent" if merchant else "qr", "membership_id": r.membership_id,
             "member": {"id": member.id, "name": member.display_name, "member_code": member.member_code} if member else None,
             "utr": r.utr, "claimed_at": iso(r.claimed_at), "decided_at": iso(r.decided_at),
             "reject_reason": r.reject_reason, "payment_id": r.payment_id, "receipt_no": receipt_no,
@@ -141,7 +162,8 @@ def ser_req(r: UpiPaymentRequest, member: GymMember | None = None, receipt_no: s
 
 def ser_acct(a: GymUpiAccount) -> dict:
     return {"id": a.id, "vpa": a.vpa, "payee_name": a.payee_name, "label": a.label, "is_default": a.is_default,
-            "active": a.active, "created_at": iso(a.created_at)}
+            "active": a.active, "account_type": a.account_type or "personal", "merchant_code": a.merchant_code,
+            "created_at": iso(a.created_at)}
 
 
 def default_account(db: Session, gym_id: str, account_id: str | None = None) -> GymUpiAccount:
@@ -199,6 +221,7 @@ def new_request(db: Session, gym: Gym, member: GymMember, ms: Membership | None,
     note = (note or f"{gym.code_prefix} {member.member_code}{label}")[:50]
     r = UpiPaymentRequest(gym_id=gym.id, member_id=member.id, membership_id=ms.id if ms else None,
                           upi_account_id=acct.id, vpa=acct.vpa, payee_name=acct.payee_name, amount_paise=amount,
+                          account_type=acct.account_type or "personal", merchant_code=acct.merchant_code,
                           ref=f"DMBL{secrets.token_hex(6).upper()}", note=re.sub(r"[^\w .\-/]", "", note),
                           status="pending", created_via=via, created_by=actor_id,
                           purpose="renewal" if plan else "dues", plan_id=plan.id if plan else None,
@@ -264,8 +287,10 @@ def _set_default(db: Session, gym_id: str, keep_id: str):
 
 @router.post("/gyms/{gymId}/upi-accounts", response_model=UpiAccountOut, status_code=201,
              summary="Add a UPI ID (settings.manage)",
-             description="Use a **business / merchant** UPI ID where possible (PhonePe Business, Paytm for Business, "
-                         "bank merchant VPA). Some UPI apps limit pre-filled-amount payments to personal UPI IDs.")
+             description="Set `account_type` honestly. **merchant** (PhonePe/Paytm/GPay for Business, BharatPe, bank "
+                         "merchant VPA): one-tap app links work. **personal**: UPI apps decline “tap to pay” links to "
+                         "personal IDs (security rules), so members pay by scanning the QR inside their UPI app or "
+                         "paying to the UPI ID; requests come back with `pay_mode: \"qr\"` and no `app_links`.")
 def add_account(body: UpiAccountIn, ctx: GymCtx = Depends(perm_ctx("settings.manage")), db: Session = Depends(get_db)):
     vpa = clean_vpa(body.vpa)
     a = db.scalar(select(GymUpiAccount).where(GymUpiAccount.gym_id == ctx.gym.id, GymUpiAccount.vpa == vpa))
@@ -279,6 +304,7 @@ def add_account(body: UpiAccountIn, ctx: GymCtx = Depends(perm_ctx("settings.man
         a = GymUpiAccount(gym_id=ctx.gym.id, vpa=vpa, payee_name=body.payee_name.strip(), label=body.label,
                           created_by=ctx.user.id)
         db.add(a)
+    a.account_type, a.merchant_code = body.account_type, body.merchant_code
     a.is_default = body.is_default or first
     db.flush()
     if a.is_default:
@@ -296,7 +322,7 @@ def patch_account(accountId: str, body: UpiAccountPatch, ctx: GymCtx = Depends(p
     if not a or a.gym_id != ctx.gym.id:
         raise ApiError(404, "NOT_FOUND", "That UPI ID wasn’t found.")
     data = body.model_dump(exclude_unset=True)
-    for k in ("payee_name", "label", "active"):
+    for k in ("payee_name", "label", "active", "account_type", "merchant_code"):
         if k in data and data[k] is not None:
             setattr(a, k, data[k])
     if data.get("is_default"):

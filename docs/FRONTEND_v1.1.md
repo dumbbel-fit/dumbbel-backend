@@ -172,6 +172,15 @@ Each note: `{id, body, author{id,name}, created_at}`. (The old single `notes` fi
 - Requests have `purpose` (`dues`|`renewal`), `plan_id`, `plan_name` and `result_membership_id`. Show "Renewal · Monthly" in the queue.
 - Staff with `payments.record` (not only the owner) get a push when a member submits a UTR.
 
+## 3b-2. Personal vs business UPI IDs (v1.3.1)
+UPI apps (GPay, PhonePe, Paytm) decline "tap to pay" links from other apps and websites to **personal** UPI IDs
+("security concerns"). So each UPI ID now has `account_type`: `personal` (default) or `merchant`.
+- Requests return `pay_mode`: `intent` (merchant) → show the `app_links` buttons; `qr` (personal) → `app_links` is
+  null: show the QR (`upi_uri`) with **Save QR to gallery** (member: UPI app → Scan → gallery), **Copy UPI ID** and
+  **Copy amount**, then ask for the UTR.
+- Personal QR = `pa, pn, am, cu, tn` only (no `tr`/`mc`). Merchant = plus `tr` (our ref) and `mc` (default 7997).
+- Admin UPI IDs: `POST/PATCH /gyms/{id}/upi-accounts {account_type, merchant_code?}`.
+
 ## 3c. Check-in = member scans the gym's QR (v1.3)
 - **Admin → Check-in QR** (`checkins.manage`): `GET /gyms/{id}/checkin-qr` →
   `display.url` (live QR; refetch every `refresh_in_sec`=20, each token valid ~60 s), `poster.url` (fixed printable QR),

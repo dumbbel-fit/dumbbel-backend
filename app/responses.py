@@ -626,6 +626,8 @@ class UpiAccountOut(Out):
     id: str
     vpa: str
     payee_name: str
+    account_type: str | None = None
+    merchant_code: str | None = None
     label: str | None = None
     is_default: bool
     active: bool
@@ -645,7 +647,10 @@ class UpiRequestOut(Out):
     ref: str
     note: str | None = None
     upi_uri: str | None = None
+    qr_payload: str | None = None
     app_links: dict[str, str] | None = None
+    account_type: str | None = None
+    pay_mode: str | None = None
     member: dict[str, Any] | None = None
     membership_id: str | None = None
     utr: str | None = None

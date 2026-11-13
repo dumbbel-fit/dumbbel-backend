@@ -446,6 +446,10 @@ class GymUpiAccount(Base):
     vpa: Mapped[str] = mapped_column(String(120), nullable=False)
     payee_name: Mapped[str] = mapped_column(String(120), nullable=False)
     label: Mapped[str | None] = mapped_column(String(60))
+    # personal = individual UPI ID (UPI apps block "tap to pay" links to these → QR / copy-ID flow)
+    # merchant = business UPI ID (PhonePe/Paytm/GPay for Business, BharatPe…) → one-tap app links work
+    account_type: Mapped[str] = mapped_column(String(10), default="personal", server_default="personal", nullable=False)
+    merchant_code: Mapped[str | None] = mapped_column(String(4))  # MCC, e.g. 7997 (health/fitness clubs)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1", nullable=False)
     created_by: Mapped[str | None] = fk("users.id", nullable=True)
@@ -465,6 +469,8 @@ class UpiPaymentRequest(Base):
     upi_account_id: Mapped[str] = fk("gym_upi_accounts.id")
     vpa: Mapped[str] = mapped_column(String(120), nullable=False)  # snapshot
     payee_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    account_type: Mapped[str] = mapped_column(String(10), default="personal", server_default="personal", nullable=False)
+    merchant_code: Mapped[str | None] = mapped_column(String(4))
     amount_paise: Mapped[int] = mapped_column(Integer, nullable=False)
     ref: Mapped[str] = mapped_column(String(35), nullable=False, unique=True)  # UPI tr
     note: Mapped[str | None] = mapped_column(String(80))
