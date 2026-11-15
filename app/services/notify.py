@@ -11,7 +11,7 @@ from app.services.push import send_push
 
 log = logging.getLogger("dumbbel.notify")
 
-TITLES = {"gym_approved": "Your gym is approved 🎉", "gym_rejected": "Gym verification needs attention",
+TITLES = {"gym_approved": "Your gym is approved", "gym_rejected": "Gym verification needs attention",
           "gym_suspended": "Your gym is suspended", "gym_reinstated": "Your gym is active again"}
 
 

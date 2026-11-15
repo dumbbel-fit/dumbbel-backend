@@ -356,7 +356,7 @@ def summary(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
 
 
 TEMPLATES = {
-    "expiring": "Hi {first}, your {plan} at {gym} ends on {end}. Renew at the front desk or reply here to keep your streak going! 💪",
+    "expiring": "Hi {first}, your {plan} at {gym} ends on {end}. Renew at the front desk or reply here to keep your streak going!",
     "expired": "Hi {first}, your {plan} at {gym} ended on {end}. We miss you — renew anytime at the front desk.",
     "dues": "Hi {first}, a quick reminder from {gym}: {due} is pending on your membership. You can pay by UPI or cash at the desk. Thanks!",
     "away": "Hi {first}, we haven’t seen you at {gym} in a while. Your membership is active till {end} — come say hi this week!",

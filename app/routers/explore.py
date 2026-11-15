@@ -325,7 +325,7 @@ def book_visit(body: VisitIn, user: User = Depends(current_user), db: Session = 
     audit(db, g.id, user.id, "visit.request", "visit", v.id, f"{who} booked a visit for {_when(v)}")
     db.commit()
     for uid in _staff_to_notify(db, g):
-        enqueue("push.send", send_push, uid, "admin", "New visit request 👋",
+        enqueue("push.send", send_push, uid, "admin", "New visit request",
                 f"{who} wants to visit {g.name} on {_when(v)}. Tap to confirm.",
                 {"type": "visit_request", "gym_id": g.id, "visit_id": v.id})
     return ser_visit(v, g, (_photos_by_gym(db, [g.id], 1).get(g.id) or [None])[0])
@@ -429,7 +429,7 @@ def update_visit(visitId: str, body: VisitPatch, ctx: GymCtx = Depends(perm_ctx(
     audit(db, g.id, ctx.user.id, "visit.update", "visit", v.id,
           f"Visit by {v.name or v.phone}: {v.status.replace('_', ' ')} ({_when(v)})")
     db.commit()
-    msg = {"confirmed": ("Visit confirmed ✅", f"{g.name} is expecting you on {_when(v)}."),
+    msg = {"confirmed": ("Visit confirmed", f"{g.name} is expecting you on {_when(v)}."),
            "cancelled": ("Visit declined", f"{g.name} can’t take your visit on {_when(v)}." + (f" {v.gym_note}" if v.gym_note else ""))}
     if resched and v.status == "confirmed":
         msg["confirmed"] = ("Visit time updated", f"{g.name} has you down for {_when(v)}.")
