@@ -245,7 +245,13 @@ def create_member(body: MemberCreate, ctx: GymCtx = Depends(perm_ctx("members.ed
                 "membership": ser_membership(ms, gym, db, can_pay=ctx.can_pay,
                                              due=membership_due(db, ms)) if ms else None,
                 "payment": ser_payment(pay, member.display_name, ms.plan_name if ms else None, ctx.user.name) if pay else None}
-    return idem.respond(201, body_out)
+    resp = idem.respond(201, body_out)
+    if ms:
+        from app.services.whatsapp import fire_later
+        fire_later(gym.id, "welcome", member.id, ms.id, dedupe=f"welcome:{member.id}")
+        if pay:
+            fire_later(gym.id, "payment_received", member.id, ms.id, {"amount": rupees(pay.amount_paise)}, f"paid:{pay.id}")
+    return resp
 
 
 # ---------------- detail ----------------
@@ -434,7 +440,15 @@ def assign_membership(memberId: str, body: MembershipCreate, ctx: GymCtx = Depen
            "payment": ser_payment(pay, m.display_name, ms.plan_name, ctx.user.name) if pay else None}
     if ctx.can_pay:
         out["due_paise"] = due
-    return idem.respond(201, out)
+    resp = idem.respond(201, out)
+    from app.services.whatsapp import fire_later
+    if had_any:
+        fire_later(gym.id, "renewal_confirmed", m.id, ms.id, dedupe=f"renewed:{ms.id}")
+    else:
+        fire_later(gym.id, "welcome", m.id, ms.id, dedupe=f"welcome:{m.id}")
+    if pay:
+        fire_later(gym.id, "payment_received", m.id, ms.id, {"amount": rupees(pay.amount_paise)}, f"paid:{pay.id}")
+    return resp
 
 
 # ---------------- freeze / unfreeze / cancel ----------------

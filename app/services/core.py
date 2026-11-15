@@ -240,7 +240,8 @@ def ser_member_basic(m: GymMember, u: User, include_notes: bool = True) -> dict:
          "emergency_contact": m.emergency_contact, "status": m.status, "source": m.source,
          "joined_on": dstr(m.joined_on), "joined_at": dstr(m.joined_on), "last_checkin_at": iso(m.last_checkin_at),
          "last_visit_at": iso(m.last_checkin_at), "on_app": u.first_login_at is not None,
-         "claimed_at": iso(m.claimed_at), "claim_disputed_at": iso(m.claim_disputed_at), "created_at": iso(m.created_at)}
+         "claimed_at": iso(m.claimed_at), "claim_disputed_at": iso(m.claim_disputed_at), "created_at": iso(m.created_at),
+         "wa_opted_out": m.wa_opted_out_at is not None, "wa_opted_out_at": iso(m.wa_opted_out_at), "wa_opt_source": m.wa_opt_source}
     if include_notes:
         d["notes"] = m.notes
     return d

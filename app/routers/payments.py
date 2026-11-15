@@ -150,7 +150,11 @@ def record_payment(body: PaymentCreate, ctx: GymCtx = Depends(perm_ctx("payments
                                   ctx.user.name),
            "credit_payment": ser_payment(credit, member.display_name, None, ctx.user.name) if (credit and pay) else None,
            "due_paise": membership_due(db, ms) if ms else 0}
-    return idem.respond(201, out)
+    resp = idem.respond(201, out)
+    from app.services.whatsapp import fire_later
+    fire_later(gym.id, "payment_received", member.id, ms.id if ms else None, {"amount": rupees(body.amount_paise)},
+               f"paid:{primary.id}")
+    return resp
 
 
 def _payment_ctx(db: Session, user: User, payment_id: str):

@@ -199,6 +199,8 @@ class GymMember(Base):
     claimed_at = mapped_column(TS, nullable=True)
     claim_disputed_at = mapped_column(TS, nullable=True)
     claim_dispute_note: Mapped[str | None] = mapped_column(Text)
+    wa_opted_out_at = mapped_column(TS, nullable=True)  # member said STOP / staff switched WhatsApp off
+    wa_opt_source: Mapped[str | None] = mapped_column(String(16))  # member | staff
     created_at = created()
     updated_at = updated()
     __table_args__ = (UniqueConstraint("gym_id", "user_id", name="uq_member_gym_user"),
@@ -491,6 +493,7 @@ class UpiPaymentRequest(Base):
     reject_reason: Mapped[str | None] = mapped_column(Text)
     payment_id: Mapped[str | None] = fk("payments.id", nullable=True)
     expires_at = mapped_column(TS, nullable=False)
+    renewal_token_id: Mapped[str | None] = mapped_column(String(36), index=True)  # started from a renewal link
     created_at = created()
     updated_at = updated()
     __table_args__ = (Index("ix_upi_gym_status", "gym_id", "status", "created_at"),)
@@ -576,4 +579,99 @@ class StoredFile(Base):
     content_type: Mapped[str] = mapped_column(String(100), nullable=False)
     size: Mapped[int] = mapped_column(Integer, nullable=False)
     data = mapped_column(LONGBLOB, nullable=False)
+    created_at = created()
+
+
+# ---------------- WhatsApp (Meta Cloud API) ----------------
+class GymWhatsApp(Base):
+    """One WhatsApp Business number per gym. The access token is stored encrypted (Fernet) and never returned."""
+    __tablename__ = "gym_whatsapp"
+    gym_id: Mapped[str] = mapped_column(String(36), ForeignKey("gyms.id"), primary_key=True)
+    waba_id: Mapped[str | None] = mapped_column(String(40), index=True)
+    phone_number_id: Mapped[str | None] = mapped_column(String(40), unique=True)
+    display_phone: Mapped[str | None] = mapped_column(String(32))
+    verified_name: Mapped[str | None] = mapped_column(String(200))
+    quality: Mapped[str | None] = mapped_column(String(20))
+    token_enc: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="disconnected", server_default="disconnected", nullable=False)  # connected|error|disconnected
+    last_error: Mapped[str | None] = mapped_column(String(500))
+    connected_via: Mapped[str | None] = mapped_column(String(16))  # manual | embedded
+    connected_by: Mapped[str | None] = mapped_column(String(36))
+    connected_at = mapped_column(TS, nullable=True)
+    checked_at = mapped_column(TS, nullable=True)
+    consent_confirmed_at = mapped_column(TS, nullable=True)  # owner attested members agreed to WhatsApp updates
+    settings = mapped_column(JSON, nullable=True)  # automations, send hour
+    created_at = created()
+    updated_at = updated()
+
+
+class WaTemplate(Base):
+    __tablename__ = "wa_templates"
+    id: Mapped[str] = pk()
+    gym_id: Mapped[str] = fk("gyms.id", index=True)
+    key: Mapped[str] = mapped_column(String(40), nullable=False)  # expiry_reminder, welcome, …
+    meta_name: Mapped[str | None] = mapped_column(String(120))
+    meta_id: Mapped[str | None] = mapped_column(String(40))
+    language: Mapped[str] = mapped_column(String(10), default="en", server_default="en", nullable=False)
+    category: Mapped[str] = mapped_column(String(16), nullable=False)  # UTILITY | MARKETING
+    body: Mapped[str] = mapped_column(Text, nullable=False)  # with {{member_name}}-style variables
+    button_text: Mapped[str | None] = mapped_column(String(25))  # set → URL button to the renewal link
+    status: Mapped[str] = mapped_column(String(16), default="draft", server_default="draft", nullable=False)  # draft|pending|approved|rejected|paused|disabled
+    reject_reason: Mapped[str | None] = mapped_column(String(300))
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    submitted_at = mapped_column(TS, nullable=True)
+    created_at = created()
+    updated_at = updated()
+    __table_args__ = (UniqueConstraint("gym_id", "key", name="uq_wa_tpl_gym_key"),)
+
+
+class WaMessage(Base):
+    """Outbox + history. queued → sending → sent → delivered → read, or failed / cancelled.
+    `dedupe_key` (unique per gym) is what stops a reminder going out twice."""
+    __tablename__ = "wa_messages"
+    id: Mapped[str] = pk()
+    gym_id: Mapped[str] = fk("gyms.id")
+    member_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    membership_id: Mapped[str | None] = mapped_column(String(36))
+    phone: Mapped[str] = mapped_column(String(32), nullable=False)
+    event: Mapped[str] = mapped_column(String(40), nullable=False)
+    category: Mapped[str] = mapped_column(String(16), nullable=False)
+    template_key: Mapped[str] = mapped_column(String(40), nullable=False)
+    vars = mapped_column(JSON, nullable=True)
+    body: Mapped[str | None] = mapped_column(Text)  # rendered text shown in history
+    status: Mapped[str] = mapped_column(String(12), default="queued", server_default="queued", nullable=False)
+    wamid: Mapped[str | None] = mapped_column(String(120), unique=True)
+    error_code: Mapped[str | None] = mapped_column(String(20))
+    error: Mapped[str | None] = mapped_column(String(500))
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    next_attempt_at = mapped_column(TS, nullable=True)
+    dedupe_key: Mapped[str | None] = mapped_column(String(120))
+    batch_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    trigger: Mapped[str] = mapped_column(String(10), default="auto", server_default="auto", nullable=False)  # auto | manual
+    created_by: Mapped[str | None] = mapped_column(String(36))
+    sent_at = mapped_column(TS, nullable=True)
+    delivered_at = mapped_column(TS, nullable=True)
+    read_at = mapped_column(TS, nullable=True)
+    failed_at = mapped_column(TS, nullable=True)
+    created_at = created()
+    updated_at = updated()
+    __table_args__ = (UniqueConstraint("gym_id", "dedupe_key", name="uq_wa_msg_dedupe"),
+                      Index("ix_wa_msg_gym_created", "gym_id", "created_at"),
+                      Index("ix_wa_msg_queue", "status", "next_attempt_at"))
+
+
+class RenewalToken(Base):
+    """Personal renewal link (https://dumbbel.fit/renew/<token>). Only the SHA-256 of the token is stored."""
+    __tablename__ = "renewal_tokens"
+    id: Mapped[str] = pk()
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    gym_id: Mapped[str] = fk("gyms.id", index=True)
+    member_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    message_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    source: Mapped[str] = mapped_column(String(16), default="whatsapp", server_default="whatsapp", nullable=False)
+    expires_at = mapped_column(TS, nullable=False)
+    opened_at = mapped_column(TS, nullable=True)
+    used_at = mapped_column(TS, nullable=True)  # a renewal through this link was completed
+    result_membership_id: Mapped[str | None] = mapped_column(String(36))
+    revoked_at = mapped_column(TS, nullable=True)
     created_at = created()

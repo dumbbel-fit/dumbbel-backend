@@ -442,6 +442,17 @@ def verify_request(requestId: str, body: VerifyIn, ctx: GymCtx = Depends(perm_ct
     enqueue("push.send", send_push, member.user_id, "member", "Payment received", msg,
             {"type": "upi_verified", "request_id": r.id, "payment_id": main.id,
              "membership_id": r.result_membership_id or r.membership_id})
+    from app.services.whatsapp import fire_later
+    if r.result_membership_id:
+        if r.renewal_token_id:  # renewal came from a WhatsApp link → attribute it
+            from app.models import RenewalToken
+            tok = db.get(RenewalToken, r.renewal_token_id)
+            if tok and not tok.used_at:
+                tok.used_at, tok.result_membership_id = utcnow(), r.result_membership_id
+                db.commit()
+        fire_later(gym.id, "renewal_confirmed", member.id, r.result_membership_id, dedupe=f"renewed:{r.result_membership_id}")
+    else:
+        fire_later(gym.id, "payment_received", member.id, r.membership_id, {"amount": rupees(r.amount_paise)}, f"paid:{main.id}")
     return ser_req(r, member, main.receipt_no)
 
 
@@ -495,6 +506,8 @@ def reject_request(requestId: str, body: RejectIn, ctx: GymCtx = Depends(perm_ct
     enqueue("push.send", send_push, member.user_id, "member", "Payment not confirmed",
             f"{ctx.gym.name} couldn’t find your UPI payment of {rupees(r.amount_paise)}: {body.reason}",
             {"type": "upi_rejected", "request_id": r.id})
+    from app.services.whatsapp import fire_later
+    fire_later(ctx.gym.id, "payment_failed", member.id, r.membership_id, {"amount": rupees(r.amount_paise)}, f"upirej:{r.id}")
     return ser_req(r, member)
 
 

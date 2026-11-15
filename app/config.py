@@ -66,6 +66,18 @@ class Settings(BaseSettings):
     s3_secret_key: str | None = None
     local_storage_dir: str = "./storage"
 
+    # WhatsApp (Meta Cloud API). One Meta app for the platform; each gym connects its own number.
+    meta_app_id: str | None = None
+    meta_app_secret: str | None = None            # verifies webhook signatures + embedded-signup code exchange
+    meta_webhook_verify_token: str | None = None  # the "Verify token" typed into the Meta webhook form
+    meta_es_config_id: str | None = None          # Embedded Signup configuration id (optional)
+    meta_graph_base: str = "https://graph.facebook.com"
+    meta_graph_version: str = "v21.0"
+    whatsapp_enc_key: str | None = None           # Fernet key for stored tokens (falls back to one derived from JWT_SECRET)
+    renew_url_base: str = "https://dumbbel.fit/renew"
+    renew_token_days: int = 14
+    wa_send_per_sec: int = 8
+
     # Push
     expo_access_token: str | None = None
 
