@@ -10,7 +10,10 @@ Design rules:
 """
 import base64
 import hashlib
+import hmac
 import logging
+import random
+import threading
 import re
 import secrets
 import time
@@ -26,7 +29,7 @@ from app.config import settings
 from app.db import session_scope
 from app.models import (Gym, GymMember, GymUpiAccount, GymWhatsApp, Membership, Payment, Plan, RenewalToken, User,
                         WaMessage, WaTemplate)
-from app.utils import rupees, today_in, utcnow, uuid7
+from app.utils import local_midnight_utc, rupees, today_in, utcnow, uuid7
 
 log = logging.getLogger("dumbbel.whatsapp")
 
@@ -145,6 +148,114 @@ def graph(method: str, path: str, token: str | None, *, json: dict | None = None
     return data
 
 
+# ---------------------------------------------------------------- Evolution API (QR-linked WhatsApp, Baileys)
+def web_available() -> bool:
+    return bool(settings.evolution_api_url and settings.evolution_api_key)
+
+
+def evo(method: str, path: str, *, json: dict | None = None, params: dict | None = None, timeout: float = 25) -> dict:
+    """Call our Evolution API server. Raises MetaError (same handling as the Cloud API). Never logs the key."""
+    if not web_available():
+        raise MetaError("WhatsApp QR linking isn’t set up on this server.")
+    url = settings.evolution_api_url.rstrip("/") + "/" + path.lstrip("/")
+    try:
+        r = httpx.request(method, url, json=json, params=params, timeout=timeout,
+                          headers={"apikey": settings.evolution_api_key})
+    except httpx.HTTPError as e:
+        raise MetaError(f"The WhatsApp link service isn’t reachable ({type(e).__name__}).", transient=True)
+    try:
+        data = r.json()
+    except ValueError:
+        data = {}
+    if r.status_code >= 400:
+        resp = data.get("response") if isinstance(data, dict) else None
+        msg = resp.get("message") if isinstance(resp, dict) else None
+        if isinstance(msg, list) and msg:
+            m0 = msg[0]
+            if isinstance(m0, dict) and m0.get("exists") is False:
+                raise MetaError("This number isn’t on WhatsApp.", code=404404, status=r.status_code)
+            msg = m0 if isinstance(m0, str) else str(m0)
+        msg = msg or (data.get("error") if isinstance(data, dict) else None) or f"WhatsApp link service returned HTTP {r.status_code}"
+        raise MetaError(str(msg)[:400], status=r.status_code, transient=r.status_code >= 500 or r.status_code == 429)
+    return data if isinstance(data, (dict, list)) else {}
+
+
+def instance_name(gym_id: str) -> str:
+    return "dmbl-" + gym_id
+
+
+def web_hook_secret(gym_id: str) -> str:
+    return hmac.new(("evo-hook:" + settings.jwt_secret).encode(), gym_id.encode(), hashlib.sha256).hexdigest()
+
+
+WEB_EVENTS = ["QRCODE_UPDATED", "CONNECTION_UPDATE", "MESSAGES_UPDATE", "MESSAGES_UPSERT"]
+
+
+def web_webhook_url() -> str:
+    base = (settings.evolution_webhook_base or _public_base()).rstrip("/")
+    return f"{base}{settings.api_prefix}/webhooks/evolution"
+
+
+def _public_base() -> str:
+    from app.services.storage import _base
+    return _base()
+
+
+def web_create(gym_id: str, pairing_number: str | None = None) -> dict:
+    """Create (or reuse) this gym's Evolution instance and return {state, qr_base64, pairing_code}."""
+    name = instance_name(gym_id)
+    body = {"instanceName": name, "integration": "WHATSAPP-BAILEYS", "qrcode": True, "groupsIgnore": True,
+            "rejectCall": False, "alwaysOnline": False, "readMessages": False, "readStatus": False,
+            "syncFullHistory": False,
+            "webhook": {"enabled": True, "url": web_webhook_url(), "byEvents": False, "base64": False,
+                        "headers": {"x-dumbbel-token": web_hook_secret(gym_id)}, "events": WEB_EVENTS}}
+    if pairing_number:
+        body["number"] = pairing_number
+    try:
+        d = evo("POST", "/instance/create", json=body)
+        q = d.get("qrcode") or {}
+        if q.get("base64") or q.get("pairingCode"):
+            return {"state": "connecting", "qr_base64": q.get("base64"), "pairing_code": q.get("pairingCode")}
+    except MetaError as e:
+        if "already in use" not in e.message.lower() and "already exists" not in e.message.lower():
+            raise
+        # existing instance: make sure the webhook points here (URL / secret may have changed)
+        evo("POST", f"/webhook/set/{name}", json={"webhook": body["webhook"]})
+    return web_connect(gym_id, pairing_number)
+
+
+def web_connect(gym_id: str, pairing_number: str | None = None) -> dict:
+    name = instance_name(gym_id)
+    d = evo("GET", f"/instance/connect/{name}", params={"number": pairing_number} if pairing_number else None)
+    if isinstance(d, dict) and (d.get("instance") or {}).get("state") == "open":
+        return {"state": "open", "qr_base64": None, "pairing_code": None}
+    return {"state": "connecting", "qr_base64": d.get("base64") if isinstance(d, dict) else None,
+            "pairing_code": d.get("pairingCode") if isinstance(d, dict) else None}
+
+
+def web_state(gym_id: str) -> str:
+    d = evo("GET", f"/instance/connectionState/{instance_name(gym_id)}")
+    return ((d.get("instance") or {}).get("state") or "close") if isinstance(d, dict) else "close"
+
+
+def web_profile(gym_id: str) -> dict:
+    d = evo("GET", "/instance/fetchInstances", params={"instanceName": instance_name(gym_id)})
+    row = d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
+    row = row.get("instance", row) if isinstance(row, dict) else {}
+    jid = row.get("ownerJid") or row.get("owner") or ""
+    digits = re.sub(r"\D", "", jid.split("@")[0]) if jid else ""
+    return {"phone": ("+" + digits) if digits else None, "name": row.get("profileName")}
+
+
+def web_remove(gym_id: str):
+    name = instance_name(gym_id)
+    for path in (f"/instance/logout/{name}", f"/instance/delete/{name}"):
+        try:
+            evo("DELETE", path)
+        except MetaError:
+            pass
+
+
 # ---------------------------------------------------------------- config
 def get_config(db: Session, gym_id: str) -> GymWhatsApp | None:
     return db.get(GymWhatsApp, gym_id)
@@ -159,7 +270,18 @@ def wa_settings(cfg: GymWhatsApp | None) -> dict:
 
 
 def is_connected(cfg: GymWhatsApp | None) -> bool:
-    return bool(cfg and cfg.status == "connected" and cfg.token_enc and cfg.phone_number_id)
+    if not cfg or cfg.status != "connected":
+        return False
+    if cfg.provider == "web":
+        return bool(cfg.instance_name) and web_available()
+    return bool(cfg.token_enc and cfg.phone_number_id)
+
+
+def template_ready(cfg: GymWhatsApp | None, tpl: WaTemplate | None) -> bool:
+    """Linked (web) numbers send plain text, so no WhatsApp approval is needed; the Cloud API needs it."""
+    if not tpl:
+        return False
+    return True if (cfg and cfg.provider == "web") else tpl.status == "approved"
 
 
 def verify_number(token: str, phone_number_id: str) -> dict:
@@ -368,7 +490,7 @@ def queue_message(db: Session, gym: Gym, member: GymMember, event: str, *, ms: M
     if trigger == "auto" and not wa_settings(cfg)["automations"].get(event, False):
         return None, "automation_off"
     tpl = tpl or db.scalar(select(WaTemplate).where(WaTemplate.gym_id == gym.id, WaTemplate.key == event))
-    if not tpl or tpl.status != "approved":
+    if not template_ready(cfg, tpl):
         return None, "template_not_approved"
     if member.status != "active":
         return None, "archived"
@@ -515,6 +637,24 @@ def run_expiry_automation(force: bool = False) -> int:
 
 
 # ---------------------------------------------------------------- sending (worker)
+def _send_web(db: Session, m: WaMessage, cfg: GymWhatsApp, tpl: WaTemplate):
+    link = None
+    if tpl.button_text and m.member_id:
+        raw = new_renewal_token(db, m.gym_id, m.member_id, m.id)
+        link = f"{settings.renew_url_base.rstrip('/')}/{raw}"
+    text = render(tpl.body, m.vars or {})
+    if link:
+        text += f"\n\n{tpl.button_text}: {link}"
+    if tpl.category == "MARKETING" and "STOP" not in text:
+        text += "\n\nReply STOP to stop these messages."
+    d = evo("POST", f"/message/sendText/{cfg.instance_name}",
+            json={"number": m.phone, "text": text, "linkPreview": False, "delay": random.randint(1200, 3500)}, timeout=45)
+    wamid = ((d.get("key") or {}).get("id")) if isinstance(d, dict) else None
+    if not wamid:
+        raise MetaError("WhatsApp didn’t confirm the message.", transient=True)
+    m.wamid, m.status, m.sent_at, m.error, m.error_code = wamid, "sent", utcnow(), None, None
+
+
 def _send_one(db: Session, m: WaMessage, cfg: GymWhatsApp, tpl: WaTemplate, token: str):
     names = template_vars(tpl.body)
     v = m.vars or {}
@@ -539,15 +679,73 @@ def _send_one(db: Session, m: WaMessage, cfg: GymWhatsApp, tpl: WaTemplate, toke
 BACKOFF = [60, 300, 1800, 7200]  # seconds before attempts 2..5
 
 
+_queue_lock = threading.Lock()
+
+
+def _web_hold(db: Session, cfg: GymWhatsApp, gym: Gym, trigger: str):
+    """Linked numbers: quiet hours for automatic messages and a daily cap. Returns a UTC datetime to retry at, or None."""
+    from app.utils import tz
+    z = tz(gym.timezone)
+    local = utcnow().astimezone(z)
+    qs, qe = settings.wa_web_quiet_start, settings.wa_web_quiet_end
+    if trigger == "auto" and (local.hour >= qs or local.hour < qe):
+        nxt = local.replace(hour=qe, minute=random.randint(0, 20), second=0, microsecond=0)
+        if local.hour >= qs:
+            nxt += timedelta(days=1)
+        return nxt.astimezone(utcnow().tzinfo)
+    start = local_midnight_utc(local.date(), gym.timezone)
+    sent = db.scalar(select(func.count()).select_from(WaMessage).where(
+        WaMessage.gym_id == cfg.gym_id, WaMessage.sent_at >= start)) or 0
+    if sent >= settings.wa_web_daily_limit:
+        nxt = (local + timedelta(days=1)).replace(hour=qe, minute=random.randint(0, 30), second=0, microsecond=0)
+        return nxt.astimezone(utcnow().tzinfo)
+    return None
+
+
 def process_queue(limit: int = 60) -> int:
-    """Send due messages. Rows are claimed with SKIP LOCKED so two workers never send the same message."""
+    """Send due messages. Rows are claimed with SKIP LOCKED so two workers never send the same message.
+    Linked (web) numbers send one message at a time with a random 12–35 s gap, like a person would."""
+    if not _queue_lock.acquire(blocking=False):
+        return 0  # another loop in this process is already sending
+    try:
+        return _process_queue(limit)
+    finally:
+        _queue_lock.release()
+
+
+def _process_queue(limit: int) -> int:
     now = utcnow()
     with session_scope() as db:
         # release rows a crashed worker left in "sending"
         db.execute(update(WaMessage).where(WaMessage.status == "sending", WaMessage.updated_at < now - timedelta(minutes=10))
                    .values(status="queued", next_attempt_at=now))
-        ids = db.scalars(select(WaMessage.id).where(WaMessage.status == "queued", WaMessage.next_attempt_at <= now)
-                         .order_by(WaMessage.next_attempt_at).limit(limit).with_for_update(skip_locked=True)).all()
+        rows = db.execute(select(WaMessage.id, WaMessage.gym_id).where(
+            WaMessage.status == "queued", WaMessage.next_attempt_at <= now)
+            .order_by(WaMessage.next_attempt_at).limit(400).with_for_update(skip_locked=True)).all()
+        if not rows:
+            return 0
+        providers = dict(db.execute(select(GymWhatsApp.gym_id, GymWhatsApp.provider).where(
+            GymWhatsApp.gym_id.in_({g for _, g in rows}))).all())
+        web_gyms = {g for _, g in rows if providers.get(g) == "web"}
+        # Linked numbers: one message per number per pass, only once its random gap has passed. The gap lives in the
+        # database and the gym row is locked, so several workers/instances still can't burst one number.
+        web_ok = set()
+        if web_gyms:
+            for cfg in db.scalars(select(GymWhatsApp).where(GymWhatsApp.gym_id.in_(web_gyms))
+                                  .with_for_update(skip_locked=True)):
+                if cfg.next_send_at is None or cfg.next_send_at <= now:
+                    cfg.next_send_at = now + timedelta(seconds=random.uniform(settings.wa_web_min_gap_sec,
+                                                                               settings.wa_web_max_gap_sec))
+                    web_ok.add(cfg.gym_id)
+        ids, web_taken = [], set()
+        for mid, gid in rows:
+            if gid in web_gyms:
+                if gid not in web_ok or gid in web_taken:
+                    continue
+                web_taken.add(gid)
+            ids.append(mid)
+            if len(ids) >= limit:
+                break
         if not ids:
             return 0
         db.execute(update(WaMessage).where(WaMessage.id.in_(ids)).values(status="sending"))
@@ -569,18 +767,27 @@ def process_queue(limit: int = 60) -> int:
                 member = db.get(GymMember, m.member_id) if m.member_id else None
                 tpl = db.scalar(select(WaTemplate).where(WaTemplate.gym_id == m.gym_id, WaTemplate.key == m.template_key))
                 m.attempts += 1
-                if not is_connected(cfg) or not token:
+                if not is_connected(cfg) or (cfg.provider != "web" and not token):
                     _fail(m, "not_connected", "WhatsApp was disconnected before this could be sent.")
                 elif member is not None and member.wa_opted_out_at is not None:
                     _fail(m, "opted_out", "The member opted out before this was sent.", status="cancelled")
-                elif not tpl or tpl.status != "approved":
+                elif not template_ready(cfg, tpl):
                     _fail(m, "template", "The template is no longer approved.")
+                elif cfg.provider == "web" and (hold := _web_hold(db, cfg, db.get(Gym, m.gym_id), m.trigger)):
+                    m.status, m.next_attempt_at, m.attempts = "queued", hold, max(0, m.attempts - 1)
                 else:
                     try:
-                        _send_one(db, m, cfg, tpl, token)
+                        if cfg.provider == "web":
+                            _send_web(db, m, cfg, tpl)
+                        else:
+                            _send_one(db, m, cfg, tpl, token)
                         sent += 1
                     except MetaError as e:
-                        if e.token_problem:
+                        if cfg.provider == "web" and e.status in (400, 404) and "not on whatsapp" not in e.message.lower() \
+                                and ("closed" in e.message.lower() or "not connected" in e.message.lower() or e.status == 404 and "instance" in e.message.lower()):
+                            cfg.status, cfg.last_error = "error", "WhatsApp was unlinked. Scan the QR code again to resume sending."
+                            m.status, m.next_attempt_at = "queued", utcnow() + timedelta(minutes=30)
+                        elif e.token_problem and cfg.provider != "web":
                             cfg.status, cfg.last_error = "error", "WhatsApp rejected the access token. Reconnect to resume sending."
                             cfg_cache[m.gym_id] = ("error", None)
                             _fail(m, str(e.code or 190), cfg.last_error)
@@ -599,6 +806,63 @@ def process_queue(limit: int = 60) -> int:
         if spent < gap:
             time.sleep(gap - spent)
     return sent
+
+
+# ---------------------------------------------------------------- Evolution webhooks
+EVO_STATUS = {"SERVER_ACK": "sent", "DELIVERY_ACK": "delivered", "READ": "read", "PLAYED": "read", "ERROR": "failed"}
+
+
+def handle_evolution(payload: dict, gym_id: str) -> dict:
+    out = {"event": payload.get("event")}
+    event = (payload.get("event") or "").lower().replace("_", ".")
+    data = payload.get("data") or {}
+    with session_scope() as db:
+        cfg = get_config(db, gym_id)
+        if not cfg or cfg.provider != "web" or cfg.instance_name != payload.get("instance"):
+            return {"ignored": True}
+        if event == "connection.update":
+            state = data.get("state")
+            if state == "open":
+                prof = {}
+                try:
+                    prof = web_profile(gym_id)
+                except MetaError:
+                    pass
+                wuid = re.sub(r"\D", "", str(data.get("wuid") or "").split("@")[0])
+                cfg.display_phone = prof.get("phone") or (("+" + wuid) if wuid else cfg.display_phone)
+                cfg.verified_name = prof.get("name") or data.get("profileName") or cfg.verified_name
+                if cfg.status != "connected":
+                    cfg.connected_at = utcnow()
+                cfg.status, cfg.last_error, cfg.checked_at = "connected", None, utcnow()
+            elif state == "close" and cfg.status == "connected":
+                reason = data.get("statusReason")
+                cfg.status = "error"
+                cfg.last_error = ("WhatsApp was unlinked from the phone. Scan the QR code again to resume sending."
+                                  if reason in (401, 403, 440) else "The WhatsApp link dropped. Reconnecting…")
+            out["state"] = state
+        elif event == "messages.update":
+            items = data if isinstance(data, list) else [data]
+            n = 0
+            for it in items:
+                st = EVO_STATUS.get(str(it.get("status") or "").upper())
+                if st and it.get("fromMe", True) is not False:
+                    n += bool(apply_status(db, cfg, {"id": it.get("keyId") or (it.get("key") or {}).get("id"), "status": st,
+                                                     "errors": [{"code": "web", "title": "WhatsApp couldn’t deliver this"}] if st == "failed" else None}))
+            out["statuses"] = n
+        elif event == "messages.upsert":
+            items = data if isinstance(data, list) else [data]
+            n = 0
+            for it in items:
+                key = it.get("key") or {}
+                if key.get("fromMe") or "@g.us" in str(key.get("remoteJid") or ""):
+                    continue
+                msg = it.get("message") or {}
+                text = msg.get("conversation") or (msg.get("extendedTextMessage") or {}).get("text") or ""
+                jid = key.get("remoteJidAlt") if "@lid" in str(key.get("remoteJid") or "") else key.get("remoteJid")
+                frm = re.sub(r"\D", "", str(jid or "").split("@")[0])
+                n += bool(apply_inbound(db, cfg, {"from": frm, "type": "text", "text": {"body": text}}))
+            out["inbound"] = n
+    return out
 
 
 def _fail(m: WaMessage, code: str, message: str, status: str = "failed"):

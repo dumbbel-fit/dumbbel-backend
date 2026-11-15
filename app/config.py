@@ -77,6 +77,15 @@ class Settings(BaseSettings):
     renew_url_base: str = "https://dumbbel.fit/renew"
     renew_token_days: int = 14
     wa_send_per_sec: int = 8
+    # WhatsApp via QR linking (Evolution API + Baileys) — free, no Meta setup. Leave URL empty to hide the option.
+    evolution_api_url: str | None = None         # e.g. http://10.128.0.5:8080 (private) or https://wa.example.com
+    evolution_api_key: str | None = None         # Evolution AUTHENTICATION_API_KEY (server-side only)
+    evolution_webhook_base: str | None = None    # how Evolution reaches this API (defaults to PUBLIC_BASE_URL)
+    wa_web_daily_limit: int = 200                 # max messages per gym per day on a linked number
+    wa_web_min_gap_sec: int = 12                  # random pause between two messages from the same number
+    wa_web_max_gap_sec: int = 35
+    wa_web_quiet_start: int = 21                  # no automated sends 21:00–08:00 gym time
+    wa_web_quiet_end: int = 8
 
     # Push
     expo_access_token: str | None = None

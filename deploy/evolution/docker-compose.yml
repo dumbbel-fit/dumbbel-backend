@@ -1,0 +1,69 @@
+# Evolution API (WhatsApp by QR linking, built on Baileys) for DUMBBEL.fit.
+# Runs on one small always-on VM: Evolution + its own PostgreSQL + Caddy (automatic HTTPS).
+# Setup: see setup-vm.sh and docs/WHATSAPP.md.  Start/upgrade:  docker compose up -d
+services:
+  evolution:
+    image: evoapicloud/evolution-api:v2.3.7
+    restart: always
+    environment:
+      SERVER_TYPE: http
+      SERVER_PORT: "8080"
+      SERVER_URL: https://${WA_DOMAIN}
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      DATABASE_PROVIDER: postgresql          # Evolution's status updates use PostgreSQL-only SQL — MySQL is not enough
+      DATABASE_CONNECTION_URI: postgresql://evolution:${PG_PASSWORD}@postgres:5432/evolution?schema=public
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"   # needed so delivered/read receipts can be matched to sent messages
+      DATABASE_SAVE_MESSAGE_UPDATE: "true"
+      DATABASE_SAVE_DATA_CONTACTS: "false"
+      DATABASE_SAVE_DATA_CHATS: "false"
+      DATABASE_SAVE_DATA_HISTORIC: "false"
+      DATABASE_SAVE_DATA_LABELS: "false"
+      CACHE_REDIS_ENABLED: "false"
+      CACHE_LOCAL_ENABLED: "true"
+      DEL_INSTANCE: "false"
+      QRCODE_LIMIT: "30"
+      CONFIG_SESSION_PHONE_CLIENT: DUMBBEL.fit
+      CONFIG_SESSION_PHONE_NAME: Chrome
+      WEBHOOK_GLOBAL_ENABLED: "false"
+      LOG_LEVEL: ERROR,WARN
+      LOG_BAILEYS: error
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 700m
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: evolution
+      POSTGRES_DB: evolution
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evolution -d evolution"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 200m
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+
+  caddy:
+    image: caddy:2-alpine
+    restart: always
+    ports: ["80:80", "443:443"]
+    environment:
+      WA_DOMAIN: ${WA_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [evolution]
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

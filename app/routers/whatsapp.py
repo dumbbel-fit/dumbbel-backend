@@ -45,6 +45,9 @@ MANAGE, VIEW, SEND = "settings.manage", "members.view", "members.edit"
 def ser_config(db: Session, gym: Gym, cfg: GymWhatsApp | None) -> dict:
     s = wa.wa_settings(cfg)
     return {"status": cfg.status if cfg else "disconnected", "connected": wa.is_connected(cfg),
+            "provider": cfg.provider if cfg else None,
+            "web": {"available": wa.web_available(), "daily_limit": settings.wa_web_daily_limit,
+                    "quiet_hours": [settings.wa_web_quiet_start, settings.wa_web_quiet_end]},
             "phone": cfg.display_phone if cfg else None, "business_name": cfg.verified_name if cfg else None,
             "quality": cfg.quality if cfg else None, "waba_id": cfg.waba_id if cfg else None,
             "phone_number_id": cfg.phone_number_id if cfg else None, "last_error": cfg.last_error if cfg else None,
@@ -57,6 +60,13 @@ def ser_config(db: Session, gym: Gym, cfg: GymWhatsApp | None) -> dict:
                          "webhook_ready": bool(settings.meta_app_secret and settings.meta_webhook_verify_token),
                          "webhook_url": f"{settings.public_base_url.rstrip('/')}{settings.api_prefix}/webhooks/whatsapp"},
             "upi_ready": wa.has_upi(db, gym.id), "renew_url_base": settings.renew_url_base}
+
+
+def ser_tpl_for(cfg: GymWhatsApp | None, t: WaTemplate) -> dict:
+    d = ser_tpl(t)
+    if cfg and cfg.provider == "web":
+        d["status"], d["reject_reason"] = "ready", None  # linked numbers send plain text: no WhatsApp review
+    return d
 
 
 def ser_tpl(t: WaTemplate) -> dict:
@@ -97,7 +107,7 @@ def get_whatsapp(ctx: GymCtx = Depends(perm_ctx(VIEW)), db: Session = Depends(ge
     out = ser_config(db, ctx.gym, cfg)
     if not ctx.has(MANAGE):
         out["waba_id"] = out["phone_number_id"] = None
-    out["templates"] = [ser_tpl(t) for t in tpls]
+    out["templates"] = [ser_tpl_for(cfg, t) for t in tpls]
     out["stats"] = _stats(db, ctx.gym)
     out["can_manage"], out["can_send"] = ctx.has(MANAGE), ctx.has(SEND)
     return out
@@ -126,6 +136,9 @@ def _connect(db: Session, ctx: GymCtx, waba_id: str, phone_number_id: str, token
         db.add(cfg)
     now = utcnow()
     changed_account = cfg.waba_id and cfg.waba_id != waba_id
+    if cfg.provider == "web" and cfg.instance_name:
+        wa.web_remove(ctx.gym.id)
+    cfg.provider, cfg.instance_name = "cloud", None
     cfg.waba_id, cfg.phone_number_id, cfg.token_enc = waba_id, phone_number_id, wa.encrypt(token)
     cfg.display_phone, cfg.verified_name = info.get("display_phone_number"), info.get("verified_name")
     cfg.quality = info.get("quality_rating")
@@ -181,6 +194,22 @@ def connect_embedded(body: EmbeddedIn, ctx: GymCtx = Depends(perm_ctx(MANAGE)), 
 @router.post("/gyms/{gymId}/whatsapp/test", summary="Re-check the connection with Meta (settings.manage)")
 def test_connection(ctx: GymCtx = Depends(perm_ctx(MANAGE)), db: Session = Depends(get_db)):
     cfg = wa.get_config(db, ctx.gym.id)
+    if cfg and cfg.provider == "web" and cfg.instance_name:
+        rate_limit(f"watest:{ctx.gym.id}", 30, 3600)
+        try:
+            state = wa.web_state(ctx.gym.id)
+            if state == "open":
+                prof = wa.web_profile(ctx.gym.id)
+                cfg.status, cfg.last_error = "connected", None
+                cfg.display_phone = prof.get("phone") or cfg.display_phone
+                cfg.verified_name = prof.get("name") or cfg.verified_name
+            else:
+                cfg.status, cfg.last_error = "error", "WhatsApp isn’t linked any more. Scan the QR code again."
+        except wa.MetaError as e:
+            cfg.last_error = e.message
+        cfg.checked_at = utcnow()
+        db.commit()
+        return get_whatsapp(ctx, db)
     if not cfg or not cfg.token_enc:
         raise ApiError(409, "WHATSAPP_NOT_CONNECTED", "Connect WhatsApp first.")
     rate_limit(f"watest:{ctx.gym.id}", 20, 3600)
@@ -206,6 +235,9 @@ def test_connection(ctx: GymCtx = Depends(perm_ctx(MANAGE)), db: Session = Depen
 def disconnect(ctx: GymCtx = Depends(perm_ctx(MANAGE)), db: Session = Depends(get_db)):
     cfg = wa.get_config(db, ctx.gym.id)
     if cfg:
+        if cfg.provider == "web" and cfg.instance_name:
+            wa.web_remove(ctx.gym.id)  # unlinks the device from the phone too
+            cfg.instance_name = None
         cfg.token_enc, cfg.status, cfg.last_error = None, "disconnected", None
         db.execute(update(WaMessage).where(WaMessage.gym_id == ctx.gym.id, WaMessage.status.in_(("queued", "sending")))
                    .values(status="cancelled", error="WhatsApp was disconnected", error_code="disconnected"))
@@ -257,6 +289,124 @@ def patch_settings(body: SettingsIn, ctx: GymCtx = Depends(perm_ctx(MANAGE)), db
     return get_whatsapp(ctx, db)
 
 
+# ---------------------------------------------------------------- link a normal WhatsApp with a QR (Evolution API)
+class WebLinkIn(BaseModel):
+    pairing_phone: str | None = Field(None, description="Link with an 8-character code instead of a QR (10-digit number)")
+    risk_ack: bool = Field(..., description="Owner accepts that WhatsApp may restrict numbers that send automated messages")
+    consent_confirmed: bool = False
+
+
+def _web_status(db: Session, ctx: GymCtx, cfg: GymWhatsApp, link: dict | None = None) -> dict:
+    out = {"state": "open" if cfg.status == "connected" else (link or {}).get("state", "connecting"),
+           "qr_base64": (link or {}).get("qr_base64"), "pairing_code": (link or {}).get("pairing_code"),
+           "connected": wa.is_connected(cfg), "phone": cfg.display_phone, "name": cfg.verified_name}
+    return out
+
+
+@router.post("/gyms/{gymId}/whatsapp/web/link", summary="Start linking the gym’s WhatsApp by QR code (settings.manage)",
+             description="Creates this gym’s linked-device session and returns a QR (base64 PNG) to scan in WhatsApp → "
+                         "Linked devices, or an 8-character pairing code when `pairing_phone` is given. Poll "
+                         "GET /whatsapp/web/link until `connected` is true.")
+def web_link(body: WebLinkIn, ctx: GymCtx = Depends(perm_ctx(MANAGE)), db: Session = Depends(get_db)):
+    if not wa.web_available():
+        raise ApiError(409, "WEB_LINK_UNAVAILABLE", "QR linking isn’t set up on this server yet.")
+    if not body.risk_ack:
+        raise validation({"risk_ack": "Please confirm you understand how linking works."})
+    rate_limit(f"walink:{ctx.gym.id}", 20, 3600)
+    pairing = None
+    if body.pairing_phone:
+        digits = "".join(ch for ch in body.pairing_phone if ch.isdigit())[-10:]
+        if len(digits) != 10:
+            raise validation({"pairing_phone": "Enter the 10-digit WhatsApp number."})
+        pairing = "91" + digits
+    cfg = wa.get_config(db, ctx.gym.id)
+    if not cfg:
+        cfg = GymWhatsApp(gym_id=ctx.gym.id)
+        db.add(cfg)
+    if cfg.provider != "web" and cfg.token_enc:  # switching from the Meta API: drop that token
+        cfg.token_enc, cfg.waba_id, cfg.phone_number_id = None, None, None
+    try:
+        link = wa.web_create(ctx.gym.id, pairing)
+    except wa.MetaError as e:
+        _meta_fail(e, "WHATSAPP_LINK_FAILED")
+    cfg.provider, cfg.instance_name = "web", wa.instance_name(ctx.gym.id)
+    if cfg.status != "connected":
+        cfg.status, cfg.last_error = "disconnected", None
+    if body.consent_confirmed:
+        cfg.consent_confirmed_at = cfg.consent_confirmed_at or utcnow()
+    cfg.connected_via, cfg.connected_by = "qr", ctx.user.id
+    wa.ensure_templates(db, ctx.gym.id)
+    audit(db, ctx.gym.id, ctx.user.id, "whatsapp.link", "gym", ctx.gym.id, "Started linking WhatsApp by QR code")
+    db.commit()
+    return _web_status(db, ctx, cfg, link)
+
+
+@router.get("/gyms/{gymId}/whatsapp/web/link", summary="Linking progress: fresh QR / pairing code, or connected")
+def web_link_status(pairing_phone: str | None = None, ctx: GymCtx = Depends(perm_ctx(MANAGE)), db: Session = Depends(get_db)):
+    cfg = wa.get_config(db, ctx.gym.id)
+    if not cfg or cfg.provider != "web" or not cfg.instance_name:
+        raise ApiError(409, "NOT_LINKING", "Start linking first.")
+    try:
+        state = wa.web_state(ctx.gym.id)
+    except wa.MetaError as e:
+        _meta_fail(e, "WHATSAPP_LINK_FAILED")
+    if state == "open":
+        if cfg.status != "connected":
+            prof = {}
+            try:
+                prof = wa.web_profile(ctx.gym.id)
+            except wa.MetaError:
+                pass
+            phone = prof.get("phone")
+            other = phone and db.scalar(select(GymWhatsApp).where(GymWhatsApp.display_phone == phone,
+                                                                  GymWhatsApp.gym_id != ctx.gym.id,
+                                                                  GymWhatsApp.status == "connected"))
+            if other:
+                wa.web_remove(ctx.gym.id)
+                cfg.instance_name, cfg.status = None, "disconnected"
+                db.commit()
+                raise ApiError(409, "NUMBER_IN_USE", "This WhatsApp number is already linked to another gym.")
+            cfg.status, cfg.last_error, cfg.connected_at, cfg.checked_at = "connected", None, utcnow(), utcnow()
+            cfg.display_phone, cfg.verified_name = phone, prof.get("name")
+            audit(db, ctx.gym.id, ctx.user.id, "whatsapp.connect", "gym", ctx.gym.id,
+                  f"Linked WhatsApp {phone or ''} by QR code")
+            db.commit()
+        return _web_status(db, ctx, cfg, {"state": "open"})
+    pairing = None
+    if pairing_phone:
+        digits = "".join(ch for ch in pairing_phone if ch.isdigit())[-10:]
+        pairing = "91" + digits if len(digits) == 10 else None
+    try:
+        link = wa.web_connect(ctx.gym.id, pairing)
+    except wa.MetaError as e:
+        _meta_fail(e, "WHATSAPP_LINK_FAILED")
+    return _web_status(db, ctx, cfg, link)
+
+
+@public.post("/webhooks/evolution", include_in_schema=False)
+async def evolution_webhook(request: Request):
+    raw = await request.body()
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        raise ApiError(400, "BAD_REQUEST", "Invalid JSON.")
+    inst = str(payload.get("instance") or "")
+    if not inst.startswith("dmbl-"):
+        raise ApiError(403, "FORBIDDEN", "Unknown instance.")
+    gym_id = inst[5:]
+    tok = request.headers.get("x-dumbbel-token") or ""
+    if not hmac.compare_digest(tok, wa.web_hook_secret(gym_id)):
+        raise ApiError(403, "BAD_SIGNATURE", "Token check failed.")
+    try:
+        res = await run_in_threadpool(wa.handle_evolution, payload, gym_id)
+        if res.get("statuses") or res.get("inbound") or res.get("state"):
+            log.info("evolution webhook: %s", res)
+    except Exception as e:
+        log.error("evolution webhook failed: %s", type(e).__name__)
+        raise ApiError(500, "WEBHOOK_FAILED", "Temporary error.")
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- templates
 class TemplateIn(BaseModel):
     body: str = Field(..., min_length=20, max_length=1000)
@@ -281,6 +431,9 @@ def edit_template(key: str, body: TemplateIn, ctx: GymCtx = Depends(perm_ctx(MAN
     if text != t.body:
         t.body, t.status, t.reject_reason = text, "draft", None
         t.version, t.meta_name, t.meta_id = t.version + 1, None, None
+        if (cfg := wa.get_config(db, ctx.gym.id)) and cfg.provider == "web":
+            db.commit()
+            return ser_tpl_for(cfg, t)
         audit(db, ctx.gym.id, ctx.user.id, "whatsapp.template", "gym", ctx.gym.id, f"Edited WhatsApp template “{wa.EVENTS[key]['label']}”")
     db.commit()
     return ser_tpl(t)
@@ -289,6 +442,8 @@ def edit_template(key: str, body: TemplateIn, ctx: GymCtx = Depends(perm_ctx(MAN
 @router.post("/gyms/{gymId}/whatsapp/templates/{key}/submit", summary="Send a template to WhatsApp for approval")
 def submit_template(key: str, ctx: GymCtx = Depends(perm_ctx(MANAGE)), db: Session = Depends(get_db)):
     cfg = _cfg_or_409(db, ctx.gym.id)
+    if cfg.provider == "web":
+        return ser_tpl_for(cfg, _tpl(db, ctx.gym.id, key))
     t = _tpl(db, ctx.gym.id, key)
     if t.status in ("pending", "approved"):
         return ser_tpl(t)
@@ -312,6 +467,8 @@ def submit_template(key: str, ctx: GymCtx = Depends(perm_ctx(MANAGE)), db: Sessi
 @router.post("/gyms/{gymId}/whatsapp/templates/submit-all", summary="Submit every draft template for approval")
 def submit_all(ctx: GymCtx = Depends(perm_ctx(MANAGE)), db: Session = Depends(get_db)):
     cfg = _cfg_or_409(db, ctx.gym.id)
+    if cfg.provider == "web":
+        return {"items": [ser_tpl_for(cfg, t) for t in wa.ensure_templates(db, ctx.gym.id)], "errors": {}}
     rate_limit(f"watpl:{ctx.gym.id}", 30, 3600)
     errors = {}
     for t in wa.ensure_templates(db, ctx.gym.id):
@@ -327,6 +484,8 @@ def submit_all(ctx: GymCtx = Depends(perm_ctx(MANAGE)), db: Session = Depends(ge
 @router.post("/gyms/{gymId}/whatsapp/templates/sync", summary="Refresh approval status from WhatsApp")
 def sync_templates(ctx: GymCtx = Depends(perm_ctx(VIEW)), db: Session = Depends(get_db)):
     cfg = _cfg_or_409(db, ctx.gym.id)
+    if cfg.provider == "web":
+        return {"items": [ser_tpl_for(cfg, t) for t in wa.ensure_templates(db, ctx.gym.id)]}
     rate_limit(f"watplsync:{ctx.gym.id}", 60, 3600)
     try:
         wa.sync_templates(db, cfg)
@@ -383,11 +542,12 @@ def reminders(view: Literal["expiring", "today", "month", "expired"] = "expiring
     cfg = wa.get_config(db, ctx.gym.id)
     tpl = db.scalar(select(WaTemplate).where(WaTemplate.gym_id == ctx.gym.id, WaTemplate.key == event))
     items = _eligible(db, ctx.gym, view, event)
-    blocked = None if wa.is_connected(cfg) and tpl and tpl.status == "approved" else (
+    blocked = None if wa.is_connected(cfg) and wa.template_ready(cfg, tpl) else (
         "not_connected" if not wa.is_connected(cfg) else "template_not_approved")
     return {"view": view, "event": event, "items": items, "sendable": sum(1 for i in items if i["can_send"]),
             "blocked": blocked, "blocked_label": wa.SKIP.get(blocked) if blocked else None,
-            "template_status": tpl.status if tpl else "draft"}
+            "template_status": ("ready" if cfg and cfg.provider == "web" else tpl.status) if tpl else "draft",
+            "provider": cfg.provider if cfg else None}
 
 
 class PreviewIn(BaseModel):
@@ -411,8 +571,13 @@ def preview(body: PreviewIn, ctx: GymCtx = Depends(perm_ctx(VIEW)), db: Session 
     elif body.announcement:
         v["announcement"] = body.announcement
     v["gym_name"], v["gym_phone"] = ctx.gym.name, wa.fmt_phone(ctx.gym.phone)
-    return {"event": body.event, "member_name": name, "status": t.status, "button_text": t.button_text,
-            "text": wa.render(t.body, v), "link": f"{settings.renew_url_base}/…" if t.button_text else None}
+    cfg = wa.get_config(db, ctx.gym.id)
+    text = wa.render(t.body, v)
+    if cfg and cfg.provider == "web" and t.button_text:  # linked numbers send the link inside the text
+        text += f"\n\n{t.button_text}: {settings.renew_url_base}/…"
+    return {"event": body.event, "member_name": name, "status": t.status, "provider": cfg.provider if cfg else None,
+            "button_text": None if (cfg and cfg.provider == "web") else t.button_text, "text": text,
+            "link": f"{settings.renew_url_base}/…" if t.button_text else None}
 
 
 class SendIn(BaseModel):
@@ -434,7 +599,7 @@ def send(body: SendIn, ctx: GymCtx = Depends(perm_ctx(SEND)), db: Session = Depe
         raise ApiError(423, "GYM_PENDING")
     rate_limit(f"wasend:{gym.id}", 30, 3600)
     tpl = _tpl(db, gym.id, body.event)
-    if tpl.status != "approved":
+    if not wa.template_ready(cfg, tpl):
         raise ApiError(409, "TEMPLATE_NOT_APPROVED", wa.SKIP["template_not_approved"] + ".", {"status": tpl.status})
     if body.event == "announcement":
         if not body.announcement:

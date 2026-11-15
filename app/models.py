@@ -587,6 +587,9 @@ class GymWhatsApp(Base):
     """One WhatsApp Business number per gym. The access token is stored encrypted (Fernet) and never returned."""
     __tablename__ = "gym_whatsapp"
     gym_id: Mapped[str] = mapped_column(String(36), ForeignKey("gyms.id"), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(8), default="cloud", server_default="cloud", nullable=False)  # cloud (Meta) | web (QR link via Evolution API)
+    instance_name: Mapped[str | None] = mapped_column(String(60), unique=True)  # Evolution instance (web provider)
+    next_send_at = mapped_column(TS, nullable=True)  # web provider: earliest time the linked number may send again
     waba_id: Mapped[str | None] = mapped_column(String(40), index=True)
     phone_number_id: Mapped[str | None] = mapped_column(String(40), unique=True)
     display_phone: Mapped[str | None] = mapped_column(String(32))

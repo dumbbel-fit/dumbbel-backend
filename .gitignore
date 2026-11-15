@@ -7,3 +7,4 @@ storage/
 firebase-service-account*.json
 *-service-account*.json
 .DS_Store
+deploy/evolution/.env

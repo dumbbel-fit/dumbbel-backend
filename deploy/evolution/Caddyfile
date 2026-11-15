@@ -1,0 +1,8 @@
+# HTTPS in front of Evolution API. Caddy gets and renews the certificate automatically.
+{$WA_DOMAIN} {
+	encode gzip
+	# Evolution's own web manager isn't needed — keep it closed to the internet.
+	@manager path /manager*
+	respond @manager 404
+	reverse_proxy evolution:8080
+}

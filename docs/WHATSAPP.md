@@ -1,15 +1,34 @@
 # WhatsApp integration — architecture, setup and operations
 
-## Why Meta's official Cloud API (and not the other three)
+Gyms can send reminders, renewal links and updates in two ways. Each gym picks one in Dashboard → WhatsApp.
 
-| Option | How it connects | Verdict |
+| | **Link by QR (default, free)** | **Official WhatsApp Business API** |
 |---|---|---|
-| whatsapp-web.js | Drives WhatsApp Web in a headless Chrome (Puppeteer) | **Rejected.** Its README: *"WhatsApp does not allow bots or unofficial clients … not guaranteed you will not be blocked."* A gym's real number can be banned. Needs a Chrome per number. |
-| Baileys | Reverse-engineered WhatsApp Web WebSocket protocol, QR pairing | **Rejected.** README: *"not affiliated … with WhatsApp"*, *"We discourage … bulk or automated messaging."* Reminders to hundreds of members are exactly that. |
-| Evolution API | Node.js gateway (Postgres/MySQL + optional Redis) wrapping Baileys **or** the official Cloud API | **Not needed.** In Cloud API mode it only adds a second service, database and auth layer in front of the same Meta API we call directly. |
-| **Meta WhatsApp Cloud API** | Official HTTPS API, approved templates, signed webhooks | **Chosen.** Allowed for commercial and automated messages, delivery/read receipts, no extra service to run. |
+| How | Gym scans a QR in WhatsApp → Linked devices (like WhatsApp Web) | Meta Business account, approved templates |
+| Built on | [Evolution API](https://github.com/EvolutionAPI/evolution-api) 2.3.7 → [Baileys](https://github.com/WhiskeySockets/Baileys) | Meta Cloud API, called directly |
+| Cost | Free (one small always-on server for the whole platform) | Meta charges per message |
+| Setup per gym | Scan a QR (or type an 8-character code) | WABA ID + phone number ID + system-user token |
+| Number | Any normal WhatsApp or WhatsApp Business app number | A number registered on the Business Platform |
+| Message approval | None, plain text | Every template is reviewed by Meta |
+| Risk | Unofficial: WhatsApp can restrict numbers that send automated messages | None |
 
-So the integration lives inside the existing Python backend. No Node.js service or extra database.
+**Why Evolution API and not whatsapp-web.js directly:** whatsapp-web.js runs a headless Chrome for every connected
+number, roughly 150–300 MB each. Baileys speaks the WhatsApp Web protocol over a WebSocket with no browser.
+Evolution API wraps Baileys with what we need: one instance per gym, QR and pairing codes, sessions stored in
+PostgreSQL so a restart doesn't unlink anyone, a REST API and webhooks. It's maintained, Apache-2.0 licensed, and
+runs as one container.
+
+**Keeping linked numbers safe.** The backend enforces these; they can't be turned off from the dashboard:
+* Messages go only to the gym's own members. Promotional messages need the owner's consent confirmation.
+* Every member can reply STOP (or use the link on the renewal page) and is skipped from then on.
+* Messages are sent one at a time per number, with a random **12–35 s** gap (`WA_WEB_MIN/MAX_GAP_SEC`). The gap is
+  stored in the database, so several workers can't burst one number.
+* At most **200 messages per number per day** (`WA_WEB_DAILY_LIMIT`); the rest wait until the next morning.
+* No automatic messages between **21:00 and 08:00** gym time (`WA_WEB_QUIET_START/END`). Manual sends still go out.
+* Each message is personal (name, plan, date, own link), so there are no identical bulk blasts.
+* Numbers that aren't on WhatsApp fail straight away with a clear reason instead of being retried.
+
+The owner confirms they understand the risk before linking.
 
 ## How it works
 
@@ -68,7 +87,42 @@ Member ──► https://dumbbel.fit/renew/<token> ──► /v1/renew/<token>�
 
 Members who already renewed are never reminded.
 
-## One-time platform setup (DUMBBEL.fit team)
+## Set up QR linking (Evolution API) — one server for all gyms
+
+A linked WhatsApp has to stay connected all the time, so Evolution runs on a small always-on VM, not Cloud Run. The
+Google Cloud **e2-micro** VM is in the always-free tier in us-central1, us-west1 and us-east1. Google may charge a
+little for its public IPv4 address, so check the billing page. Oracle Cloud's Always Free VMs are a fully free
+alternative; the same `setup-vm.sh` works there.
+
+```bash
+# 1) VM (Cloud Shell)
+gcloud config set project dumbbel-e448b
+gcloud compute instances create dumbbel-wa --zone us-central1-a --machine-type e2-micro \
+  --image-family debian-12 --image-project debian-cloud --boot-disk-size 30GB --boot-disk-type pd-standard \
+  --tags dumbbel-wa
+gcloud compute firewall-rules create dumbbel-wa-web --allow tcp:80,tcp:443 --target-tags dumbbel-wa
+gcloud compute instances describe dumbbel-wa --zone us-central1-a --format='get(networkInterfaces[0].accessConfigs[0].natIP)'
+
+# 2) DNS (Hostinger → DNS zone for dumbbel.fit): add an A record   wa  →  <the IP from step 1>
+
+# 3) Install Evolution API + PostgreSQL + HTTPS on the VM
+gcloud compute ssh dumbbel-wa --zone us-central1-a -- \
+  'curl -fsSL https://raw.githubusercontent.com/dumbbel-fit/dumbbel-backend/main/deploy/evolution/setup-vm.sh | sudo WA_DOMAIN=wa.dumbbel.fit bash'
+```
+
+The last command prints `EVOLUTION_API_URL` and `EVOLUTION_API_KEY`. Add both to the backend `env.yaml` and redeploy.
+The **QR link** option then appears for every gym.
+
+* Upgrade: `sudo docker compose -f /opt/dumbbel-wa/docker-compose.yml pull && sudo docker compose -f /opt/dumbbel-wa/docker-compose.yml up -d`
+  (change the image tag in `docker-compose.yml` first). Linked sessions survive restarts because they're stored
+  in PostgreSQL.
+* Logs: `sudo docker compose -f /opt/dumbbel-wa/docker-compose.yml logs -f evolution`
+* Back up `/opt/dumbbel-wa/.env` somewhere safe. A new API key means updating the backend; the sessions themselves
+  live in the `pgdata` volume.
+* Evolution's built-in web manager is blocked by Caddy, and every API call needs the key. Only the DUMBBEL backend
+  holds it.
+
+## One-time platform setup for the official API (optional)
 
 1. **Meta app:** at developers.facebook.com, create an app of type *Business* and add the **WhatsApp** product.
 2. **Webhook:** go to WhatsApp → Configuration → Webhook.
@@ -86,6 +140,17 @@ Members who already renewed are never reminded.
 ## Environment variables (add to `env.yaml`)
 
 ```yaml
+# QR linking (Evolution API)
+EVOLUTION_API_URL: "https://wa.dumbbel.fit"
+EVOLUTION_API_KEY: "…"            # printed by setup-vm.sh
+# optional tuning (defaults shown)
+# WA_WEB_DAILY_LIMIT: "200"
+# WA_WEB_MIN_GAP_SEC: "12"
+# WA_WEB_MAX_GAP_SEC: "35"
+# WA_WEB_QUIET_START: "21"
+# WA_WEB_QUIET_END: "8"
+
+# Official API (only if you also offer it)
 META_APP_SECRET: "…"              # required for webhooks
 META_WEBHOOK_VERIFY_TOKEN: "…"    # random string, same as in the Meta webhook form
 WHATSAPP_ENC_KEY: "…"             # python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"
@@ -136,6 +201,13 @@ The new tables stay and older code ignores them. To stop all sending immediately
 from each gym's dashboard, or run `UPDATE gym_whatsapp SET status='disconnected'`.
 
 ## Tests
+
+`tests/whatsapp_web_e2e.py` tests QR linking against a **mock** Evolution server. It covers linking by QR and by
+pairing code, re-linking, webhook token checks, sending with spacing, the personal link in the text, delivered/read
+receipts with no downgrade, STOP replies, group messages ignored, "not on WhatsApp" failures, unlinking from the phone
+and relinking, quiet hours, the daily cap, and disconnecting. The QR flow was also checked against a **real**
+Evolution API 2.3.7 running locally: it returned a real WhatsApp QR, and Evolution's webhook calls reached the
+backend and passed the token check. Actually scanning with a phone and sending a real message hasn't been done.
 
 `tests/whatsapp_e2e.py` runs the whole flow against a **mock** Graph API (no real messages). It covers connect
 (bad token, number already used by another gym, encryption at rest), template validation and submission, bulk send
