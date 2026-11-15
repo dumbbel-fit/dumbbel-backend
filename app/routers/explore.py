@@ -9,6 +9,8 @@ Gym:      GET  /gyms/{gymId}/visits        requests & upcoming visits (members.v
           PATCH /gyms/{gymId}/visits/{id}  confirm · decline · visited · no-show (members.edit) → member gets a push
           POST /gyms/{gymId}/visits/{id}/convert   add the visitor as a member (members.edit)
 """
+import hashlib
+import logging
 import math
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -21,14 +23,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from app.db import get_db
+from app.db import get_db, session_scope
 from app.deps import GymCtx, bearer, current_user, get_auth, perm_ctx
 from app.errors import ApiError, validation
-from app.models import Gym, GymMember, GymPhoto, GymStaff, GymVisit, Plan, User
+from app.models import ExploreEvent, Gym, GymMember, GymPhoto, GymStaff, GymVisit, Plan, User
 from app.permissions import effective_permissions
 from app.responses import DocRoute, ERRORS
 from app.services.audit import audit
-from app.services.cache import rate_limit
+from app.services.cache import cache, rate_limit
 from app.services.core import gym_settings, next_member_code
 from app.services.jobs import enqueue
 from app.services.push import send_push
@@ -168,6 +170,48 @@ def optional_user(request: Request, creds: HTTPAuthorizationCredentials | None =
         return None
 
 
+# ---------------- demand log (console demand map) ----------------
+log = logging.getLogger("dumbbel.explore")
+
+
+def _who(request: Request, user: User | None) -> str:
+    """Throttle key only — never stored. Signed-in user, else a short hash of the caller's address."""
+    if user:
+        return user.id
+    ip = (request.headers.get("x-forwarded-for") or (request.client.host if request.client else "")).split(",")[0].strip()
+    return hashlib.sha256(ip.encode()).hexdigest()[:16]
+
+
+def _save_event(kind: str, user_id: str | None, gym_id: str | None, lat, lng, q, city, results, find_nearest: bool):
+    with session_scope() as db:
+        nearest = None
+        if find_nearest and lat is not None and lng is not None:
+            pts = [(float(a), float(b)) for a, b, st in db.execute(
+                select(Gym.lat, Gym.lng, Gym.status).where(Gym.status == "active", Gym.lat.is_not(None), Gym.lng.is_not(None)))]
+            if pts:
+                nearest = round(min(haversine_km(lat, lng, a, b) for a, b in pts), 1)
+        db.add(ExploreEvent(kind=kind, user_id=user_id, gym_id=gym_id,
+                            lat=round(lat, 2) if lat is not None else None, lng=round(lng, 2) if lng is not None else None,
+                            q=(q or "").strip()[:80] or None, city=(city or "").strip()[:80] or None, results=results,
+                            nearest_km=min(nearest, 9999.9) if nearest is not None else None))
+
+
+def log_event(request: Request, user: User | None, kind: str, *, gym_id=None, lat=None, lng=None, q=None, city=None,
+              results=None, every_sec=600):
+    """Best-effort and off the request path. One event per person per place/term in `every_sec`, so panning the
+    map or re-opening a page doesn't inflate demand."""
+    try:
+        if kind == "search" and lat is None and not (q or "").strip() and not (city or "").strip():
+            return  # browsing the full list says nothing about where demand is
+        cell = f"{round(lat, 2)},{round(lng, 2)}" if lat is not None and lng is not None else "-"
+        key = f"exev:{kind}:{_who(request, user)}:{gym_id or ''}:{cell}:{(q or '').strip().lower()}:{(city or '').strip().lower()}"
+        if not cache.set(key, "1", ex=every_sec, nx=True):
+            return
+        enqueue("explore.event", _save_event, kind, user.id if user else None, gym_id, lat, lng, q, city, results, kind == "search")
+    except Exception as e:  # never let analytics break Explore
+        log.warning("explore event not logged: %s", e)
+
+
 # ---------------- discover ----------------
 @public.get("/discover/gyms", summary="Gyms near you (map pins + listing cards)",
             description="Pass `lat`/`lng` for gyms within `radius_km`, nearest first (or `sort=price`). Without a "
@@ -177,7 +221,8 @@ def optional_user(request: Request, creds: HTTPAuthorizationCredentials | None =
 def discover(lat: float | None = Query(None, ge=-90, le=90), lng: float | None = Query(None, ge=-180, le=180),
              radius_km: float = Query(15, ge=0.5, le=200), q: str | None = Query(None, max_length=80),
              city: str | None = Query(None, max_length=80), sort: Literal["distance", "price"] = "distance",
-             limit: int = Query(60, ge=1, le=200), db: Session = Depends(get_db)):
+             limit: int = Query(60, ge=1, le=200), request: Request = None, user: User | None = Depends(optional_user),
+             db: Session = Depends(get_db)):
     conds = [Gym.status == "active"]
     has_loc = lat is not None and lng is not None
     if has_loc:
@@ -207,16 +252,18 @@ def discover(lat: float | None = Query(None, ge=-90, le=90), lng: float | None =
     else:
         items.sort(key=lambda x: (x["photos"] == [], x["name"].lower()))
     cities = sorted({g.city for g in gyms if g.city})
+    log_event(request, user, "search", lat=lat if has_loc else None, lng=lng if has_loc else None, q=q, city=city, results=len(items))
     return {"items": items[:limit], "total": len(items), "center": {"lat": lat, "lng": lng} if has_loc else None,
             "radius_km": radius_km if has_loc else None, "cities": cities}
 
 
 @public.get("/discover/gyms/{gymId}", summary="Gym listing: photos, plans & prices, hours, amenities, crowd")
 def discover_gym(gymId: str, lat: float | None = Query(None, ge=-90, le=90), lng: float | None = Query(None, ge=-180, le=180),
-                 user: User | None = Depends(optional_user), db: Session = Depends(get_db)):
+                 request: Request = None, user: User | None = Depends(optional_user), db: Session = Depends(get_db)):
     g = db.get(Gym, gymId)
     if not g or not listed(g):
         raise ApiError(404, "NOT_FOUND", "This gym isn’t listed right now.")
+    log_event(request, user, "view", gym_id=g.id, lat=lat, lng=lng, every_sec=1800)
     s = gym_settings(g)
     plans = _plans_by_gym(db, [g.id]).get(g.id, [])
     photos = _photos_by_gym(db, [g.id], None).get(g.id, [])

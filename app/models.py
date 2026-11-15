@@ -678,3 +678,34 @@ class RenewalToken(Base):
     result_membership_id: Mapped[str | None] = mapped_column(String(36))
     revoked_at = mapped_column(TS, nullable=True)
     created_at = created()
+
+
+class ExploreEvent(Base):
+    """What people look for in DUMBBEL Explore (search / gym page view). Feeds the console demand map.
+    Location is rounded to ~1 km before it is stored; no IP address or device is kept."""
+    __tablename__ = "explore_events"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String(8), nullable=False)  # search | view
+    user_id: Mapped[str | None] = mapped_column(String(36))
+    gym_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    lat = mapped_column(Numeric(6, 2), nullable=True)
+    lng = mapped_column(Numeric(6, 2), nullable=True)
+    q: Mapped[str | None] = mapped_column(String(80))
+    city: Mapped[str | None] = mapped_column(String(80))
+    results: Mapped[int | None] = mapped_column(Integer)  # search: gyms returned
+    nearest_km = mapped_column(Numeric(6, 1), nullable=True)  # search: distance to the closest listed gym
+    created_at = created()
+    __table_args__ = (Index("ix_explore_ev_kind_at", "kind", "created_at"),)
+
+
+class ExecFollowup(Base):
+    """Console call-list log: the team called / messaged a gym, snoozed an alert, or left a note."""
+    __tablename__ = "exec_followups"
+    id: Mapped[str] = pk()
+    gym_id: Mapped[str] = fk("gyms.id", index=True)
+    reason: Mapped[str | None] = mapped_column(String(40))  # the alert it answers; NULL = the whole gym
+    action: Mapped[str] = mapped_column(String(12), nullable=False)  # called | messaged | snoozed | note
+    note: Mapped[str | None] = mapped_column(String(500))
+    snooze_until = mapped_column(Date, nullable=True)
+    by_user_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    created_at = created()
