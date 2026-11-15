@@ -32,7 +32,7 @@ from app.services.cache import rate_limit
 from app.services.core import gym_settings, next_member_code
 from app.services.jobs import enqueue
 from app.services.push import send_push
-from app.services.storage import public_url
+from app.services.storage import existing_keys, public_url
 from app.utils import iso, today_in, tz, utcnow
 
 public = APIRouter(tags=["Explore (find gyms & book visits)"], route_class=DocRoute, responses=ERRORS)
@@ -119,9 +119,11 @@ def listed(g: Gym) -> bool:
 
 def _photos_by_gym(db: Session, ids: list[str], per_gym: int | None = 6) -> dict[str, list[str]]:
     out: dict[str, list[str]] = defaultdict(list)
-    for p in db.scalars(select(GymPhoto).where(GymPhoto.gym_id.in_(ids or [""]))
-                        .order_by(GymPhoto.gym_id, GymPhoto.sort_order, GymPhoto.created_at)):
-        if per_gym is None or len(out[p.gym_id]) < per_gym:
+    rows = db.scalars(select(GymPhoto).where(GymPhoto.gym_id.in_(ids or [""]))
+                      .order_by(GymPhoto.gym_id, GymPhoto.sort_order, GymPhoto.created_at)).all()
+    ok = existing_keys([p.file_key for p in rows])  # skip photos whose file was lost (old ephemeral disk)
+    for p in rows:
+        if p.file_key in ok and (per_gym is None or len(out[p.gym_id]) < per_gym):
             out[p.gym_id].append(public_url(p.file_key))
     return out
 

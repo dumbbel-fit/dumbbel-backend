@@ -10,7 +10,7 @@ from datetime import timezone
 
 from sqlalchemy import (JSON, BigInteger, Boolean, Computed, Date, Enum, ForeignKey, Index, Integer, Numeric,
                         SmallInteger, String, Text, UniqueConstraint, func)
-from sqlalchemy.dialects.mysql import DATETIME
+from sqlalchemy.dialects.mysql import DATETIME, LONGBLOB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
@@ -566,3 +566,14 @@ class GymVisit(Base):
     created_at = created()
     updated_at = updated()
     __table_args__ = (Index("ix_visit_gym_status_date", "gym_id", "status", "visit_date"),)
+
+
+class StoredFile(Base):
+    """Uploaded files (photos, logos, documents, import sheets) kept in the database when no S3/R2/GCS bucket is
+    configured — Cloud Run's disk is wiped on every restart/deploy, the database isn't."""
+    __tablename__ = "stored_files"
+    key: Mapped[str] = mapped_column(String(300), primary_key=True)
+    content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    data = mapped_column(LONGBLOB, nullable=False)
+    created_at = created()

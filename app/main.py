@@ -119,8 +119,12 @@ VERSION_EXEMPT = ("/v1/config", "/v1/health", "/docs", "/redoc", "/openapi.json"
 async def request_context(request: Request, call_next):
     rid = request.headers.get("x-request-id") or uuid.uuid4().hex
     request.state.request_id = rid
-    from app.context import request_id_var
+    from app.context import request_base_var, request_id_var
     request_id_var.set(rid)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if host:
+        proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "https").split(",")[0].strip()
+        request_base_var.set(f"{proto}://{host.split(',')[0].strip()}")
     start = time.perf_counter()
     path = request.url.path
     x_app = (request.headers.get("x-app") or "").lower()

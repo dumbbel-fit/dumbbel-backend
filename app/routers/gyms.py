@@ -161,8 +161,10 @@ MAX_PHOTOS = 12
 
 
 def _photos(db: Session, gym_id: str) -> list[dict]:
-    return [{"id": x.id, "url": storage.public_url(x.file_key), "sort_order": x.sort_order, "created_at": iso(x.created_at)}
-            for x in db.scalars(select(GymPhoto).where(GymPhoto.gym_id == gym_id).order_by(GymPhoto.sort_order, GymPhoto.created_at))]
+    rows = db.scalars(select(GymPhoto).where(GymPhoto.gym_id == gym_id).order_by(GymPhoto.sort_order, GymPhoto.created_at)).all()
+    ok = storage.existing_keys([x.file_key for x in rows])
+    return [{"id": x.id, "url": storage.public_url(x.file_key), "sort_order": x.sort_order, "created_at": iso(x.created_at),
+             "missing": x.file_key not in ok} for x in rows]
 
 
 class PhotoIn(BaseModel):

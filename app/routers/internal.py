@@ -175,9 +175,9 @@ def remove_admin(userId: str, admin: User = Depends(platform_admin), db: Session
 
 
 # ---------------- uploads ----------------
-LIMITS = {"member_photo": ({"image/jpeg", "image/png", "image/webp"}, 5 * 1024 * 1024),
-          "gym_logo": ({"image/jpeg", "image/png", "image/webp"}, 5 * 1024 * 1024),
-          "gym_photo": ({"image/jpeg", "image/png", "image/webp"}, 8 * 1024 * 1024),
+LIMITS = {"member_photo": ({"image/jpeg", "image/png", "image/webp"}, 10 * 1024 * 1024),
+          "gym_logo": ({"image/jpeg", "image/png", "image/webp"}, 10 * 1024 * 1024),
+          "gym_photo": ({"image/jpeg", "image/png", "image/webp"}, 10 * 1024 * 1024),
           "gym_document": ({"application/pdf", "image/jpeg", "image/png"}, 5 * 1024 * 1024),
           "import_file": ({"text/csv", "application/vnd.ms-excel", "application/csv", "text/plain",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}, 10 * 1024 * 1024)}
@@ -188,7 +188,7 @@ EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "applicati
 
 @uploads.post("/uploads/presign", response_model=PresignOut, summary="Get a presigned upload URL",
               description="PUT the file bytes to `upload_url` with the same Content-Type, then pass `file_key` to the API. "
-                          "Limits: images 5 MB (jpg/png/webp) · documents 5 MB (pdf/jpg/png) · import 10 MB (csv/xls/xlsx).")
+                          "Limits: images 10 MB (jpg/png/webp) · documents 5 MB (pdf/jpg/png) · import 10 MB (csv/xls/xlsx).")
 def presign(body: PresignIn, user: User = Depends(current_user)):
     types, max_size = LIMITS[body.purpose]
     if body.content_type not in types:
@@ -209,7 +209,8 @@ async def local_put(key: str, exp: int, sig: str, request: Request):
     data = await request.body()
     if len(data) > max_size:
         raise ApiError(413, "FILE_TOO_LARGE")
-    storage.put_bytes(key, data)
+    from starlette.concurrency import run_in_threadpool
+    await run_in_threadpool(storage.put_bytes, key, data, request.headers.get("content-type") or "application/octet-stream")
     return Response(status_code=204)
 
 
@@ -224,7 +225,8 @@ def local_get(key: str, exp: int, sig: str):
     ext = key.rsplit(".", 1)[-1].lower()
     mt = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp", "pdf": "application/pdf",
           "csv": "text/csv"}.get(ext, "application/octet-stream")
-    return Response(data, media_type=mt, headers={"Cache-Control": "private, max-age=300"})
+    cache = "private, max-age=86400" if key.startswith(("member_photo/", "gym_logo/", "gym_photo/")) else "private, max-age=300"
+    return Response(data, media_type=mt, headers={"Cache-Control": cache})
 
 
 _ = time
