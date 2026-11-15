@@ -146,13 +146,14 @@ def _facilities(g: Gym, plans: list[Plan]) -> list[str]:
     return out
 
 
-def card(g: Gym, photos: list[str], plans: list[Plan], dist: float | None) -> dict:
+def card(g: Gym, photos: list[str], plans: list[Plan], dist: float | None, logos_ok: set | None = None) -> dict:
     s = gym_settings(g)
+    ok = logos_ok if logos_ok is not None else existing_keys([g.logo_url] if g.logo_url else [])
+    logo = public_url(g.logo_url) if g.logo_url and g.logo_url in ok else None  # never point at a lost file
     return {"id": g.id, "name": g.name, "area": g.area, "city": g.city, "address_line": g.address_line,
             "lat": float(g.lat) if g.lat is not None else None, "lng": float(g.lng) if g.lng is not None else None,
             "distance_km": round(dist, 2) if dist is not None else None,
-            "cover_url": photos[0] if photos else public_url(g.logo_url), "photos": photos,
-            "logo_url": public_url(g.logo_url), "price_from": price_from(plans), "plans_count": len(plans),
+            "cover_url": photos[0] if photos else logo, "photos": photos, "logo_url": logo, "price_from": price_from(plans), "plans_count": len(plans),
             "facilities": _facilities(g, plans)[:8], "hours": open_now(g),
             "visits_enabled": s.get("visits_enabled", True) is not False}
 
@@ -197,7 +198,8 @@ def discover(lat: float | None = Query(None, ge=-90, le=90), lng: float | None =
         rows.append((g, dist))
     ids = [g.id for g, _ in rows]
     photos, plans = _photos_by_gym(db, ids, 5), _plans_by_gym(db, ids)
-    items = [card(g, photos.get(g.id, []), plans.get(g.id, []), d) for g, d in rows]
+    logos_ok = existing_keys([g.logo_url for g, _ in rows if g.logo_url])
+    items = [card(g, photos.get(g.id, []), plans.get(g.id, []), d, logos_ok) for g, d in rows]
     if sort == "price":
         items.sort(key=lambda x: (x["price_from"] or {}).get("per_month_paise", 10 ** 12))
     elif has_loc:

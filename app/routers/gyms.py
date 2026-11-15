@@ -101,6 +101,8 @@ def verification(ctx: GymCtx = Depends(perm_ctx("settings.manage")), db: Session
     review_state = {"pending": "in_progress" if docs else "waiting", "active": "done",
                     "rejected": "rejected", "suspended": "suspended"}[g.status]
     photos = db.scalars(select(GymPhoto).where(GymPhoto.gym_id == g.id).order_by(GymPhoto.created_at)).all()
+    ok = storage.existing_keys([p.file_key for p in photos])
+    photos = [p for p in photos if p.file_key in ok]  # a photo whose file was lost doesn't count
     return {"status": g.status, "photos": len(photos), "photos_required": MIN_PHOTOS,
             "ready_for_review": len(photos) >= MIN_PHOTOS and bool(docs),
             "steps": [{"key": "account", "done_at": iso(g.created_at)},
@@ -200,8 +202,10 @@ def delete_photo(photoId: str, ctx: GymCtx = Depends(perm_ctx("settings.manage")
     ph = db.get(GymPhoto, photoId)
     if not ph or ph.gym_id != ctx.gym.id:
         raise ApiError(404, "NOT_FOUND", "That photo wasn’t found.")
-    n = db.scalar(select(func.count()).select_from(GymPhoto).where(GymPhoto.gym_id == ctx.gym.id)) or 0
-    if ctx.gym.status == "active" and n <= MIN_PHOTOS:
+    keys = db.scalars(select(GymPhoto.file_key).where(GymPhoto.gym_id == ctx.gym.id)).all()
+    real = storage.existing_keys(keys)
+    n = sum(1 for k in keys if k in real)
+    if ph.file_key in real and ctx.gym.status == "active" and n <= MIN_PHOTOS:  # lost photos can always be removed
         raise ApiError(409, "MIN_PHOTOS", f"An approved gym needs at least {MIN_PHOTOS} photos. Add another before removing this one.")
     db.delete(ph)
     audit(db, ctx.gym.id, ctx.user.id, "gym.photo_remove", "gym", ctx.gym.id, "Removed a gym photo")

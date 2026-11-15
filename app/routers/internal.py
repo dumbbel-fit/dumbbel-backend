@@ -36,8 +36,10 @@ def _gym_out(db: Session, g: Gym, docs: bool = False) -> dict:
                         GymStaff.gym_id == g.id, GymStaff.status != "deactivated"))}}
     if docs:
         from app.models import GymPhoto
-        d["photos"] = [{"id": p.id, "url": storage.public_url(p.file_key)} for p in db.scalars(
-            select(GymPhoto).where(GymPhoto.gym_id == g.id).order_by(GymPhoto.sort_order, GymPhoto.created_at))]
+        rows = db.scalars(select(GymPhoto).where(GymPhoto.gym_id == g.id).order_by(GymPhoto.sort_order, GymPhoto.created_at)).all()
+        ok = storage.existing_keys([p.file_key for p in rows])
+        d["photos"] = [{"id": p.id, "url": storage.public_url(p.file_key)} for p in rows if p.file_key in ok]
+        d["photos_missing"] = sum(1 for p in rows if p.file_key not in ok)
         d["photos_required"] = MIN_GYM_PHOTOS
         d["documents"] = [{"id": x.id, "type": x.type, "status": x.status, "review_note": x.review_note,
                            "url": storage.signed_get_url(x.file_key, 300), "created_at": iso(x.created_at)}
@@ -92,7 +94,9 @@ def _transition(action: str):
         reason = body.reason if body else None
         if action == "approve":
             from app.models import GymPhoto
-            n_photos = db.scalar(select(func.count()).select_from(GymPhoto).where(GymPhoto.gym_id == g.id)) or 0
+            keys = db.scalars(select(GymPhoto.file_key).where(GymPhoto.gym_id == g.id)).all()
+            real = storage.existing_keys(keys)
+            n_photos = sum(1 for k in keys if k in real)
             if n_photos < MIN_GYM_PHOTOS:
                 raise ApiError(409, "PHOTOS_REQUIRED", f"This gym has {n_photos} photo{'s' if n_photos != 1 else ''}. "
                                f"At least {MIN_GYM_PHOTOS} are needed before approval.", {"photos": n_photos, "required": MIN_GYM_PHOTOS})
