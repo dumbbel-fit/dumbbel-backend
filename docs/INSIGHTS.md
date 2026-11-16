@@ -13,6 +13,8 @@ pass `refresh=true` to recompute.
 | Benchmarks | `GET /benchmarks` | How does each gym compare with the platform and its city? |
 | Impact | `GET /impact?range=` | What did WhatsApp reminders and Explore earn gyms? |
 | Demand map | `GET /demand?range=` | Where do people look for a gym, and where do we have none? |
+| Revenue ideas | `GET /revenue` | Who are the gyms and members, and what could DUMBBEL.fit charge for? |
+| Capacity | `GET /capacity` | How many members and gyms can the current setup carry? |
 | Overview strip | `GET /headline` | Three numbers for the top of the overview page. |
 
 ## How the numbers are worked out
@@ -47,6 +49,22 @@ an import only contains the members who survived.
 once each. The "link" numbers are the subset completed through the personal renewal link. Explore:
 payments from people who booked a visit and were then added as a member.
 
+**Capacity.** `app/services/metrics.py` counts every request in memory: one bucket per minute for 24 hours,
+requests in flight, response times, and totals per route template (never the real path, user or IP). It
+starts empty on each deploy and describes one server. The ceiling is
+`min(worker threads, database connections, Cloud Run concurrency) × servers ÷ average response time`,
+and the safe load is 60% of it. Until 50 requests have been seen, 200 ms is assumed and the response says
+`basis: assumed`. Members served = `safe requests per hour ÷ requests per visit ÷ share of members in the
+busiest hour`; the share is measured from check-ins, requests per visit (15) is a guess the page lets you
+change. Cloud Run does not tell the container its limits, so set `RUN_MAX_INSTANCES` and `RUN_CONCURRENCY`
+to match the deploy flags (defaults 1 and 80). `DB_STORAGE_LIMIT_MB` is optional. This is arithmetic, not a
+load test. Not cached.
+
+**Revenue ideas.** Each idea is `measured number × price or rate × take-up`. The measured numbers (gyms by
+size, UPI money, visits booked, lapsed value, app users) come from the tables; every price and take-up is
+a default guess that the page lets you change and keeps in the browser. DUMBBEL.fit has no billing, so
+`platform_income_paise` is always 0.
+
 ## Demand log and privacy
 
 `explore_events` is written from `GET /v1/discover/gyms` (search) and `GET /v1/discover/gyms/{id}`
@@ -65,7 +83,7 @@ Created automatically at startup by `app/migrate.py`: `explore_events`, `exec_fo
 ```bash
 DATABASE_URL=...dumbbel_test AUTH_PROVIDER=2factor OTP_DEV_CODE=123456 APP_ENV=dev \
   uvicorn app.main:app --port 8000 &
-DATABASE_URL=...dumbbel_test python tests/insights_e2e.py   # 103 checks
+DATABASE_URL=...dumbbel_test python tests/insights_e2e.py   # 127 checks
 ```
 
 The suite refuses to run unless the database name contains `test`.

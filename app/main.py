@@ -13,6 +13,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.config import settings
 from app.errors import (DEFAULT_MESSAGES, ApiError, api_error_handler, http_error_handler, unhandled_handler,
                         validation_handler)
+from app.services import metrics
 from app.utils import mask_phones_in_text, version_tuple
 
 
@@ -127,6 +128,9 @@ async def request_context(request: Request, call_next):
         request_base_var.set(f"{proto}://{host.split(',')[0].strip()}")
     start = time.perf_counter()
     path = request.url.path
+    metered = request.method != "OPTIONS"
+    if metered:
+        metrics.begin()
     x_app = (request.headers.get("x-app") or "").lower()
     ver = request.headers.get("x-app-version")
     mins = {"admin": settings.min_admin_version, "member": settings.min_member_version}
@@ -142,16 +146,19 @@ async def request_context(request: Request, call_next):
         except Exception as e:  # pragma: no cover
             resp = await unhandled_handler(request, e)
     resp.headers["X-Request-Id"] = rid
+    if metered:  # route template ("/v1/gyms/{gymId}"), never the real path, so no ids are kept
+        tpl = getattr(request.scope.get("route"), "path", None) or "(unmatched)"
+        metrics.end(f"{request.method} {tpl}", resp.status_code, (time.perf_counter() - start) * 1000)
     log.info("%s %s %s %.0fms app=%s rid=%s", request.method, path, resp.status_code,
              (time.perf_counter() - start) * 1000, x_app or "-", rid)
     return resp
 
 
-from app.routers import auth, checkins, engage, exec as exec_console, explore, gyms, imports, insights, internal, me, member_app, members, payments, staff, upi, whatsapp  # noqa: E402
+from app.routers import auth, checkins, engage, exec as exec_console, explore, growth, gyms, imports, insights, internal, me, member_app, members, payments, staff, upi, whatsapp  # noqa: E402
 
 P = settings.api_prefix
 for r in (auth.router, me.public, me.router, member_app.router, gyms.router, members.router, payments.router,
-          checkins.router, checkins.me_router, engage.me, engage.gym, imports.public, imports.router, staff.router, upi.router, upi.me_router, internal.router, exec_console.router, insights.router,
+          checkins.router, checkins.me_router, engage.me, engage.gym, imports.public, imports.router, staff.router, upi.router, upi.me_router, internal.router, exec_console.router, insights.router, growth.router,
           internal.uploads, explore.public, explore.me, explore.gym, whatsapp.router, whatsapp.public):
     app.include_router(r, prefix=P)
 

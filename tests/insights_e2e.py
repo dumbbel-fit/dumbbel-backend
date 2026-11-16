@@ -105,7 +105,7 @@ A = H(TA)
 R = {"refresh": "true"}
 
 print("\n== access")
-for path in ["actions", "forecast", "cohorts", "adoption", "benchmarks", "impact", "demand", "headline", f"forecast/{GA}", f"followups?gym_id={GA}"]:
+for path in ["actions", "forecast", "cohorts", "adoption", "benchmarks", "impact", "demand", "headline", "capacity", "revenue", f"forecast/{GA}", f"followups?gym_id={GA}"]:
     chk(f"non-admin refused: {path}", c.get(f"{I}/{path}", headers=H(TB)), 403)
 chk("no token refused", c.get(f"{I}/actions"), 401)
 chk("non-admin can't log a follow-up", c.post(f"{I}/followups", headers=H(TB), json={"gym_id": GA, "action": "called"}), 403)
@@ -234,6 +234,38 @@ expect("7d: the old reminder is outside the window", (find(im7["whatsapp"]["gyms
 print("\n== headline")
 hd = chk("headline", c.get(f"{I}/headline", headers=A))
 expect("headline matches the forecast", (hd["due_paise"], hd["expected_paise"]), (t["due_paise"], t["expected_paise"]))
+print("\n== capacity")
+cp = chk("capacity", c.get(f"{I}/capacity", headers=A))
+expect("capacity: 8 layers, each with a status", (len(cp["layers"]), all(x["status"] in ("ok", "watch", "limit") for x in cp["layers"])), (8, True))
+expect("capacity: the meter counted this run", cp["traffic"]["requests_total"] > 20 and cp["traffic"]["sampled"] > 20, True)
+expect("capacity: 24 hourly points", len(cp["traffic"]["hours"]), 24)
+expect("capacity: routes are templates, never real ids", any(GA in x["route"] for x in cp["traffic"]["routes"]), False)
+ce = cp["ceiling"]
+expect("capacity: slots = smallest of threads, pool, concurrency", ce["slots"], min(cp["setup"]["threads"], cp["setup"]["db_pool"], cp["setup"]["concurrency"]) * cp["setup"]["instances"])
+expect("capacity: ceiling arithmetic", ce["ceiling_per_min"], round(ce["slots"] / (ce["avg_ms"] / 1000) * 60))
+expect("capacity: safe load is 60% of the ceiling", ce["safe_per_min"], round(ce["ceiling_per_min"] * 0.6))
+expect("capacity: counts the live gyms", cp["people"]["gyms"], sql("SELECT COUNT(*) FROM gyms WHERE status='active'").scalar())
+expect("capacity: database size and tables read", cp["database"]["size_mb"] > 0 and len(cp["database"]["tables"]) > 0, True)
+expect("capacity: always ends with a load-test step", cp["next_steps"][-1]["when"], "Before a big launch")
+chk("capacity needs sign-in", c.get(f"{I}/capacity"), 401)
+
+print("\n== revenue ideas")
+rv = chk("revenue", c.get(f"{I}/revenue", headers=A, params=R))
+expect("revenue: bands cover every live gym", sum(b["gyms"] for b in rv["bands"]), rv["today"]["gyms"])
+expect("revenue: bands add up to the members and money", (sum(b["members"] for b in rv["bands"]), sum(b["collected_paise"] for b in rv["bands"])),
+       (rv["today"]["active_members"], rv["today"]["collected_30d_paise"]))
+expect("revenue: collected matches the payments table", rv["today"]["collected_30d_paise"], int(sql(
+    "SELECT COALESCE(SUM(p.amount_paise),0) FROM payments p JOIN gyms g ON g.id=p.gym_id AND g.status='active' "
+    "WHERE p.status='recorded' AND p.source<>'import' AND p.paid_at >= :s",
+    s=__import__("app.routers.insights", fromlist=["x"]).utc_start(__import__("app.routers.insights", fromlist=["x"]).today_ist() - __import__("datetime").timedelta(days=30))).scalar()))
+expect("revenue: 8 ideas, each with rows and a take-up", (len(rv["ideas"]), all(i["rows"] and 0 < i["take_pct"] <= 100 for i in rv["ideas"])), (8, True))
+sub = next(i for i in rv["ideas"] if i["key"] == "subscription")
+expect("revenue: plan idea counts gyms with members", sum(r["base"] for r in sub["rows"]), rv["today"]["gyms"] - rv["bands"][0]["gyms"])
+expect("revenue: 24 hours, shares of terms add up", (len(rv["hours"]), sum(t["sold"] for t in rv["terms"])), (24, rv["terms_sold"]))
+expect("revenue: no platform income is claimed", rv["today"]["platform_income_paise"], 0)
+expect("revenue: gender counts cover the active members", sum(rv["gender"].values()) <= rv["today"]["active_members"], True)
+chk("revenue needs sign-in", c.get(f"{I}/revenue"), 401)
+
 sql("UPDATE users SET is_platform_admin=0 WHERE id=:u", u=sa["user"]["id"])
 print("\nFAILS:", fails)
 sys.exit(1 if fails else 0)

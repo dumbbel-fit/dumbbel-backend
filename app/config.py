@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     # Redis (optional). Without it an in-process cache is used (fine for a single worker / dev).
     redis_url: str | None = None
 
+    # What the service was deployed with (Cloud Run does not tell the container). Only used by the console's
+    # Capacity screen; keep in step with the `gcloud run deploy` flags.
+    run_max_instances: int = 1
+    run_concurrency: int = 80
+    db_storage_limit_mb: int | None = None  # storage included in the database plan, if you want a "% used"
+
     # Auth
     jwt_secret: str = "change-me-jwt-secret"
     access_token_ttl_sec: int = 900
