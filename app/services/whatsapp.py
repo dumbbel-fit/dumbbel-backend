@@ -207,9 +207,47 @@ def _public_base() -> str:
     return _base()
 
 
+# The number a gym is linking with a pairing code, kept for the whole attempt so a session that times out and
+# restarts asks for a code again instead of silently falling back to QR. One server (max-instances 1).
+_PAIRING: dict[str, str] = {}
+LINK_WAIT_SEC = 8   # how long the first response waits for the QR / code to be ready
+
+
+def pairing_for(gym_id: str) -> str | None:
+    return _PAIRING.get(gym_id)
+
+
+def _wait_for_code(gym_id: str, want_code: bool, first: dict) -> dict:
+    """Evolution makes the QR (and the pairing code) a few seconds after the session starts. Ask again for a
+    few seconds so the first answer already has it. While connecting, /instance/connect only reads the current
+    QR: it doesn't restart anything or request a new code."""
+    out, end = first, time.time() + LINK_WAIT_SEC
+    while out.get("state") != "open" and not (out.get("pairing_code") if want_code else out.get("qr_base64")):
+        if time.time() >= end:
+            break
+        time.sleep(1.5)
+        out = web_connect(gym_id, None)
+    return out
+
+
 def web_create(gym_id: str, pairing_number: str | None = None) -> dict:
-    """Create (or reuse) this gym's Evolution instance and return {state, qr_base64, pairing_code}."""
+    """Start linking from a clean session and return {state, qr_base64, pairing_code}.
+
+    A session left over from an earlier try (QR mode, another number, or timed out) is removed first: while a
+    session is connecting, Evolution ignores a new pairing number, so the code would never come."""
     name = instance_name(gym_id)
+    try:
+        if web_state(gym_id) == "open":
+            _PAIRING.pop(gym_id, None)
+            return {"state": "open", "qr_base64": None, "pairing_code": None}
+        web_remove(gym_id)
+        time.sleep(1)
+    except MetaError:
+        pass   # no session yet
+    if pairing_number:
+        _PAIRING[gym_id] = pairing_number
+    else:
+        _PAIRING.pop(gym_id, None)
     body = {"instanceName": name, "integration": "WHATSAPP-BAILEYS", "qrcode": True, "groupsIgnore": True,
             "rejectCall": False, "alwaysOnline": False, "readMessages": False, "readStatus": False,
             "syncFullHistory": False,
@@ -220,14 +258,14 @@ def web_create(gym_id: str, pairing_number: str | None = None) -> dict:
     try:
         d = evo("POST", "/instance/create", json=body)
         q = d.get("qrcode") or {}
-        if q.get("base64") or q.get("pairingCode"):
-            return {"state": "connecting", "qr_base64": q.get("base64"), "pairing_code": q.get("pairingCode")}
+        first = {"state": "connecting", "qr_base64": q.get("base64"), "pairing_code": q.get("pairingCode")}
     except MetaError as e:
         if "already in use" not in e.message.lower() and "already exists" not in e.message.lower():
             raise
         # existing instance: make sure the webhook points here (URL / secret may have changed)
         evo("POST", f"/webhook/set/{name}", json={"webhook": body["webhook"]})
-    return web_connect(gym_id, pairing_number)
+        first = web_connect(gym_id, pairing_number)
+    return _wait_for_code(gym_id, bool(pairing_number), first)
 
 
 def web_connect(gym_id: str, pairing_number: str | None = None) -> dict:

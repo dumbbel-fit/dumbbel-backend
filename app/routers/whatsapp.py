@@ -352,6 +352,7 @@ def web_link_status(pairing_phone: str | None = None, ctx: GymCtx = Depends(perm
     except wa.MetaError as e:
         _meta_fail(e, "WHATSAPP_LINK_FAILED")
     if state == "open":
+        wa._PAIRING.pop(ctx.gym.id, None)
         if cfg.status != "connected":
             prof = {}
             try:
@@ -374,8 +375,8 @@ def web_link_status(pairing_phone: str | None = None, ctx: GymCtx = Depends(perm
             db.commit()
             wa.onboard_later(ctx.gym.id)
         return _web_status(db, ctx, cfg, {"state": "open"})
-    pairing = None
-    if pairing_phone:
+    pairing = wa.pairing_for(ctx.gym.id)   # remembered from "Start linking", so a restarted session keeps code mode
+    if pairing_phone and not pairing:
         digits = "".join(ch for ch in pairing_phone if ch.isdigit())[-10:]
         pairing = "91" + digits if len(digits) == 10 else None
     try:
