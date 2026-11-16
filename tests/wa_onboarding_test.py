@@ -32,6 +32,9 @@ sent_texts = []
 wa.evo = lambda method, path, **kw: (sent_texts.append((kw.get("json") or {}).get("text", "")) or {"key": {"id": "fake-" + uuid7()}})
 settings.wa_web_quiet_start, settings.wa_web_quiet_end = 24, 0   # no quiet hours in this test
 settings.wa_web_min_gap_sec, settings.wa_web_max_gap_sec = 20, 20
+from app.services import jobs  # noqa: E402
+_enqueue = jobs.enqueue   # this test drives the sender itself: don't let "send now" wake-ups run in the background
+jobs.enqueue = lambda name, fn, *a, **k: None if name == "wa.send_now" else _enqueue(name, fn, *a, **k)
 
 tag = uuid7()[-8:]
 with session_scope() as db:
