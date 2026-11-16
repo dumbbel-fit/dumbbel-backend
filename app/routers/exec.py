@@ -350,7 +350,11 @@ def attention(admin: User = Depends(platform_admin), db: Session = Depends(get_d
     for r in disputes:
         r["at"] = iso(r["at"].replace(tzinfo=timezone.utc))
     keep = ("id", "name", "city", "status", "created_at", "health", "flags", "members", "checkins")
-    return {"pending_approvals": [{k: r[k] for k in keep} for r in pending],
+    dels = rows(db, """SELECT id, gym_id, gym_name, city, requester_name, created_at FROM gym_deletion_requests
+                       WHERE status='pending' ORDER BY created_at LIMIT 20""")
+    for r in dels:
+        r["created_at"] = iso(r["created_at"].replace(tzinfo=timezone.utc))
+    return {"deletion_requests": dels, "pending_approvals": [{k: r[k] for k in keep} for r in pending],
             "at_risk": [{k: r[k] for k in keep} for r in risk[:15]], "upi_backlog": upi, "claim_disputes": disputes}
 
 

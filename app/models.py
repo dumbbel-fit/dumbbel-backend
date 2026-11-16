@@ -709,3 +709,51 @@ class ExecFollowup(Base):
     snooze_until = mapped_column(Date, nullable=True)
     by_user_id: Mapped[str] = mapped_column(String(36), nullable=False)
     created_at = created()
+
+
+# ---------------- Gym deletion (owner asks, console deletes) ----------------
+class GymDeletionRequest(Base):
+    """An owner asked for their gym to be deleted. Only the console acts on it. `gym_id` is a plain column (no foreign
+    key) so the request survives the gym it deleted. pending → completed | rejected | cancelled."""
+    __tablename__ = "gym_deletion_requests"
+    id: Mapped[str] = pk()
+    gym_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    gym_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    code_prefix: Mapped[str | None] = mapped_column(String(3))
+    city: Mapped[str | None] = mapped_column(String(120))
+    requested_by: Mapped[str] = mapped_column(String(36), nullable=False)
+    requester_name: Mapped[str | None] = mapped_column(String(200))
+    requester_phone: Mapped[str | None] = mapped_column(String(32))
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(12), default="pending", server_default="pending", nullable=False, index=True)
+    decided_by: Mapped[str | None] = mapped_column(String(36))
+    decided_at = mapped_column(TS, nullable=True)
+    decision_note: Mapped[str | None] = mapped_column(Text)
+    archive_id: Mapped[str | None] = mapped_column(String(36))
+    pending_guard = mapped_column(String(36), Computed("IF(status = 'pending', gym_id, NULL)", persisted=True))
+    created_at = created()
+    updated_at = updated()
+    __table_args__ = (UniqueConstraint("pending_guard", name="uq_gym_del_one_pending"),)
+
+
+class GymArchive(Base):
+    """Everything a deleted gym had, as zlib-compressed JSON (one list of rows per table). Uploaded files are not
+    kept: only their keys. Read the rows back with GET /internal/gym-archives/{id}/download."""
+    __tablename__ = "gym_archives"
+    id: Mapped[str] = pk()
+    gym_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    gym_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    code_prefix: Mapped[str | None] = mapped_column(String(3))
+    city: Mapped[str | None] = mapped_column(String(120))
+    owner_user_id: Mapped[str | None] = mapped_column(String(36))
+    owner_name: Mapped[str | None] = mapped_column(String(200))
+    owner_phone: Mapped[str | None] = mapped_column(String(32))
+    request_id: Mapped[str | None] = mapped_column(String(36))
+    reason: Mapped[str | None] = mapped_column(Text)
+    counts = mapped_column(JSON, nullable=True)  # rows archived per table, files removed, accounts removed
+    raw_bytes: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0", nullable=False)
+    data_bytes: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0", nullable=False)
+    data = mapped_column(LONGBLOB, nullable=False)
+    deleted_by: Mapped[str] = mapped_column(String(36), nullable=False)
+    deleted_at = mapped_column(TS, nullable=False)
+    created_at = created()
