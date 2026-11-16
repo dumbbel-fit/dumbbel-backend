@@ -158,6 +158,7 @@ def _connect(db: Session, ctx: GymCtx, waba_id: str, phone_number_id: str, token
         db.commit()
     except wa.MetaError:
         db.rollback()
+    wa.onboard_later(ctx.gym.id)
     return get_whatsapp(ctx, db)
 
 
@@ -371,6 +372,7 @@ def web_link_status(pairing_phone: str | None = None, ctx: GymCtx = Depends(perm
             audit(db, ctx.gym.id, ctx.user.id, "whatsapp.connect", "gym", ctx.gym.id,
                   f"Linked WhatsApp {phone or ''} by QR code")
             db.commit()
+            wa.onboard_later(ctx.gym.id)
         return _web_status(db, ctx, cfg, {"state": "open"})
     pairing = None
     if pairing_phone:

@@ -36,7 +36,8 @@ log = logging.getLogger("dumbbel.whatsapp")
 # ---------------------------------------------------------------- events & default templates
 VARS = {"member_name": "Meghana", "gym_name": "Iron Republic Fitness", "membership_plan": "Monthly",
         "expiry_date": "30 Nov 2026", "gym_phone": "+91 98765 43210", "membership_amount": "₹1,500",
-        "amount": "₹1,500", "announcement": "The gym stays open till 11 pm this week", "days_left": "3"}
+        "amount": "₹1,500", "announcement": "The gym stays open till 11 pm this week", "days_left": "3",
+        "app_link": "https://dumbbel.fit/member"}
 BUTTON_EVENTS = {"expiry_reminder", "expired", "payment_due"}
 
 EVENTS: dict[str, dict] = {
@@ -48,6 +49,11 @@ EVENTS: dict[str, dict] = {
         "label": "Membership expired", "category": "UTILITY", "button": "Renew membership", "default_on": True,
         "body": "Hi {{member_name}}, your {{membership_plan}} membership at {{gym_name}} ended on {{expiry_date}}. "
                 "You can renew any time with the link below. Call {{gym_phone}} if you need help."},
+    "gym_live": {
+        "label": "Your gym is on DUMBBEL.fit (once per member)", "category": "UTILITY", "button": None, "default_on": True,
+        "body": "Hi {{member_name}}, {{gym_name}} is now on DUMBBEL.fit. Open {{app_link}} and sign in with this "
+                "mobile number to check in at the gym every day, see your attendance and streak, and keep track of "
+                "your membership. Questions? Call us on {{gym_phone}}. Reply STOP to stop these messages."},
     "welcome": {
         "label": "New member welcome", "category": "UTILITY", "button": None, "default_on": False,
         "body": "Welcome to {{gym_name}}, {{member_name}}. Your {{membership_plan}} membership is active until "
@@ -435,7 +441,7 @@ def build_vars(db: Session, gym: Gym, member: GymMember, ms: Membership | None, 
         amount = rupees(due if due > 0 else (ms.price_paise or 0))
     v = {"member_name": first, "gym_name": gym.name, "membership_plan": ms.plan_name if ms else "membership",
          "expiry_date": fmt_date(ms.end_date) if ms else "-", "gym_phone": fmt_phone(gym.phone),
-         "membership_amount": amount or "-", "amount": amount or "-"}
+         "membership_amount": amount or "-", "amount": amount or "-", "app_link": settings.member_app_url}
     if ms is not None:
         v["days_left"] = str(max(0, (ms.end_date - today_in(gym.timezone)).days))
     v.update({k: x for k, x in (extra or {}).items() if x is not None})
@@ -593,6 +599,13 @@ def run_expiry_automation(force: bool = False) -> int:
             s = wa_settings(cfg)
             from app.utils import tz
             hour = utcnow().astimezone(tz(gym.timezone)).hour
+            try:  # every hour: members added or imported since the last run get their one-time message
+                ensure_templates(db, gym.id)
+                queued += queue_onboarding(db, gym, cfg)
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                log.warning("whatsapp onboarding failed: %s", type(e).__name__)
             if not force and hour != int(s.get("send_hour", 10)):
                 continue
             tpls = {t.key: t for t in db.scalars(select(WaTemplate).where(WaTemplate.gym_id == gym.id))}
@@ -634,6 +647,60 @@ def run_expiry_automation(force: bool = False) -> int:
     if queued:
         log.info("whatsapp automation queued %s message(s)", queued)
     return queued
+
+
+# ---------------------------------------------------------------- "your gym is on DUMBBEL.fit" (once per member)
+LIVE_EVENT = "gym_live"
+LIVE_RECENT_DAYS = 30     # members whose membership ended longer ago than this are not messaged
+LIVE_CAP_SHARE = 0.75     # of the daily limit on a linked number; the rest is kept for reminders
+
+
+def queue_onboarding(db: Session, gym: Gym, cfg: GymWhatsApp, tpl: WaTemplate | None = None) -> int:
+    """Queue the one-time "your gym is on DUMBBEL.fit" message for every member who has not had it: active members
+    with a membership that is current or ended in the last 30 days. Safe to call any number of times: the dedupe
+    key `live:<member>` allows one per member, ever. Caller commits."""
+    if not is_connected(cfg) or not wa_settings(cfg)["automations"].get(LIVE_EVENT, False):
+        return 0
+    tpl = tpl or db.scalar(select(WaTemplate).where(WaTemplate.gym_id == gym.id, WaTemplate.key == LIVE_EVENT))
+    if not template_ready(cfg, tpl):
+        return 0
+    done = set(db.scalars(select(WaMessage.dedupe_key).where(WaMessage.gym_id == gym.id, WaMessage.event == LIVE_EVENT)))
+    targets = [t for t in expiry_targets(db, gym, window=(-LIVE_RECENT_DAYS, 36500)) if f"live:{t[1].id}" not in done]
+    step = (settings.wa_web_min_gap_sec + settings.wa_web_max_gap_sec) / 2 if cfg.provider == "web" else 0
+    now, n = utcnow(), 0
+    for ms, gm, u, _ in targets:
+        m, _why = queue_message(db, gym, gm, LIVE_EVENT, ms=ms, dedupe=f"live:{gm.id}", cfg=cfg, tpl=tpl, user=u)
+        if m:
+            # spread out in send order, so a reminder queued later is not stuck behind hundreds of these
+            m.next_attempt_at = now + timedelta(seconds=step * n)
+            n += 1
+    return n
+
+
+def onboard_gym(gym_id: str) -> int:
+    """Own session; never raises. Used after WhatsApp is linked and after an import finishes."""
+    try:
+        with session_scope() as db:
+            cfg, gym = get_config(db, gym_id), db.get(Gym, gym_id)
+            if not cfg or not gym or gym.status != "active":
+                return 0
+            ensure_templates(db, gym_id)
+            n = queue_onboarding(db, gym, cfg)
+        if n:
+            log.info("whatsapp onboarding queued %s message(s) for gym %s", n, gym_id)
+        return n
+    except Exception as e:
+        log.warning("whatsapp onboarding failed: %s", type(e).__name__)
+        return 0
+
+
+def onboard_later(gym_id: str):
+    from app.services.jobs import enqueue
+
+    def run():
+        time.sleep(2)  # let the request that triggered this commit first
+        onboard_gym(gym_id)
+    enqueue("wa.onboard", run)
 
 
 # ---------------------------------------------------------------- sending (worker)
@@ -682,7 +749,7 @@ BACKOFF = [60, 300, 1800, 7200]  # seconds before attempts 2..5
 _queue_lock = threading.Lock()
 
 
-def _web_hold(db: Session, cfg: GymWhatsApp, gym: Gym, trigger: str):
+def _web_hold(db: Session, cfg: GymWhatsApp, gym: Gym, trigger: str, event: str | None = None):
     """Linked numbers: quiet hours for automatic messages and a daily cap. Returns a UTC datetime to retry at, or None."""
     from app.utils import tz
     z = tz(gym.timezone)
@@ -696,7 +763,10 @@ def _web_hold(db: Session, cfg: GymWhatsApp, gym: Gym, trigger: str):
     start = local_midnight_utc(local.date(), gym.timezone)
     sent = db.scalar(select(func.count()).select_from(WaMessage).where(
         WaMessage.gym_id == cfg.gym_id, WaMessage.sent_at >= start)) or 0
-    if sent >= settings.wa_web_daily_limit:
+    limit = settings.wa_web_daily_limit
+    if event == LIVE_EVENT:
+        limit = int(limit * LIVE_CAP_SHARE)
+    if sent >= limit:
         nxt = (local + timedelta(days=1)).replace(hour=qe, minute=random.randint(0, 30), second=0, microsecond=0)
         return nxt.astimezone(utcnow().tzinfo)
     return None
@@ -721,7 +791,8 @@ def _process_queue(limit: int) -> int:
                    .values(status="queued", next_attempt_at=now))
         rows = db.execute(select(WaMessage.id, WaMessage.gym_id).where(
             WaMessage.status == "queued", WaMessage.next_attempt_at <= now)
-            .order_by(WaMessage.next_attempt_at).limit(400).with_for_update(skip_locked=True)).all()
+            .order_by(WaMessage.event == LIVE_EVENT, WaMessage.next_attempt_at)  # reminders before the one-time message
+            .limit(400).with_for_update(skip_locked=True)).all()
         if not rows:
             return 0
         providers = dict(db.execute(select(GymWhatsApp.gym_id, GymWhatsApp.provider).where(
@@ -773,7 +844,7 @@ def _process_queue(limit: int) -> int:
                     _fail(m, "opted_out", "The member opted out before this was sent.", status="cancelled")
                 elif not template_ready(cfg, tpl):
                     _fail(m, "template", "The template is no longer approved.")
-                elif cfg.provider == "web" and (hold := _web_hold(db, cfg, db.get(Gym, m.gym_id), m.trigger)):
+                elif cfg.provider == "web" and (hold := _web_hold(db, cfg, db.get(Gym, m.gym_id), m.trigger, m.event)):
                     m.status, m.next_attempt_at, m.attempts = "queued", hold, max(0, m.attempts - 1)
                 else:
                     try:
@@ -833,6 +904,7 @@ def handle_evolution(payload: dict, gym_id: str) -> dict:
                 cfg.verified_name = prof.get("name") or data.get("profileName") or cfg.verified_name
                 if cfg.status != "connected":
                     cfg.connected_at = utcnow()
+                    onboard_later(gym_id)
                 cfg.status, cfg.last_error, cfg.checked_at = "connected", None, utcnow()
             elif state == "close" and cfg.status == "connected":
                 reason = data.get("statusReason")

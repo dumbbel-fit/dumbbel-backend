@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     meta_graph_version: str = "v21.0"
     whatsapp_enc_key: str | None = None           # Fernet key for stored tokens (falls back to one derived from JWT_SECRET)
     renew_url_base: str = "https://dumbbel.fit/renew"
+    member_app_url: str = "https://dumbbel.fit/member"  # link in the "your gym is on DUMBBEL.fit" message
     renew_token_days: int = 14
     wa_send_per_sec: int = 8
     # WhatsApp via QR linking (Evolution API + Baileys) — free, no Meta setup. Leave URL empty to hide the option.

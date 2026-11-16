@@ -146,6 +146,8 @@ async def request_context(request: Request, call_next):
         except Exception as e:  # pragma: no cover
             resp = await unhandled_handler(request, e)
     resp.headers["X-Request-Id"] = rid
+    if path.startswith("/v1") and "cache-control" not in resp.headers:
+        resp.headers["Cache-Control"] = "no-store"  # API answers are always live; files set their own caching
     if metered:  # route template ("/v1/gyms/{gymId}"), never the real path, so no ids are kept
         tpl = getattr(request.scope.get("route"), "path", None) or "(unmatched)"
         metrics.end(f"{request.method} {tpl}", resp.status_code, (time.perf_counter() - start) * 1000)

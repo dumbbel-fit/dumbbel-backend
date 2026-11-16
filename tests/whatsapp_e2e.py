@@ -241,9 +241,12 @@ n3 = wa.run_expiry_automation(force=True)
 after = c.get(f"{B}/gyms/{GA}/whatsapp/messages", headers=H(TA)).json()
 print("   queued per run:", n1, n2, n3)
 expect("second and third runs queue nothing", (n2, n3), (0, 0))
-auto = [m for m in after["items"] if m["trigger"] == "auto"]
+auto = [m for m in after["items"] if m["trigger"] == "auto" and m["event"] != "gym_live"]
 expect("auto reminders for 7/3/1-day + expired members, once each", sorted(m["member"]["name"] for m in auto if m["member"]["id"] in (m3["id"], m1["id"], m7["id"], mexp["id"], m20["id"])), ["Asha Three", "Bala One", "Chitra Seven", "Esha Expired"])
-expect("20-days-left member not messaged", any(m["member"]["id"] == m20["id"] for m in after["items"]), False)
+expect("20-days-left member gets no reminder", any(m["member"]["id"] == m20["id"] and m["event"] != "gym_live" for m in after["items"]), False)
+live = [m for m in after["items"] if m["event"] == "gym_live"]
+expect("each member gets the go-live message once", len(live), len({m["member"]["id"] for m in live}))
+expect("20-days-left member gets the go-live message", any(m["member"]["id"] == m20["id"] for m in live), True)
 
 print("\n== retries")
 MOCK["sent"].clear(); MOCK["fail_next"] = "transient"

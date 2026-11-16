@@ -87,6 +87,20 @@ Member ──► https://dumbbel.fit/renew/<token> ──► /v1/renew/<token>�
 
 Members who already renewed are never reminded.
 
+### "Your gym is on DUMBBEL.fit" (`gym_live`, on by default)
+
+Sent once to each member, with the member app link (`MEMBER_APP_URL`, default `https://dumbbel.fit/member`).
+
+- **Who:** active members whose membership is current or ended in the last 30 days, with a valid number, not opted out.
+- **When it is queued:** when WhatsApp is linked, when an import finishes, and every hour for members added since.
+- **Once only:** the dedupe key `live:<member id>` allows one per member, ever, even after re-linking.
+- **Pace on a linked number:** one message every 12 to 35 seconds, none between 21:00 and 08:00, and at most 75% of
+  the daily limit (`WA_WEB_DAILY_LIMIT`, default 200), so reminders always have room. Reminders are sent first.
+  A gym with 400 members therefore takes about three days.
+- **Official API:** waits until the `gym_live` template is approved by WhatsApp.
+
+Test: `tests/wa_onboarding_test.py` (test database, fake gateway).
+
 ## Set up QR linking (Evolution API) — one server for all gyms
 
 A linked WhatsApp has to stay connected all the time, so Evolution runs on a small always-on VM, not Cloud Run. The

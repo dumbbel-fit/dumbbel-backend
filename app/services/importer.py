@@ -595,6 +595,8 @@ def job_commit(import_id: str):
         imp.counts = c
         audit(db, gym_id, creator, "import.commit", "import", import_id,
               f"Imported {imported} members from {imp.file_name}" + (f" ({failed} failed)" if failed else ""))
+    from app.services import whatsapp as wa   # imported members get the one-time "your gym is on DUMBBEL.fit" message
+    wa.onboard_gym(gym_id)
     if creator:
         send_push(creator, "admin", "Import finished", f"{imported} members imported" + (f", {failed} failed" if failed else ""),
                   {"type": "import_completed", "import_id": import_id})
