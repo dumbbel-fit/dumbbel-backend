@@ -143,7 +143,7 @@ def start_scheduler():
     s.add_job(sync_membership_states, "cron", hour=0, minute=5, id="membership.state_sync")
     from app.services import whatsapp as wa
     # WhatsApp: outbox worker every 20 s; reminders checked hourly (each gym sends at its own hour; dedupe makes repeats safe)
-    s.add_job(wa.process_queue, "interval", seconds=20, id="whatsapp.queue", max_instances=1, coalesce=True)
+    s.add_job(wa.process_queue, "interval", seconds=5, id="whatsapp.queue", max_instances=1, coalesce=True)
     s.add_job(wa.run_expiry_automation, "cron", minute=5, id="whatsapp.reminders", max_instances=1, coalesce=True)
     s.start()
     return s

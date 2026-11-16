@@ -21,7 +21,7 @@ from datetime import date, timedelta
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -55,7 +55,7 @@ EVENTS: dict[str, dict] = {
                 "mobile number to check in at the gym every day, see your attendance and streak, and keep track of "
                 "your membership. Questions? Call us on {{gym_phone}}. Reply STOP to stop these messages."},
     "welcome": {
-        "label": "New member welcome", "category": "UTILITY", "button": None, "default_on": False,
+        "label": "New member welcome", "category": "UTILITY", "button": None, "default_on": True,
         "body": "Welcome to {{gym_name}}, {{member_name}}. Your {{membership_plan}} membership is active until "
                 "{{expiry_date}}. Reach us on {{gym_phone}} for anything you need."},
     "renewal_confirmed": {
@@ -63,7 +63,7 @@ EVENTS: dict[str, dict] = {
         "body": "Thanks {{member_name}}, your {{membership_plan}} membership at {{gym_name}} is renewed and valid "
                 "until {{expiry_date}}. See you at the gym."},
     "payment_received": {
-        "label": "Payment received", "category": "UTILITY", "button": None, "default_on": False,
+        "label": "Payment received", "category": "UTILITY", "button": None, "default_on": True,
         "body": "Hi {{member_name}}, we received your payment of {{amount}} at {{gym_name}}. Thank you. "
                 "Call {{gym_phone}} if anything looks wrong."},
     "payment_due": {
@@ -71,9 +71,21 @@ EVENTS: dict[str, dict] = {
         "body": "Hi {{member_name}}, {{membership_amount}} is pending for your {{membership_plan}} membership at "
                 "{{gym_name}}. Please pay at the front desk or with the link below. Thank you."},
     "payment_failed": {
-        "label": "Payment not verified", "category": "UTILITY", "button": None, "default_on": False,
+        "label": "Payment not verified", "category": "UTILITY", "button": None, "default_on": True,
         "body": "Hi {{member_name}}, we could not verify your recent payment of {{amount}} at {{gym_name}}. "
                 "Please call {{gym_phone}} so we can sort it out."},
+    "membership_cancelled": {
+        "label": "Membership cancelled", "category": "UTILITY", "button": None, "default_on": True,
+        "body": "Hi {{member_name}}, your {{membership_plan}} membership at {{gym_name}} has been cancelled. "
+                "If you think this is a mistake, please call us on {{gym_phone}}."},
+    "membership_frozen": {
+        "label": "Membership on hold (frozen)", "category": "UTILITY", "button": None, "default_on": True,
+        "body": "Hi {{member_name}}, your {{membership_plan}} membership at {{gym_name}} is on hold as requested. "
+                "The days you are away are added back, so you don't lose any. Call {{gym_phone}} with any questions."},
+    "membership_resumed": {
+        "label": "Membership resumed", "category": "UTILITY", "button": None, "default_on": True,
+        "body": "Welcome back {{member_name}}, your {{membership_plan}} membership at {{gym_name}} is active again "
+                "and valid until {{expiry_date}}. See you at the gym."},
     "away_nudge": {
         "label": "Haven’t visited in 14 days", "category": "MARKETING", "button": None, "default_on": False,
         "body": "Hi {{member_name}}, we have not seen you at {{gym_name}} for a while. Your {{membership_plan}} "
@@ -84,6 +96,10 @@ EVENTS: dict[str, dict] = {
                 "Please call us on {{gym_phone}} if you have any questions. Reply STOP to stop these updates."},
 }
 AUTO_EVENTS = [k for k, v in EVENTS.items() if not v.get("manual_only")]
+# Answers to something that just happened at the desk (a payment, a new plan, a cancellation). They go out at
+# once, before any bulk reminder, and also during quiet hours: the member is standing at the gym.
+INSTANT_EVENTS = {"welcome", "renewal_confirmed", "payment_received", "payment_failed", "membership_cancelled",
+                  "membership_frozen", "membership_resumed"}
 DEFAULT_SETTINGS = {"send_hour": 10, "expiry_days_before": [7, 3, 1, 0], "expired_days_after": [1],
                     "due_every_days": 7, "automations": {k: bool(v["default_on"]) for k, v in EVENTS.items()
                                                          if not v.get("manual_only")}}
@@ -526,14 +542,18 @@ SKIP = {"not_connected": "WhatsApp isn’t connected", "automation_off": "This a
 def queue_message(db: Session, gym: Gym, member: GymMember, event: str, *, ms: Membership | None = None,
                   dedupe: str | None = None, batch_id: str | None = None, extra: dict | None = None,
                   actor_id: str | None = None, trigger: str = "auto", cfg: GymWhatsApp | None = None,
-                  tpl: WaTemplate | None = None, user: User | None = None) -> tuple[WaMessage | None, str | None]:
-    """Add one message to the outbox. Returns (message, None) or (None, skip_reason). Caller commits."""
+                  tpl: WaTemplate | None = None, user: User | None = None,
+                  offline: bool = False) -> tuple[WaMessage | None, str | None]:
+    """Add one message to the outbox. Returns (message, None) or (None, skip_reason). Caller commits.
+    offline=True: WhatsApp is down right now; the message is kept as waiting (see WAITING) instead of skipped."""
     cfg = cfg or get_config(db, gym.id)
-    if not is_connected(cfg):
+    if not offline and not is_connected(cfg):
         return None, "not_connected"
     if trigger == "auto" and not wa_settings(cfg)["automations"].get(event, False):
         return None, "automation_off"
     tpl = tpl or db.scalar(select(WaTemplate).where(WaTemplate.gym_id == gym.id, WaTemplate.key == event))
+    if tpl is None and event in EVENTS:   # a message type added after this gym linked WhatsApp
+        tpl = next((t for t in ensure_templates(db, gym.id) if t.key == event), None)
     if not template_ready(cfg, tpl):
         return None, "template_not_approved"
     if member.status != "active":
@@ -554,6 +574,8 @@ def queue_message(db: Session, gym: Gym, member: GymMember, event: str, *, ms: M
                   event=event, category=tpl.category, template_key=tpl.key, vars=v, body=render(tpl.body, v, link),
                   status="queued", next_attempt_at=utcnow(), dedupe_key=dedupe, batch_id=batch_id, trigger=trigger,
                   created_by=actor_id)
+    if offline:
+        m.status, m.error_code, m.error, m.next_attempt_at = "cancelled", "disconnected", WAITING_TEXT, None
     try:
         with db.begin_nested():
             db.add(m)
@@ -569,13 +591,17 @@ def fire(gym_id: str, event: str, member_id: str, membership_id: str | None = No
     try:
         with session_scope() as db:
             cfg = get_config(db, gym_id)
-            if not is_connected(cfg):
+            online = is_connected(cfg)
+            if not online and not (cfg and cfg.connected_at):   # never linked: nothing to send through
                 return
             gym, member = db.get(Gym, gym_id), db.get(GymMember, member_id)
             if not gym or not member or member.gym_id != gym_id:
                 return
             ms = db.get(Membership, membership_id) if membership_id else latest_membership(db, member_id)
-            queue_message(db, gym, member, event, ms=ms, dedupe=dedupe, extra=extra, cfg=cfg)
+            m, _ = queue_message(db, gym, member, event, ms=ms, dedupe=dedupe, extra=extra, cfg=cfg, offline=not online)
+        if m is not None and online:
+            from app.services.jobs import enqueue
+            enqueue("wa.send_now", process_queue)   # don't wait for the next sender tick
     except Exception as e:  # an automation must never break the action that triggered it
         log.warning("whatsapp trigger %s failed: %s", event, type(e).__name__)
 
@@ -639,6 +665,7 @@ def run_expiry_automation(force: bool = False) -> int:
             hour = utcnow().astimezone(tz(gym.timezone)).hour
             try:  # every hour: members added or imported since the last run get their one-time message
                 ensure_templates(db, gym.id)
+                queued += revive_waiting(db, gym.id)
                 queued += queue_onboarding(db, gym, cfg)
                 db.commit()
             except Exception as e:
@@ -715,6 +742,24 @@ def queue_onboarding(db: Session, gym: Gym, cfg: GymWhatsApp, tpl: WaTemplate | 
     return n
 
 
+WAITING_TEXT = "WhatsApp wasn’t connected. Sent automatically if WhatsApp is linked again within 24 hours."
+WAITING_HOURS = 24
+WAITING_CODES = ("disconnected", "not_connected")
+
+
+def revive_waiting(db: Session, gym_id: str) -> int:
+    """WhatsApp is back: queue again what couldn't go while it was down. Welcome, payment and reminder messages
+    only if they are under 24 hours old (a receipt days later is confusing); the one-time go-live message always,
+    because otherwise that member would never get it (its dedupe key blocks a new one). Caller commits."""
+    cutoff = utcnow() - timedelta(hours=WAITING_HOURS)
+    r = db.execute(update(WaMessage).where(
+        WaMessage.gym_id == gym_id, WaMessage.status.in_(("cancelled", "failed")), WaMessage.error_code.in_(WAITING_CODES),
+        WaMessage.trigger == "auto", or_(WaMessage.event == LIVE_EVENT, WaMessage.created_at >= cutoff))
+        .values(status="queued", next_attempt_at=utcnow(), error=None, error_code=None, attempts=0, failed_at=None)
+        .execution_options(synchronize_session=False))
+    return r.rowcount or 0
+
+
 def onboard_gym(gym_id: str) -> int:
     """Own session; never raises. Used after WhatsApp is linked and after an import finishes."""
     try:
@@ -723,7 +768,10 @@ def onboard_gym(gym_id: str) -> int:
             if not cfg or not gym or gym.status != "active":
                 return 0
             ensure_templates(db, gym_id)
+            back = revive_waiting(db, gym_id) if is_connected(cfg) else 0
             n = queue_onboarding(db, gym, cfg)
+        if back:
+            log.info("whatsapp: %s waiting message(s) queued again for gym %s", back, gym_id)
         if n:
             log.info("whatsapp onboarding queued %s message(s) for gym %s", n, gym_id)
         return n
@@ -793,7 +841,7 @@ def _web_hold(db: Session, cfg: GymWhatsApp, gym: Gym, trigger: str, event: str 
     z = tz(gym.timezone)
     local = utcnow().astimezone(z)
     qs, qe = settings.wa_web_quiet_start, settings.wa_web_quiet_end
-    if trigger == "auto" and (local.hour >= qs or local.hour < qe):
+    if trigger == "auto" and event not in INSTANT_EVENTS and (local.hour >= qs or local.hour < qe):
         nxt = local.replace(hour=qe, minute=random.randint(0, 20), second=0, microsecond=0)
         if local.hour >= qs:
             nxt += timedelta(days=1)
@@ -829,7 +877,8 @@ def _process_queue(limit: int) -> int:
                    .values(status="queued", next_attempt_at=now))
         rows = db.execute(select(WaMessage.id, WaMessage.gym_id).where(
             WaMessage.status == "queued", WaMessage.next_attempt_at <= now)
-            .order_by(WaMessage.event == LIVE_EVENT, WaMessage.next_attempt_at)  # reminders before the one-time message
+            .order_by(case((WaMessage.event.in_(INSTANT_EVENTS), 0), (WaMessage.event == LIVE_EVENT, 2), else_=1),
+                      WaMessage.next_attempt_at)  # receipts first, then reminders, then the one-time message
             .limit(400).with_for_update(skip_locked=True)).all()
         if not rows:
             return 0
@@ -880,6 +929,8 @@ def _process_queue(limit: int) -> int:
                     _fail(m, "not_connected", "WhatsApp was disconnected before this could be sent.")
                 elif member is not None and member.wa_opted_out_at is not None:
                     _fail(m, "opted_out", "The member opted out before this was sent.", status="cancelled")
+                elif member is not None and member.status != "active" and m.trigger == "auto":
+                    _fail(m, "archived", "The member was archived before this was sent.", status="cancelled")
                 elif not template_ready(cfg, tpl):
                     _fail(m, "template", "The template is no longer approved.")
                 elif cfg.provider == "web" and (hold := _web_hold(db, cfg, db.get(Gym, m.gym_id), m.trigger, m.event)):

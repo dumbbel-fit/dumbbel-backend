@@ -146,10 +146,12 @@ pv = chk("preview", c.post(f"{B}/gyms/{G}/whatsapp/preview", headers=H(T), json=
 expect("preview has the link inline (no button)", ("Renew membership: https://" in pv["text"], pv["button_text"]), (True, None))
 s = chk("send to all expiring", c.post(f"{B}/gyms/{G}/whatsapp/send", headers=H(T), json={"event": "expiry_reminder", "view": "expiring"}), 202)
 expect("3 queued", s["queued"], 3)
-deadline = time.time() + 60
-while time.time() < deadline and len([x for x in EVO["sent"] if x["instance"] == NAME]) < 3:
+is_rem = lambda x: x["instance"] == NAME and "Renew membership: https://" in x["text"]  # noqa: E731  (welcome messages go first now)
+deadline = time.time() + 90
+while time.time() < deadline and len([x for x in EVO["sent"] if is_rem(x)]) < 3:
     wa.process_queue(); time.sleep(0.5)
-sent = [x for x in EVO["sent"] if x["instance"] == NAME]
+expect("welcome messages went out before the reminders", sum(1 for x in EVO["sent"] if x["instance"] == NAME and x["text"].startswith("Welcome to")) >= 3, True)
+sent = [x for x in EVO["sent"] if is_rem(x)]
 expect("all 3 sent through the linked number", len(sent), 3)
 gaps = [round(b["at"] - a["at"], 1) for a, b in zip(sent, sent[1:])]
 print("   gaps between messages (s):", gaps)

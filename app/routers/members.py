@@ -503,6 +503,8 @@ def freeze(id: str, body: FreezeIn, user: User = Depends(current_user), db: Sess
           + (f" for {body.days} days" if body.days else " (open-ended)"),
           before, {"end_date": ms.end_date, "state": ms.state})
     db.commit()
+    from app.services.whatsapp import fire_later
+    fire_later(gym.id, "membership_frozen", member.id, ms.id, dedupe=f"frozen:{f.id}")
     return {"membership": ser_membership(ms, gym, db, can_pay=ctx.can_pay)}
 
 
@@ -532,6 +534,8 @@ def unfreeze(id: str, user: User = Depends(current_user), db: Session = Depends(
           f"Unfroze {member.display_name}’s {ms.plan_name} ({used} days used)", before,
           {"end_date": ms.end_date, "state": ms.state})
     db.commit()
+    from app.services.whatsapp import fire_later
+    fire_later(gym.id, "membership_resumed", member.id, ms.id, dedupe=f"resumed:{f.id}")
     return {"membership": ser_membership(ms, gym, db, can_pay=ctx.can_pay)}
 
 
@@ -551,6 +555,8 @@ def cancel(id: str, body: CancelIn, user: User = Depends(current_user), db: Sess
     audit(db, ctx.gym.id, user.id, "membership.cancel", "membership", ms.id,
           f"Cancelled {member.display_name}’s {ms.plan_name}: {body.reason}", before, {"state": "cancelled"})
     db.commit()
+    from app.services.whatsapp import fire_later
+    fire_later(ctx.gym.id, "membership_cancelled", member.id, ms.id, dedupe=f"cancelled:{ms.id}")
     return {"membership": ser_membership(ms, ctx.gym, db, can_pay=ctx.can_pay)}
 
 
