@@ -45,6 +45,9 @@ def patch_me(body: MePatch, user: User = Depends(current_user), db: Session = De
 def delete_me(user: User = Depends(current_user), db: Session = Depends(get_db)):
     active_staff = db.scalar(select(GymStaff).where(GymStaff.user_id == user.id,
                                                     GymStaff.status.in_(("invited", "active"))).limit(1))
+    if active_staff and active_staff.role == "owner":
+        raise ApiError(409, "STAFF_MUST_BE_REMOVED",
+                       "You own a gym. Ask us to delete it first: Gym profile → Delete gym.", {"owner": True})
     if active_staff:
         raise ApiError(409, "STAFF_MUST_BE_REMOVED",
                        "You’re still staff at a gym. Ask the owner to remove you first.")
