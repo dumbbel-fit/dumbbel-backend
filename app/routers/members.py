@@ -421,6 +421,9 @@ def assign_membership(memberId: str, body: MembershipCreate, ctx: GymCtx = Depen
     if not plan or plan.gym_id != gym.id:
         raise validation({"plan_id": "Pick a plan from this gym."})
     had_any = db.scalar(select(Membership.id).where(Membership.member_id == m.id, Membership.state != "cancelled").limit(1))
+    # anyone who ever had a plan (even a cancelled one) gets the "membership confirmed" message, not a second welcome:
+    # the welcome goes once per member, so it would be skipped and they'd only get the payment receipt
+    ever_had = had_any or db.scalar(select(Membership.id).where(Membership.member_id == m.id).limit(1))
     start = body.start_date or default_start(db, gym, m.id)
     ms = create_membership(db, gym, ctx.user.id, m, plan=plan, start=start, discount_paise=body.discount_paise)
     action = "membership.renew" if had_any else "membership.assign"
@@ -445,7 +448,7 @@ def assign_membership(memberId: str, body: MembershipCreate, ctx: GymCtx = Depen
     resp = idem.respond(201, out)
     from app.services.whatsapp import fire_later
     fire_later(gym.id, "gym_live", m.id, ms.id, dedupe=f"live:{m.id}")  # skipped if this member already had it
-    if had_any:
+    if ever_had:
         fire_later(gym.id, "renewal_confirmed", m.id, ms.id, dedupe=f"renewed:{ms.id}")
     else:
         fire_later(gym.id, "welcome", m.id, ms.id, dedupe=f"welcome:{m.id}")

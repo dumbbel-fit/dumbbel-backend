@@ -15,7 +15,7 @@ from app.config import settings  # noqa: E402
 from app.db import engine, session_scope  # noqa: E402
 from app.models import Gym, GymMember, GymWhatsApp, Membership, User, WaMessage, WaTemplate  # noqa: E402
 from app.services import whatsapp as wa  # noqa: E402
-from app.utils import today_in, utcnow, uuid7  # noqa: E402
+from app.utils import today_in, tz, utcnow, uuid7  # noqa: E402
 
 assert "test" in engine.url.database, "refusing to run outside a test database"
 fails = []
@@ -162,7 +162,7 @@ expect("at 75% of the limit, go-live waits", wa.process_queue(), 0)
 with session_scope() as db:
     held = db.scalars(select(WaMessage).where(WaMessage.gym_id == GID, WaMessage.event == "gym_live", WaMessage.status == "queued")).all()
     expect("the held message is kept and moved to a later time, not dropped",
-           (len(held), sum(h.next_attempt_at > utcnow() + timedelta(minutes=30) for h in held) >= 1), (2, True))
+           (len(held), sum(h.next_attempt_at.astimezone(tz("Asia/Kolkata")).date() > today_in("Asia/Kolkata") for h in held) >= 1), (2, True))
     expect("nothing failed", db.scalar(text("SELECT COUNT(*) FROM wa_messages WHERE gym_id=:g AND status IN ('failed','cancelled')"), {"g": GID}), 0)
 
 with session_scope() as db:   # tidy up

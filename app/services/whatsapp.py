@@ -22,7 +22,7 @@ from datetime import date, timedelta
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import case, func, or_, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -59,8 +59,8 @@ EVENTS: dict[str, dict] = {
         "body": "Welcome to {{gym_name}}, {{member_name}}. Your {{membership_plan}} membership is active until "
                 "{{expiry_date}}. Reach us on {{gym_phone}} for anything you need."},
     "renewal_confirmed": {
-        "label": "Membership renewed", "category": "UTILITY", "button": None, "default_on": True,
-        "body": "Thanks {{member_name}}, your {{membership_plan}} membership at {{gym_name}} is renewed and valid "
+        "label": "Membership renewed / new plan added", "category": "UTILITY", "button": None, "default_on": True,
+        "body": "Thanks {{member_name}}, your {{membership_plan}} membership at {{gym_name}} is confirmed and valid "
                 "until {{expiry_date}}. See you at the gym."},
     "payment_received": {
         "label": "Payment received", "category": "UTILITY", "button": None, "default_on": True,
@@ -362,15 +362,31 @@ def exchange_code(code: str) -> str:
     return d["access_token"]
 
 
+# Default texts we have since improved: a gym still on the old default (never edited) gets the new one.
+OLD_DEFAULTS = {"renewal_confirmed": "Thanks {{member_name}}, your {{membership_plan}} membership at {{gym_name}} is renewed "
+                                     "and valid until {{expiry_date}}. See you at the gym."}
+
+
 def ensure_templates(db: Session, gym_id: str) -> list[WaTemplate]:
     have = {t.key: t for t in db.scalars(select(WaTemplate).where(WaTemplate.gym_id == gym_id))}
+    for key, old in OLD_DEFAULTS.items():
+        t = have.get(key)
+        if t is not None and t.body == old and t.status in ("draft", "ready", "approved") and \
+                not db.scalar(select(GymWhatsApp.provider).where(GymWhatsApp.gym_id == gym_id, GymWhatsApp.provider == "cloud")):
+            t.body = EVENTS[key]["body"]   # linked (web) numbers send plain text: no WhatsApp re-approval needed
     for key, ev in EVENTS.items():
         if key not in have:
             t = WaTemplate(gym_id=gym_id, key=key, category=ev["category"], body=ev["body"], button_text=ev["button"])
-            db.add(t)
-            have[key] = t
+            try:   # several messages can fire at once for the same gym: the other one may have just made it
+                with db.begin_nested():
+                    db.add(t)
+                    db.flush()
+            except IntegrityError:
+                t = db.scalar(select(WaTemplate).where(WaTemplate.gym_id == gym_id, WaTemplate.key == key))
+            if t is not None:
+                have[key] = t
     db.flush()
-    return [have[k] for k in EVENTS]
+    return [have[k] for k in EVENTS if k in have]
 
 
 # ---------------------------------------------------------------- templates
@@ -554,6 +570,8 @@ def queue_message(db: Session, gym: Gym, member: GymMember, event: str, *, ms: M
     tpl = tpl or db.scalar(select(WaTemplate).where(WaTemplate.gym_id == gym.id, WaTemplate.key == event))
     if tpl is None and event in EVENTS:   # a message type added after this gym linked WhatsApp
         tpl = next((t for t in ensure_templates(db, gym.id) if t.key == event), None)
+        if tpl is None:   # another message created it a moment ago; our snapshot can't see it yet
+            raise _TemplateRace()
     if not template_ready(cfg, tpl):
         return None, "template_not_approved"
     if member.status != "active":
@@ -585,10 +603,21 @@ def queue_message(db: Session, gym: Gym, member: GymMember, event: str, *, ms: M
     return m, None
 
 
+class _TemplateRace(Exception):
+    pass
+
+
 def fire(gym_id: str, event: str, member_id: str, membership_id: str | None = None, extra: dict | None = None,
-         dedupe: str | None = None):
-    """Automation trigger used after a business event (runs in its own session; never raises)."""
+         dedupe: str | None = None, _try: int = 0):
+    """Automation trigger used after a business event (runs in its own session; never raises).
+    Retried in a fresh session if it lost a race to create a template (dedupe keys stop doubles)."""
     try:
+        # Templates first, in their own short transaction with the gym's WhatsApp row locked, so messages fired
+        # at the same moment (welcome + receipt + go-live) never race or deadlock creating the same rows.
+        with session_scope() as db:
+            if db.scalar(select(GymWhatsApp.gym_id).where(GymWhatsApp.gym_id == gym_id).with_for_update()):
+                if not db.scalar(select(WaTemplate.id).where(WaTemplate.gym_id == gym_id, WaTemplate.key == event)):
+                    ensure_templates(db, gym_id)
         with session_scope() as db:
             cfg = get_config(db, gym_id)
             online = is_connected(cfg)
@@ -603,6 +632,9 @@ def fire(gym_id: str, event: str, member_id: str, membership_id: str | None = No
             from app.services.jobs import enqueue
             enqueue("wa.send_now", process_queue)   # don't wait for the next sender tick
     except Exception as e:  # an automation must never break the action that triggered it
+        if _try < 3 and isinstance(e, (_TemplateRace, IntegrityError, OperationalError)):
+            time.sleep(0.4 * (_try + 1))
+            return fire(gym_id, event, member_id, membership_id, extra, dedupe, _try + 1)
         log.warning("whatsapp trigger %s failed: %s", event, type(e).__name__)
 
 
