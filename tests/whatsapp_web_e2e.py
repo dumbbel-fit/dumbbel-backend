@@ -164,7 +164,7 @@ chk("delivered", hook(NAME, "messages.update", {"keyId": m0["id"], "status": "DE
 chk("read", hook(NAME, "messages.update", {"keyId": m0["id"], "status": "READ", "fromMe": True}))
 chk("late server ack", hook(NAME, "messages.update", {"keyId": m0["id"], "status": "SERVER_ACK", "fromMe": True}))
 h = c.get(f"{B}/gyms/{G}/whatsapp/messages", headers=H(T)).json()
-st = {m["phone"].lstrip("+"): m["status"] for m in h["items"]}
+st = {m["phone"].lstrip("+"): m["status"] for m in h["items"] if m["event"] == "expiry_reminder"}  # each member also has a go-live message
 expect("read, no downgrade", st[m0["number"]], "read")
 chk("member replies STOP", hook(NAME, "messages.upsert", {"key": {"remoteJid": sent[1]["number"] + "@s.whatsapp.net", "fromMe": False, "id": "X1"}, "message": {"conversation": "Stop"}}))
 r = c.get(f"{B}/gyms/{G}/whatsapp/reminders", headers=H(T)).json()

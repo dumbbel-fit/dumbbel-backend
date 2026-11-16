@@ -246,8 +246,10 @@ def create_member(body: MemberCreate, ctx: GymCtx = Depends(perm_ctx("members.ed
                                              due=membership_due(db, ms)) if ms else None,
                 "payment": ser_payment(pay, member.display_name, ms.plan_name if ms else None, ctx.user.name) if pay else None}
     resp = idem.respond(201, body_out)
+    from app.services.whatsapp import fire_later
+    # straight away, once per member ever: "your gym is on DUMBBEL.fit" with the app link
+    fire_later(gym.id, "gym_live", member.id, ms.id if ms else None, dedupe=f"live:{member.id}")
     if ms:
-        from app.services.whatsapp import fire_later
         fire_later(gym.id, "welcome", member.id, ms.id, dedupe=f"welcome:{member.id}")
         if pay:
             fire_later(gym.id, "payment_received", member.id, ms.id, {"amount": rupees(pay.amount_paise)}, f"paid:{pay.id}")
@@ -442,6 +444,7 @@ def assign_membership(memberId: str, body: MembershipCreate, ctx: GymCtx = Depen
         out["due_paise"] = due
     resp = idem.respond(201, out)
     from app.services.whatsapp import fire_later
+    fire_later(gym.id, "gym_live", m.id, ms.id, dedupe=f"live:{m.id}")  # skipped if this member already had it
     if had_any:
         fire_later(gym.id, "renewal_confirmed", m.id, ms.id, dedupe=f"renewed:{ms.id}")
     else:

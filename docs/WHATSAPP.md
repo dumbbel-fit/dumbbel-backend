@@ -92,7 +92,7 @@ Members who already renewed are never reminded.
 Sent once to each member, with the member app link (`MEMBER_APP_URL`, default `https://dumbbel.fit/member`).
 
 - **Who:** active members whose membership is current or ended in the last 30 days, with a valid number, not opted out.
-- **When it is queued:** when WhatsApp is linked, when an import finishes, and every hour for members added since.
+- **When it is queued:** when WhatsApp is linked, when an import finishes, straight away when a member is added by hand or given a plan, and every hour as a safety net.
 - **Once only:** the dedupe key `live:<member id>` allows one per member, ever, even after re-linking.
 - **Pace on a linked number:** one message every 12 to 35 seconds, none between 21:00 and 08:00, and at most 75% of
   the daily limit (`WA_WEB_DAILY_LIMIT`, default 200), so reminders always have room. Reminders are sent first.

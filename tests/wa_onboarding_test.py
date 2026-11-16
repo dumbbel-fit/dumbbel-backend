@@ -95,6 +95,24 @@ with session_scope() as db:
 expect("a member who joins later gets it on the next run", wa.onboard_gym(GID), 1)
 expect("still one message per member", len(live_rows()), 4)
 
+print("== added by hand: sent straight away, once")
+with session_scope() as db:
+    u = User(phone=f"+9196{tag[:8].translate(str.maketrans('abcdef', '123456'))}", name="Indu New")
+    db.add(u); db.flush()
+    gm = GymMember(gym_id=GID, user_id=u.id, member_code=f"{tag}N", display_name="Indu New", joined_on=today)
+    db.add(gm); db.flush()
+    NEW = gm.id
+wa.fire(GID, "gym_live", NEW, None, dedupe=f"live:{NEW}")
+expect("a member added without a plan is queued at once", NEW in live_rows(), True)
+expect("their message has no unfilled variable", "{{" in live_rows()[NEW].body, False)
+wa.fire(GID, "gym_live", NEW, None, dedupe=f"live:{NEW}")
+with session_scope() as db:
+    db.add(Membership(gym_id=GID, member_id=NEW, plan_name="Monthly", price_paise=150000, start_date=today, end_date=today + timedelta(days=30), state="active"))
+expect("firing again, a later plan and the hourly run add nothing", (wa.onboard_gym(GID), wa.run_expiry_automation(), len(live_rows()))[2], 5)
+with session_scope() as db:
+    db.execute(text("DELETE FROM memberships WHERE member_id=:m"), {"m": NEW})
+    db.get(GymMember, NEW).status = "archived"
+
 print("== switch and connection")
 with session_scope() as db:
     db.execute(text("DELETE FROM wa_messages WHERE gym_id=:g"), {"g": GID})
