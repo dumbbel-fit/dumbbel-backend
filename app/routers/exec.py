@@ -18,7 +18,7 @@ from app.deps import platform_admin
 from app.errors import ApiError
 from app.models import User
 from app.responses import DocRoute, ERRORS
-from app.services import ai, storage
+from app.services import ai, storage, testgyms
 from app.services.cache import cache
 from app.utils import clamp_limit, decode_cursor, encode_cursor, iso, utcnow
 
@@ -41,11 +41,12 @@ def _window(rng: str) -> dict:
 
 
 def q1(db: Session, sql: str, **p):
-    return db.execute(text(sql), p).scalar() or 0
+    """Platform numbers leave test gyms out (app/services/testgyms.py); queries for one gym (`:g`) don't."""
+    return db.execute(text(testgyms.scope(sql, p)), p).scalar() or 0
 
 
-def rows(db: Session, sql: str, **p):
-    return [dict(r._mapping) for r in db.execute(text(sql), p)]
+def rows(db: Session, sql: str, *, all_gyms: bool = False, **p):
+    return [dict(r._mapping) for r in db.execute(text(sql if all_gyms else testgyms.scope(sql, p)), p)]
 
 
 def delta(cur: float, prev: float) -> float | None:
@@ -64,7 +65,7 @@ WHERE m.state <> 'cancelled' {extra}"""
 
 @router.get("/overview", summary="Platform KPIs with period-over-period change, growth series and funnel")
 def overview(rng: Range = Query("30d", alias="range"), admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
-    key = f"exec:ov:{rng}"
+    key = f"exec:ov:{rng}:{testgyms.cache_tag(db)}"
     hit = cache.get(key)
     if hit:
         return json.loads(hit)
@@ -165,13 +166,13 @@ def overview(rng: Range = Query("30d", alias="range"), admin: User = Depends(pla
     out = {"range": rng, "from": w["start"].isoformat(), "to": w["today"].isoformat(), "gyms": gyms, "members": members,
            "users": users, "checkins": checkins, "money": money, "memberships": memberships, "upi": upi,
            "engagement": engagement, "series": series, "by_hour": by_hour, "funnel": funnel,
-           "generated_at": utcnow().isoformat()}
+           "test_gyms_excluded": len(testgyms.test_gym_ids(db)), "generated_at": utcnow().isoformat()}
     cache.set(key, json.dumps(out, default=str), ex=120)
     return out
 
 
 GYM_SQL = """
-SELECT g.id, g.name, g.code_prefix, g.city, g.area, g.status, g.created_at, g.approved_at, COALESCE(g.org_id, g.id) org,
+SELECT g.id, g.name, g.code_prefix, g.city, g.area, g.status, g.is_test, g.created_at, g.approved_at, COALESCE(g.org_id, g.id) org,
   u.name owner_name, u.phone owner_phone,
   (SELECT COUNT(*) FROM gym_members gm WHERE gm.gym_id=g.id AND gm.status='active') members,
   (SELECT COUNT(*) FROM gym_members gm JOIN users uu ON uu.id=gm.user_id WHERE gm.gym_id=g.id AND gm.status='active' AND uu.first_login_at IS NOT NULL) on_app,
@@ -183,8 +184,18 @@ SELECT g.id, g.name, g.code_prefix, g.city, g.area, g.status, g.created_at, g.ap
   (SELECT MAX(c.at) FROM checkins c WHERE c.gym_id=g.id AND c.result='success') last_checkin_at,
   (SELECT COUNT(*) FROM gym_staff s WHERE s.gym_id=g.id AND s.status<>'deactivated') staff,
   (SELECT COUNT(*) FROM gym_upi_accounts a WHERE a.gym_id=g.id AND a.active=1) upi_ids,
-  (SELECT COUNT(*) FROM plans pl WHERE pl.gym_id=g.id AND pl.active=1) plans
+  (SELECT COUNT(*) FROM plans pl WHERE pl.gym_id=g.id AND pl.active=1) plans,
+  (SELECT COUNT(*) FROM gym_members gm WHERE gm.gym_id=g.id) members_all,
+  (SELECT COUNT(*) FROM checkins c WHERE c.gym_id=g.id AND c.result='success' AND c.local_date=:td) checkins_today,
+  (SELECT COALESCE(SUM(p.amount_paise),0) FROM payments p WHERE p.gym_id=g.id AND p.status='recorded' AND p.paid_at>=:tu) collected_today,
+  (SELECT COALESCE(SUM(p.amount_paise),0) FROM payments p WHERE p.gym_id=g.id AND p.status='recorded' AND p.paid_at>=:mu) collected_month,
+  (SELECT COALESCE(SUM(p.amount_paise),0) FROM payments p WHERE p.gym_id=g.id AND p.status='recorded') collected_all,
+  (SELECT COALESCE(SUM(p.amount_paise),0) FROM payments p WHERE p.gym_id=g.id AND p.status='recorded' AND p.source='import') imported_all,
+  (SELECT w.status FROM gym_whatsapp w WHERE w.gym_id=g.id) whatsapp,
+  (SELECT MAX(a.at) FROM audit_log a WHERE a.gym_id=g.id) last_activity_at
 FROM gyms g LEFT JOIN users u ON u.id = g.owner_user_id"""
+
+DUES_BY_GYM = DUES_SQL.replace("SELECT COALESCE(SUM(", "SELECT m.gym_id, COALESCE(SUM(", 1) + " GROUP BY m.gym_id"
 
 
 def _health(r: dict, w: dict) -> tuple[int, list[str]]:
@@ -223,9 +234,13 @@ def _health(r: dict, w: dict) -> tuple[int, list[str]]:
     return max(0, min(100, score)), flags
 
 
-def gym_rows(db: Session, rng: str, status: str | None = None, q: str | None = None) -> list[dict]:
+def gym_rows(db: Session, rng: str, status: str | None = None, q: str | None = None, include_test: bool = False) -> list[dict]:
+    """One row per gym. Test gyms are left out unless `include_test` (then each row says `is_test`)."""
     w = _window(rng)
-    P = {"s": w["start_utc"], "ps": w["pstart_utc"], "sd": w["start"], "psd": w["pstart"], "td": w["today"]}
+    m_first = w["today"].replace(day=1)
+    P = {"s": w["start_utc"], "ps": w["pstart_utc"], "sd": w["start"], "psd": w["pstart"], "td": w["today"],
+         "tu": w["today_utc"], "mu": datetime(m_first.year, m_first.month, 1, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)}
+    dues = {r["gym_id"]: int(r[list(r)[1]] or 0) for r in rows(db, DUES_BY_GYM.format(extra=""), all_gyms=True)}
     sql, extra = GYM_SQL, []
     if status:
         extra.append("g.status = :status")
@@ -233,19 +248,25 @@ def gym_rows(db: Session, rng: str, status: str | None = None, q: str | None = N
     if q:
         extra.append("(g.name LIKE :q OR g.city LIKE :q OR g.area LIKE :q OR g.code_prefix LIKE :q OR u.phone LIKE :q)")
         P["q"] = f"%{q.strip()}%"
+    if not include_test:
+        extra.append("g.is_test = 0")
     if extra:
         sql += " WHERE " + " AND ".join(extra)
     out = []
-    for r in rows(db, sql, **P):
+    for r in rows(db, sql, all_gyms=True, **P):  # per-gym subqueries: test gyms are filtered by the WHERE above
         score, flags = _health(r, w)
-        r.update(health=score, flags=flags,
+        r.update(health=score, flags=flags, is_test=bool(r["is_test"]),
                  app_adoption_pct=round(r["on_app"] / r["members"] * 100, 1) if r["members"] else 0,
                  checkins_change_pct=delta(r["checkins"], r["checkins_prev"]), gmv_change_pct=delta(r["gmv"], r["gmv_prev"]),
                  visits_per_active_week=round(r["checkins"] / max(1, r["active_members"]) / max(1, w["n"] / 7), 2) if r["active_members"] else 0,
                  created_at=iso(r["created_at"].replace(tzinfo=timezone.utc)) if r["created_at"] else None,
                  approved_at=iso(r["approved_at"].replace(tzinfo=timezone.utc)) if r["approved_at"] else None,
                  last_checkin_at=iso(r["last_checkin_at"].replace(tzinfo=timezone.utc)) if r["last_checkin_at"] else None,
-                 gmv=int(r["gmv"]), gmv_prev=int(r["gmv_prev"]))
+                 last_activity_at=iso(r["last_activity_at"].replace(tzinfo=timezone.utc)) if r["last_activity_at"] else None,
+                 gmv=int(r["gmv"]), gmv_prev=int(r["gmv_prev"]), dues_paise=dues.get(r["id"], 0),
+                 collected_today=int(r["collected_today"]), collected_month=int(r["collected_month"]),
+                 collected_all=int(r["collected_all"]), imported_all=int(r["imported_all"]),
+                 whatsapp=r["whatsapp"] or "not_set_up")
         out.append(r)
     return out
 
@@ -258,38 +279,55 @@ SORTS = {"gmv": lambda r: -r["gmv"], "checkins": lambda r: -r["checkins"], "memb
 @router.get("/analytics/gyms", summary="Every gym's performance: members, check-ins, GMV, adoption, health score + flags")
 def analytics_gyms(rng: Range = Query("30d", alias="range"), sort: Literal["gmv", "checkins", "members", "health", "adoption", "newest", "name"] = "gmv",
                    status: Literal["pending", "active", "rejected", "suspended"] | None = None, q: str | None = None,
+                   test: Literal["live", "test", "all"] = Query("live", description="live = real gyms only (default) · test = test gyms only · all"),
                    limit: int = Query(50, ge=1, le=100), cursor: str | None = None,
                    admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
-    data = gym_rows(db, rng, status, q)
+    every = gym_rows(db, rng, status, q, include_test=True)
+    data = [r for r in every if test == "all" or r["is_test"] == (test == "test")]
     data.sort(key=SORTS[sort], reverse=(sort == "newest"))
     off = int(decode_cursor(cursor).get("o", 0))
     lim = clamp_limit(limit)
     page = data[off:off + lim]
-    tot = {"gyms": len(data), "members": sum(r["members"] for r in data), "gmv": sum(r["gmv"] for r in data),
-           "checkins": sum(r["checkins"] for r in data), "at_risk": sum(1 for r in data if r["status"] == "active" and r["health"] < 60)}
-    return {"items": page, "next_cursor": encode_cursor({"o": off + lim}) if off + lim < len(data) else None, "totals": tot}
+    S = lambda k: sum(r[k] for r in data)
+    ids = [r["id"] for r in data]
+    people = {"people": 0, "people_on_app": 0}
+    if ids:
+        marks = ",".join(f":i{i}" for i in range(len(ids)))
+        people = rows(db, f"""SELECT COUNT(DISTINCT gm.user_id) people, COUNT(DISTINCT CASE WHEN u.first_login_at IS NOT NULL THEN gm.user_id END) people_on_app
+                              FROM gym_members gm JOIN users u ON u.id=gm.user_id WHERE gm.status='active' AND gm.gym_id IN ({marks})""",
+                      all_gyms=True, **{f"i{i}": v for i, v in enumerate(ids)})[0]
+    tot = {"gyms": len(data), "live_gyms": sum(1 for r in data if r["status"] == "active"),
+           "pending_gyms": sum(1 for r in data if r["status"] == "pending"),
+           "members": S("members"), "members_all": S("members_all"), "active_members": S("active_members"), "on_app": S("on_app"),
+           "people": int(people["people"] or 0), "people_on_app": int(people["people_on_app"] or 0),
+           "staff": S("staff"), "gmv": S("gmv"), "checkins": S("checkins"), "checkins_today": S("checkins_today"),
+           "collected_today": S("collected_today"), "collected_month": S("collected_month"), "collected_all": S("collected_all"),
+           "dues_paise": S("dues_paise"), "whatsapp_connected": sum(1 for r in data if r["whatsapp"] == "connected"),
+           "at_risk": sum(1 for r in data if r["status"] == "active" and r["health"] < 60)}
+    tabs = {"live": sum(1 for r in every if not r["is_test"]), "test": sum(1 for r in every if r["is_test"]), "all": len(every)}
+    return {"items": page, "test_counts": tabs, "next_cursor": encode_cursor({"o": off + lim}) if off + lim < len(data) else None, "totals": tot}
 
 
 @router.get("/analytics/gyms.csv", summary="Export the gym performance table as CSV", responses={200: {"content": {"text/csv": {}}}})
 def analytics_gyms_csv(rng: Range = Query("30d", alias="range"), admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
-    data = sorted(gym_rows(db, rng), key=SORTS["gmv"])
+    data = sorted(gym_rows(db, rng, include_test=True), key=lambda r: (r["is_test"], -r["gmv"]))
     buf = io.StringIO()
     wr = csv.writer(buf)
     wr.writerow(["Gym", "Code", "City", "Area", "Status", "Owner", "Owner phone", "Members", "Active members", "On app %",
                  f"Check-ins ({rng})", "Check-ins change %", f"GMV ₹ ({rng})", "GMV change %", "Visits/active member/week",
-                 "Staff", "UPI IDs", "Health", "Flags", "Last check-in", "Registered"])
+                 "Staff", "UPI IDs", "Health", "Flags", "Last check-in", "Registered", "Test gym"])
     for r in data:
         wr.writerow([r["name"], r["code_prefix"], r["city"], r["area"], r["status"], r["owner_name"], r["owner_phone"], r["members"],
                      r["active_members"], r["app_adoption_pct"], r["checkins"], r["checkins_change_pct"], f"{r['gmv'] / 100:.2f}",
                      r["gmv_change_pct"], r["visits_per_active_week"], r["staff"], r["upi_ids"], r["health"], "; ".join(r["flags"]),
-                     r["last_checkin_at"] or "", r["created_at"] or ""])
+                     r["last_checkin_at"] or "", r["created_at"] or "", "yes" if r["is_test"] else ""])
     return Response("﻿" + buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": f'attachment; filename="dumbbel-gyms-{rng}-{date.today().isoformat()}.csv"'})
 
 
 @router.get("/analytics/gyms/{gymId}", summary="Gym deep-dive: KPIs, daily series, plans mix, busiest hours, staff, recent activity")
 def analytics_gym(gymId: str, rng: Range = Query("30d", alias="range"), admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
-    base = [r for r in gym_rows(db, rng) if r["id"] == gymId]
+    base = [r for r in gym_rows(db, rng, include_test=True) if r["id"] == gymId]
     if not base:
         raise ApiError(404, "NOT_FOUND", "That gym wasn’t found.")
     w = _window(rng)
@@ -364,12 +402,14 @@ def users_search(q: str = Query(..., min_length=3), admin: User = Depends(platfo
     like = f"%{q.strip()}%"
     found = rows(db, """SELECT id, name, phone, email, is_platform_admin, first_login_at, last_login_at, created_at, deletion_requested_at
                         FROM users WHERE deleted_at IS NULL AND (name LIKE :q OR email LIKE :q OR phone LIKE :d) ORDER BY last_login_at DESC LIMIT 25""",
-                 q=like, d=f"%{digits[-10:]}%" if len(digits) >= 4 else "__none__")
+                 all_gyms=True, q=like, d=f"%{digits[-10:]}%" if len(digits) >= 4 else "__none__")
     for u in found:
-        u["staff_of"] = rows(db, """SELECT g.id gym_id, g.name gym, s.role, s.staff_role, s.status FROM gym_staff s JOIN gyms g ON g.id=s.gym_id
-                                    WHERE s.user_id=:u""", u=u["id"])
-        u["memberships"] = rows(db, """SELECT gm.id member_id, g.id gym_id, g.name gym, gm.member_code, gm.status, gm.last_checkin_at
-                                       FROM gym_members gm JOIN gyms g ON g.id=gm.gym_id WHERE gm.user_id=:u""", u=u["id"])
+        u["staff_of"] = rows(db, """SELECT g.id gym_id, g.name gym, g.is_test, s.role, s.staff_role, s.status FROM gym_staff s JOIN gyms g ON g.id=s.gym_id
+                                    WHERE s.user_id=:u""", all_gyms=True, u=u["id"])
+        u["memberships"] = rows(db, """SELECT gm.id member_id, g.id gym_id, g.name gym, g.is_test, gm.member_code, gm.status, gm.last_checkin_at
+                                       FROM gym_members gm JOIN gyms g ON g.id=gm.gym_id WHERE gm.user_id=:u""", all_gyms=True, u=u["id"])
+        for x in u["staff_of"] + u["memberships"]:
+            x["is_test"] = bool(x["is_test"])
         for k in ("first_login_at", "last_login_at", "created_at", "deletion_requested_at"):
             u[k] = iso(u[k].replace(tzinfo=timezone.utc)) if u[k] else None
         for m in u["memberships"]:
@@ -393,12 +433,13 @@ def platform_activity(gym_id: str | None = None, action: str | None = None, limi
         where.append("a.id < :cid")
         P["cid"] = int(c["id"])
     lim = clamp_limit(limit)
-    rs = rows(db, f"""SELECT a.id, a.at, a.action, a.summary, a.entity_type, a.gym_id, g.name gym, u.name actor
+    rs = rows(db, f"""SELECT a.id, a.at, a.action, a.summary, a.entity_type, a.gym_id, g.name gym, g.is_test, u.name actor
                       FROM audit_log a LEFT JOIN gyms g ON g.id=a.gym_id LEFT JOIN users u ON u.id=a.actor_user_id
-                      WHERE {' AND '.join(where)} ORDER BY a.id DESC LIMIT {lim + 1}""", **P)
+                      WHERE {' AND '.join(where)} ORDER BY a.id DESC LIMIT {lim + 1}""", all_gyms=True, **P)
     nxt = encode_cursor({"id": rs[lim - 1]["id"]}) if len(rs) > lim else None
     for r in rs:
         r["at"] = iso(r["at"].replace(tzinfo=timezone.utc))
+        r["is_test"] = bool(r["is_test"])
     return {"items": rs[:lim], "next_cursor": nxt}
 
 
@@ -409,7 +450,7 @@ def system(admin: User = Depends(platform_admin), db: Session = Depends(get_db))
         dbok = True
     except Exception:
         dbok = False
-    counts = {t: q1(db, f"SELECT COUNT(*) FROM {t}") for t in ("users", "gyms", "gym_members", "memberships", "payments",
+    counts = {t: db.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar() or 0 for t in ("users", "gyms", "gym_members", "memberships", "payments",
                                                               "checkins", "audit_log", "food_logs", "upi_payment_requests")}
     return {"database": {"ok": dbok, "tables": counts}, "environment": settings.env,
             "integrations": {"auth_provider": settings.auth_provider, "firebase": bool(settings.firebase_project_id),
@@ -424,7 +465,7 @@ def system(admin: User = Depends(platform_admin), db: Session = Depends(get_db))
 
 @router.get("/ai/summary", summary="AI executive summary of the platform (Groq), cached 30 min")
 def ai_summary(rng: Range = Query("30d", alias="range"), refresh: bool = False, admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
-    key = f"exec:ai:{rng}"
+    key = f"exec:ai:{rng}:{testgyms.cache_tag(db)}"
     if not refresh:
         hit = cache.get(key)
         if hit:

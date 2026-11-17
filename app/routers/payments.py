@@ -18,7 +18,7 @@ from app.services.audit import audit
 from app.services.core import (settle_credit, add_payment, check_duplicate_reference, gym_settings, ser_payment, user_names,
                                validate_paid_at, validate_reference)
 from app.services.receipt import render_receipt_pdf
-from app.services.rules import membership_due
+from app.services.rules import load_states, membership_due
 from app.utils import today_in, amount_in_words, clamp_limit, decode_cursor, encode_cursor, local_midnight_utc, rupees, tz, \
     utcnow
 
@@ -90,8 +90,21 @@ def list_payments(from_: date | None = Query(None, alias="from"), to: date | Non
     plans = {m.id: m.plan_name for m in db.scalars(select(Membership).where(
         Membership.id.in_([p.membership_id for p in rows if p.membership_id] or [""])))}
     names = user_names(db, [p.recorded_by for p in rows])
-    return {"items": [ser_payment(p, members.get(p.member_id), plans.get(p.membership_id), names.get(p.recorded_by))
-                      for p in rows],
+    # what is still owed on each payment's membership right now (shown as "₹X due" / "Part paid" in the list)
+    ms_due: dict[str, tuple[int, str]] = {}
+    if rows:
+        for st in load_states(db, gym, list({p.member_id for p in rows})).values():
+            for m, mst, due in st.memberships:
+                ms_due[m.id] = (due, mst)
+
+    def item(p):
+        d = ser_payment(p, members.get(p.member_id), plans.get(p.membership_id), names.get(p.recorded_by))
+        due, mst = ms_due.get(p.membership_id, (0, None)) if p.membership_id else (0, None)
+        d["due_paise"] = due if p.status == "recorded" else 0
+        if d["membership"]:
+            d["membership"]["status"], d["membership"]["due_paise"] = mst, due
+        return d
+    return {"items": [item(p) for p in rows],
             "totals": {"collected_paise": sum(by_method.values()), "total_paise": sum(by_method.values()), "count": count,
                        "by_method": by_method, "voided_paise": int(v_sum or 0), "voided_count": int(v_n or 0)},
             "next_cursor": nxt}

@@ -210,6 +210,10 @@ class NoteIn(BaseModel):
 class CancelIn(BaseModel):
     reason: str = Field(..., min_length=1)
     refund_note: str | None = None
+    remove_payments: bool | None = Field(
+        None, description="Void the payments recorded for this membership so they no longer count in collections "
+                          "(today, month, totals). They stay visible as voided. Needs payments.void. "
+                          "Default: yes when the person cancelling can void payments.")
 
 
 # ---------- payments ----------

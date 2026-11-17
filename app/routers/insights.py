@@ -29,6 +29,7 @@ from app.responses import DocRoute, ERRORS
 from app.routers.explore import haversine_km, listed, price_from
 from app.services.audit import audit
 from app.services.cache import cache
+from app.services import testgyms
 from app.services.storage import existing_keys
 from app.utils import iso, utcnow
 
@@ -56,7 +57,8 @@ def utc_start(d: date) -> datetime:
 
 
 def rows(db: Session, sql: str, **p) -> list[dict]:
-    return [dict(r._mapping) for r in db.execute(text(sql), p)]
+    """Platform numbers leave test gyms out (app/services/testgyms.py); queries for one gym (`:g`) don't."""
+    return [dict(r._mapping) for r in db.execute(text(testgyms.scope(sql, p)), p)]
 
 
 def by_gym(db: Session, sql: str, **p) -> dict[str, dict]:
@@ -71,7 +73,15 @@ def pct(a, b, nd=1):
     return round(a / b * 100, nd) if b else None
 
 
+def ckey(key: str) -> str:
+    """Cache key tagged with the current set of test gyms, so marking a gym as test refreshes every cached number."""
+    from app.db import session_scope
+    with session_scope() as sdb:
+        return f"{key}:{testgyms.cache_tag(sdb)}"
+
+
 def cached(key: str, refresh: bool, build):
+    key = ckey(key)
     if not refresh:
         hit = cache.get(key)
         if hit:
@@ -277,7 +287,7 @@ def add_followup(body: FollowupIn, admin: User = Depends(platform_admin), db: Se
     what = {"called": "called", "messaged": "messaged", "snoozed": f"snoozed until {until}", "note": "noted"}[body.action]
     audit(db, g.id, admin.id, "console.followup", "gym", g.id, f"Console: {what}" + (f" — {REASONS[body.reason]}" if body.reason else ""))
     db.commit()
-    cache.delete("ins:actions")
+    cache.delete(ckey("ins:actions"))
     return {"id": f.id, "gym_id": g.id, "action": f.action, "reason": f.reason, "note": f.note,
             "snooze_until": until.isoformat() if until else None}
 
@@ -296,7 +306,7 @@ def unsnooze(gym_id: str, admin: User = Depends(platform_admin), db: Session = D
     db.execute(text("UPDATE exec_followups SET snooze_until = :y WHERE gym_id=:g AND action='snoozed' AND snooze_until >= :td"),
                {"g": gym_id, "td": today_ist(), "y": today_ist() - timedelta(days=1)})
     db.commit()
-    cache.delete("ins:actions")
+    cache.delete(ckey("ins:actions"))
 
 
 # =====================================================================================================
@@ -547,7 +557,7 @@ def build_adoption(db: Session) -> dict:
     n_photos: dict[str, int] = defaultdict(int)
     for gid, k in photos:
         n_photos[gid] += k in real
-    orm = {g.id: g for g in db.scalars(select(Gym).where(Gym.status == "active"))}
+    orm = {g.id: g for g in db.scalars(select(Gym).where(Gym.status == "active", Gym.is_test.is_(False)))}
 
     def lvl(any_, active):
         return 2 if active else 1 if any_ else 0
@@ -618,7 +628,7 @@ def build_benchmarks(db: Session) -> dict:
     ci = by_gym(db, "SELECT gym_id, COUNT(*) n FROM checkins WHERE result='success' AND local_date >= :d30 GROUP BY gym_id", **P)
     pay = by_gym(db, "SELECT gym_id, COALESCE(SUM(amount_paise),0) v FROM payments WHERE status='recorded' AND source<>'import' AND paid_at >= :u30 GROUP BY gym_id", **P)
     plans: dict[str, list] = defaultdict(list)
-    for p in db.scalars(select(Plan).where(Plan.active.is_(True))):
+    for p in db.scalars(select(Plan).where(Plan.active.is_(True), Plan.gym_id.not_in(select(Gym.id).where(Gym.is_test.is_(True))))):
         plans[p.gym_id].append(p)
     items = []
     for g in gyms:
@@ -736,7 +746,7 @@ def build_impact(db: Session, rng: str) -> dict:
                "waiting": esum("waiting"), "lost": esum("lost"), "earned_paise": esum("earned_paise"),
                "visit_to_join_pct": pct(esum("joined"), esum("booked")),
                "avg_response_min": round(statistics.mean(all_mins)) if all_mins else None,
-               "gyms_listed": sum(1 for g in db.scalars(select(Gym).where(Gym.status == "active")) if listed(g)),
+               "gyms_listed": sum(1 for g in db.scalars(select(Gym).where(Gym.status == "active", Gym.is_test.is_(False))) if listed(g)),
                "gyms": sorted([{"gym_id": gid, "name": names[gid]["name"], "city": names[gid]["city"],
                                 **{k: v for k, v in e.items() if k != "_mins"},
                                 "avg_response_min": round(statistics.mean(e["_mins"])) if e["_mins"] else None}
@@ -761,7 +771,7 @@ def build_demand(db: Session, rng: str) -> dict:
     td = today_ist()
     s = utc_start(td - timedelta(days=RANGES[rng] - 1))
     gyms = [{"id": g.id, "name": g.name, "area": g.area, "city": g.city, "lat": float(g.lat), "lng": float(g.lng), "listed": listed(g)}
-            for g in db.scalars(select(Gym).where(Gym.status == "active", Gym.lat.is_not(None), Gym.lng.is_not(None)))]
+            for g in db.scalars(select(Gym).where(Gym.status == "active", Gym.is_test.is_(False), Gym.lat.is_not(None), Gym.lng.is_not(None)))]
     supply = [g for g in gyms if g["listed"]]
     raw = rows(db, """SELECT lat, lng, COUNT(*) searches, COUNT(DISTINCT user_id) people, SUM(results = 0) none_found,
                       AVG(nearest_km) nearest, MAX(created_at) last_at FROM explore_events

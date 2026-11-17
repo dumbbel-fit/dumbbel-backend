@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 from datetime import timedelta
 from typing import Literal
 
@@ -52,6 +53,9 @@ def ser_config(db: Session, gym: Gym, cfg: GymWhatsApp | None) -> dict:
             "quality": cfg.quality if cfg else None, "waba_id": cfg.waba_id if cfg else None,
             "phone_number_id": cfg.phone_number_id if cfg else None, "last_error": cfg.last_error if cfg else None,
             "connected_at": iso(cfg.connected_at) if cfg else None, "checked_at": iso(cfg.checked_at) if cfg else None,
+            # linked number dropped for a moment and is reconnecting by itself: still connected, messages wait
+            "reconnecting": bool(cfg and cfg.status == "connected" and cfg.link_lost_at),
+            "link_lost_at": iso(cfg.link_lost_at) if cfg else None,
             "connected_via": cfg.connected_via if cfg else None,
             "consent_confirmed": bool(cfg and cfg.consent_confirmed_at), "settings": s,
             "platform": {"embedded_signup": bool(settings.meta_app_id and settings.meta_es_config_id and settings.meta_app_secret),
@@ -199,13 +203,28 @@ def test_connection(ctx: GymCtx = Depends(perm_ctx(MANAGE)), db: Session = Depen
         rate_limit(f"watest:{ctx.gym.id}", 30, 3600)
         try:
             state = wa.web_state(ctx.gym.id)
+            if state != "open":   # ask it to reconnect with the saved session and give it a few seconds
+                try:
+                    wa.web_connect(ctx.gym.id, None)
+                except wa.MetaError:
+                    pass
+                for _ in range(6):
+                    time.sleep(1.5)
+                    state = wa.web_state(ctx.gym.id)
+                    if state == "open":
+                        break
+            now = utcnow()
             if state == "open":
                 prof = wa.web_profile(ctx.gym.id)
-                cfg.status, cfg.last_error = "connected", None
+                if cfg.status != "connected":
+                    wa.onboard_later(ctx.gym.id)   # queue again what waited while it was down
+                cfg.status, cfg.last_error, cfg.link_lost_at = "connected", None, None
                 cfg.display_phone = prof.get("phone") or cfg.display_phone
                 cfg.verified_name = prof.get("name") or cfg.verified_name
             else:
-                cfg.status, cfg.last_error = "error", "WhatsApp isn’t linked any more. Scan the QR code again."
+                cfg.link_lost_at = cfg.link_lost_at or now
+                if cfg.status != "connected" or now - cfg.link_lost_at >= wa.LINK_GRACE:
+                    cfg.status, cfg.last_error = "error", wa.UNLINKED_TEXT
         except wa.MetaError as e:
             cfg.last_error = e.message
         cfg.checked_at = utcnow()
@@ -326,8 +345,8 @@ def web_link(body: WebLinkIn, ctx: GymCtx = Depends(perm_ctx(MANAGE)), db: Sessi
         db.add(cfg)
     if cfg.provider != "web" and cfg.token_enc:  # switching from the Meta API: drop that token
         cfg.token_enc, cfg.waba_id, cfg.phone_number_id = None, None, None
-    try:
-        link = wa.web_create(ctx.gym.id, pairing)
+    try:  # a linked number is only ever reconnected here, never thrown away
+        link = wa.web_create(ctx.gym.id, pairing, keep_session=cfg.status == "connected")
     except wa.MetaError as e:
         _meta_fail(e, "WHATSAPP_LINK_FAILED")
     cfg.provider, cfg.instance_name = "web", wa.instance_name(ctx.gym.id)

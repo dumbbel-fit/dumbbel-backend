@@ -145,6 +145,8 @@ def start_scheduler():
     # WhatsApp: outbox worker every 20 s; reminders checked hourly (each gym sends at its own hour; dedupe makes repeats safe)
     s.add_job(wa.process_queue, "interval", seconds=5, id="whatsapp.queue", max_instances=1, coalesce=True)
     s.add_job(wa.run_expiry_automation, "cron", minute=5, id="whatsapp.reminders", max_instances=1, coalesce=True)
+    # linked numbers: reconnect dropped links, mark them back online, and only flag ones that are really unlinked
+    s.add_job(wa.watch_links, "interval", minutes=2, id="whatsapp.links", max_instances=1, coalesce=True)
     s.start()
     return s
 

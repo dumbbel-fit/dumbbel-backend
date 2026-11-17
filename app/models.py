@@ -138,6 +138,10 @@ class Gym(Base):
     checkin_secret: Mapped[str | None] = mapped_column(String(64))  # signs the printed check-in QR; rotate to revoke
     member_seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     receipt_seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    # demo / QA gym: kept as is, but left out of the console's platform numbers and Explore (app/services/testgyms.py)
+    is_test: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
+    test_marked_at = mapped_column(TS, nullable=True)
+    test_marked_by: Mapped[str | None] = mapped_column(String(36))
     created_at = created()
     updated_at = updated()
 
@@ -602,6 +606,9 @@ class GymWhatsApp(Base):
     connected_by: Mapped[str | None] = mapped_column(String(36))
     connected_at = mapped_column(TS, nullable=True)
     checked_at = mapped_column(TS, nullable=True)
+    # linked (web) numbers: when the link last dropped. Stays "connected" while WhatsApp reconnects on its own;
+    # only a link that is still down after the grace period (or a logout from the phone) is shown as unlinked.
+    link_lost_at = mapped_column(TS, nullable=True)
     consent_confirmed_at = mapped_column(TS, nullable=True)  # owner attested members agreed to WhatsApp updates
     settings = mapped_column(JSON, nullable=True)  # automations, send hour
     created_at = created()

@@ -54,6 +54,13 @@ app/routers/*          one file per spec section
 - Every response has a schema in Swagger. Schema changes are applied automatically and additively on startup
   (`app/migrate.py`: new tables, new columns, new enum values; never drops anything).
 
+## Test gyms
+Console → Gyms → a gym's row or page → **Mark as test gym** (`POST /internal/gyms/{id}/test`). It is only a flag
+(`gyms.is_test`): nothing about the gym is changed or deleted and it keeps working. Every platform-wide console number
+(overview, insights, gym totals, cities, AI summary) leaves test gyms out; the gym's own pages still show its data.
+`app/services/testgyms.py` scopes the console SQL in one place, so new console queries get the rule automatically
+(a query for one gym, binding `:g`, is left alone). Undo with **Not a test gym**.
+
 ## Notes and deviations from the spec
 
 - **Python/FastAPI and MySQL** instead of Node/Postgres, as requested. MySQL has no partial indexes, so the three

@@ -3,6 +3,7 @@ import time
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Request
+from pydantic import BaseModel, Field
 from fastapi.responses import Response
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
@@ -31,6 +32,7 @@ MIN_GYM_PHOTOS = 3
 def _gym_out(db: Session, g: Gym, docs: bool = False) -> dict:
     owner = db.get(User, g.owner_user_id)
     d = {**ser_gym(g), "owner": {"id": owner.id, "name": owner.name, "phone": owner.phone} if owner else None,
+         "is_test": bool(g.is_test), "test_marked_at": iso(g.test_marked_at),
          "counts": {"members": db.scalar(select(func.count()).select_from(GymMember).where(GymMember.gym_id == g.id)),
                     "staff": db.scalar(select(func.count()).select_from(GymStaff).where(
                         GymStaff.gym_id == g.id, GymStaff.status != "deactivated"))}}
@@ -125,6 +127,28 @@ def _transition(action: str):
 for _a in TRANSITIONS:
     router.add_api_route(f"/gyms/{{id}}/{_a}", _transition(_a), methods=["POST"], response_model=GymOut,
                          summary=f"{_a.title()} gym (SMS to owner)")
+
+
+class TestFlagIn(BaseModel):
+    is_test: bool = Field(..., description="true = test gym: left out of console numbers. Nothing is deleted or changed.")
+
+
+@router.post("/gyms/{id}/test", response_model=GymOut, summary="Mark / unmark a test gym (console numbers leave it out)",
+             description="Only a flag: the gym, its members, payments and everything else stay exactly as they are and "
+                         "the gym keeps working. Platform-wide console numbers (overview, insights, gyms totals) skip "
+                         "test gyms; the gym's own pages still show its data. Undo any time.")
+def set_test_gym(id: str, body: TestFlagIn, admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
+    g = db.get(Gym, id)
+    if not g:
+        raise ApiError(404, "NOT_FOUND", "That gym wasn’t found.")
+    if bool(g.is_test) != body.is_test:
+        g.is_test = body.is_test
+        g.test_marked_at, g.test_marked_by = (utcnow(), admin.id) if body.is_test else (None, None)
+        audit(db, g.id, admin.id, "gym.test_mark" if body.is_test else "gym.test_unmark", "gym", g.id,
+              f"{'Marked' if body.is_test else 'Unmarked'} {g.name} as a test gym",
+              {"is_test": not body.is_test}, {"is_test": body.is_test})
+        db.commit()
+    return _gym_out(db, g, docs=True)
 
 
 @router.post("/users/{id}/change-phone", response_model=UserWrapOut, summary="Support-only phone change (revokes sessions)")

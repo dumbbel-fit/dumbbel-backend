@@ -258,12 +258,13 @@ def _wait_gone(gym_id: str, limit: float = 12.0) -> bool:
     return False
 
 
-def web_create(gym_id: str, pairing_number: str | None = None) -> dict:
+def web_create(gym_id: str, pairing_number: str | None = None, keep_session: bool = False) -> dict:
     """Start linking and return {state, qr_base64, pairing_code}.
 
     Reuses this gym's session when it can. Only a session still waiting for a scan while a pairing code is wanted
     is replaced: Evolution ignores a new number on a waiting session, so the code would never come. The old one
-    is deleted and we wait until it's really gone before creating the new one (deleting is asynchronous)."""
+    is deleted and we wait until it's really gone before creating the new one (deleting is asynchronous).
+    `keep_session` (the gym's number is linked): never delete, only reconnect the existing session."""
     name = instance_name(gym_id)
     try:
         state = web_state(gym_id)
@@ -276,7 +277,14 @@ def web_create(gym_id: str, pairing_number: str | None = None) -> dict:
         _PAIRING[gym_id] = pairing_number
     else:
         _PAIRING.pop(gym_id, None)
-    if state == "connecting" and pairing_number:
+    if state == "connecting" and pairing_number and not keep_session:
+        time.sleep(4)   # a linked session that is only reconnecting comes back within seconds — never delete that one
+        try:
+            if web_state(gym_id) == "open":
+                _PAIRING.pop(gym_id, None)
+                return {"state": "open", "qr_base64": None, "pairing_code": None}
+        except MetaError:
+            pass
         web_remove(gym_id)
         _wait_gone(gym_id)
         state = None
@@ -1016,8 +1024,12 @@ def _process_queue(limit: int) -> int:
                     except MetaError as e:
                         if cfg.provider == "web" and e.status in (400, 404) and "not on whatsapp" not in e.message.lower() \
                                 and ("closed" in e.message.lower() or "not connected" in e.message.lower() or e.status == 404 and "instance" in e.message.lower()):
-                            cfg.status, cfg.last_error = "error", "WhatsApp was unlinked. Scan the QR code again to resume sending."
-                            m.status, m.next_attempt_at = "queued", utcnow() + timedelta(minutes=30)
+                            # the link is reconnecting (or gone): keep the message and try again shortly.
+                            # watch_links() decides whether the number is really unlinked.
+                            cfg.link_lost_at = cfg.link_lost_at or utcnow()
+                            m.status, m.next_attempt_at = "queued", utcnow() + timedelta(minutes=2)
+                            m.attempts = max(0, m.attempts - 1)
+                            m.error, m.error_code = "Waiting for WhatsApp to reconnect", "reconnecting"
                         elif e.token_problem and cfg.provider != "web":
                             cfg.status, cfg.last_error = "error", "WhatsApp rejected the access token. Reconnect to resume sending."
                             cfg_cache[m.gym_id] = ("error", None)
@@ -1037,6 +1049,84 @@ def _process_queue(limit: int) -> int:
         if spent < gap:
             time.sleep(gap - spent)
     return sent
+
+
+# ---------------------------------------------------------------- link watcher
+# Baileys close reasons after which WhatsApp will not take the session back (logged out on the phone, banned…).
+UNLINKED_REASONS = {401, 402, 403, 406}
+UNLINKED_TEXT = "WhatsApp was unlinked from the phone (Linked devices). Scan the QR code again to resume sending."
+LINK_GRACE = timedelta(minutes=15)   # a dropped link must stay down this long before we call it unlinked
+
+
+def watch_links() -> int:
+    """Every few minutes: check each linked number with Evolution. A link that dropped is asked to reconnect with
+    its saved session (no new scan needed); one that is back is marked connected and its waiting messages are
+    queued again. Only a session that is gone, or still down after LINK_GRACE, is shown as unlinked.
+    If Evolution itself can't be reached nothing is changed. Returns how many gyms changed state."""
+    if not web_available():
+        return 0
+    with session_scope() as db:
+        ids = list(db.scalars(select(GymWhatsApp.gym_id).where(
+            GymWhatsApp.provider == "web", GymWhatsApp.instance_name.is_not(None),
+            GymWhatsApp.status.in_(("connected", "error")))))
+    changed = 0
+    for gid in ids:
+        try:
+            changed += _watch_one(gid)
+        except Exception as e:  # one gym never stops the others
+            log.warning("wa watch %s failed: %s", gid[:8], type(e).__name__)
+    return changed
+
+
+def _watch_one(gym_id: str) -> int:
+    try:
+        state = web_state(gym_id)
+    except MetaError as e:
+        if e.transient or e.status not in (404,):
+            return 0          # Evolution unreachable / busy: say nothing rather than guess
+        state = "gone"        # the session no longer exists on the link server
+    nudge = False
+    back = False
+    with session_scope() as db:
+        cfg = get_config(db, gym_id)
+        if not cfg or cfg.provider != "web" or not cfg.instance_name:
+            return 0
+        now = utcnow()
+        cfg.checked_at = now
+        if state == "open":
+            if cfg.status == "connected" and not cfg.link_lost_at:
+                return 0
+            back = cfg.status != "connected"
+            log.info("wa link %s: online again (was %s)", gym_id[:8], cfg.status)
+            if back:
+                prof = {}
+                try:
+                    prof = web_profile(gym_id)
+                except MetaError:
+                    pass
+                cfg.display_phone = prof.get("phone") or cfg.display_phone
+                cfg.verified_name = prof.get("name") or cfg.verified_name
+            cfg.status, cfg.last_error, cfg.link_lost_at = "connected", None, None
+        elif cfg.status != "connected":
+            return 0          # already shown as needing a scan; it comes back here by itself if it reconnects
+        else:
+            cfg.link_lost_at = cfg.link_lost_at or now
+            if state == "gone" or now - cfg.link_lost_at >= LINK_GRACE:
+                cfg.status, cfg.last_error = "error", UNLINKED_TEXT
+                log.warning("wa link %s: still down after %s min (state=%s): needs a new scan", gym_id[:8],
+                            int((now - cfg.link_lost_at).total_seconds() // 60), state)
+                return 1
+            nudge = state == "close"
+            log.info("wa link %s: %s, reconnecting (down %s s)", gym_id[:8], state,
+                     int((now - cfg.link_lost_at).total_seconds()))
+    if nudge:
+        try:
+            web_connect(gym_id, None)  # reconnect with the saved session; no QR needed while it's still valid
+        except MetaError:
+            pass
+    if back:
+        onboard_later(gym_id)          # queue again what waited while it was down
+    return 1 if back or state == "open" else 0
 
 
 # ---------------------------------------------------------------- Evolution webhooks
@@ -1071,12 +1161,19 @@ def handle_evolution(payload: dict, gym_id: str) -> dict:
                 if cfg.status != "connected":
                     cfg.connected_at = utcnow()
                     onboard_later(gym_id)
-                cfg.status, cfg.last_error, cfg.checked_at = "connected", None, utcnow()
-            elif state == "close" and cfg.status == "connected":
+                cfg.status, cfg.last_error, cfg.checked_at, cfg.link_lost_at = "connected", None, utcnow(), None
+            elif state == "close":
                 reason = data.get("statusReason")
-                cfg.status = "error"
-                cfg.last_error = ("WhatsApp was unlinked from the phone. Scan the QR code again to resume sending."
-                                  if reason in (401, 403, 440) else "The WhatsApp link dropped. Reconnecting…")
+                try:
+                    reason = int(reason)
+                except (TypeError, ValueError):
+                    pass
+                if cfg.status == "connected":
+                    cfg.link_lost_at = cfg.link_lost_at or utcnow()
+                    if reason in UNLINKED_REASONS:   # logged out on the phone / blocked: only a new scan helps
+                        cfg.status, cfg.last_error = "error", UNLINKED_TEXT
+                    # anything else (network blip, WhatsApp restart, timeout): Evolution reconnects with the saved
+                    # session by itself. Stay "connected" so nothing is cancelled; watch_links() checks it.
             out["state"] = state
         elif event == "messages.update":
             items = data if isinstance(data, list) else [data]

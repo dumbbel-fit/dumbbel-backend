@@ -208,6 +208,23 @@ Cloud Run logs, logger `dumbbel.whatsapp`:
 
 Gym-level health shows on Dashboard → WhatsApp (status, last error, failed count, quality rating).
 
+## Linked numbers stay linked (drops vs. real unlinks)
+
+A linked WhatsApp drops its connection now and then (phone off Wi-Fi, WhatsApp restarting, a timeout). Evolution
+reconnects with the saved session by itself; **no new scan is needed**. So:
+
+* A `close` webhook with any reason except a logout (401 / 402 / 403 / 406) keeps the gym **connected** and sets
+  `gym_whatsapp.link_lost_at`. The dashboard shows "Reconnecting", and messages wait instead of being cancelled.
+* A send that hits a closed socket is re-queued in 2 minutes (no attempt used), never cancelled.
+* `whatsapp.links` (every 2 min, `watch_links()`) asks Evolution for each linked number's state. If it's open the
+  gym goes back to plain connected and anything that waited is queued again. If it's closed it asks Evolution to
+  reconnect with the saved session. Only a session that no longer exists, or one **still down after 15 minutes**,
+  is shown as "needs linking again". If Evolution can't be reached, nothing is changed.
+* A gym shown as needing a scan comes back by itself (no scan) if its session reconnects later.
+* "Link again" on a connected gym never logs out or deletes its session; it only reconnects it.
+* A logout on the phone (Linked devices → Log out) or a WhatsApp ban is still shown straight away. The server log
+  line `wa link <gym>: state=close reason=401` says WhatsApp ended the session itself.
+
 ## Rollback
 
 `gcloud run services update-traffic dumbbel-api --region asia-south1 --to-revisions <previous-revision>=100`.
@@ -219,7 +236,8 @@ from each gym's dashboard, or run `UPDATE gym_whatsapp SET status='disconnected'
 `tests/whatsapp_web_e2e.py` tests QR linking against a **mock** Evolution server. It covers linking by QR and by
 pairing code, re-linking, webhook token checks, sending with spacing, the personal link in the text, delivered/read
 receipts with no downgrade, STOP replies, group messages ignored, "not on WhatsApp" failures, unlinking from the phone
-and relinking, quiet hours, the daily cap, and disconnecting. The QR flow was also checked against a **real**
+and relinking, quiet hours, the daily cap, and disconnecting. `tests/wa_link_drops_e2e.py` covers drops, reconnects, the 15-minute grace, Evolution being
+unreachable, and that "Link again" never removes a working session. The QR flow was also checked against a **real**
 Evolution API 2.3.7 running locally: it returned a real WhatsApp QR, and Evolution's webhook calls reached the
 backend and passed the token check. Actually scanning with a phone and sending a real message hasn't been done.
 

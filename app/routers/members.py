@@ -210,8 +210,8 @@ def create_member(body: MemberCreate, ctx: GymCtx = Depends(perm_ctx("members.ed
             v = getattr(body, f)
             if v is not None:
                 setattr(user, f, v)
-        if body.photo_key:
-            user.photo_url = body.photo_key
+    if body.photo_key:  # a photo the desk just took or picked is always saved (Edit member does the same)
+        user.photo_url = body.photo_key
     today = today_in(gym.timezone)
     member = GymMember(gym_id=gym.id, user_id=user.id, member_code=next_member_code(db, gym.id),
                        display_name=body.name.strip(), source="manual", emergency_contact=body.emergency_contact,
@@ -542,13 +542,42 @@ def unfreeze(id: str, user: User = Depends(current_user), db: Session = Depends(
     return {"membership": ser_membership(ms, gym, db, can_pay=ctx.can_pay)}
 
 
+def _void_membership_payments(db: Session, ctx: GymCtx, user: User, ms: Membership, member: GymMember,
+                               why: str) -> tuple[int, int]:
+    """Void every recorded payment of this membership (kept, shown as voided) so collections stop counting it.
+    Returns (count, paise). Caller commits."""
+    pays = db.scalars(select(Payment).where(Payment.membership_id == ms.id, Payment.status == "recorded")).all()
+    now = utcnow()
+    for p in pays:
+        p.status, p.void_reason, p.voided_by, p.voided_at = "voided", why[:500], user.id, now
+        audit(db, ctx.gym.id, user.id, "payment.void", "payment", p.id,
+              f"Voided {rupees(p.amount_paise)} {p.method.upper()} from {member.display_name}: {why}",
+              {"status": "recorded"}, {"status": "voided"})
+    if pays:
+        db.flush()
+        settle_credit(db, ctx.gym, member, user.id)  # if voided money was credit already used, undo that use
+    return len(pays), sum(p.amount_paise for p in pays)
+
+
+def _paid_on(db: Session, ms: Membership) -> int:
+    return int(db.scalar(select(func.coalesce(func.sum(Payment.amount_paise), 0)).where(
+        Payment.membership_id == ms.id, Payment.status == "recorded")) or 0)
+
+
 @router.post("/memberships/{id}/cancel", response_model=MembershipWrapOut, summary="Cancel membership (owner only)",
-             description="Refunds are recorded outside the app in v1; `refund_note` is kept for reference.")
+             description="Refunds are recorded outside the app in v1; `refund_note` is kept for reference. "
+                         "`remove_payments` voids this membership's payments so they leave today's / the month's "
+                         "collections (default: yes, when you may void payments). Nothing is deleted.")
 def cancel(id: str, body: CancelIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
     ms, ctx, member = _membership_ctx(db, user, id)
     ctx.require("memberships.cancel")
     if ms.state == "cancelled":
         raise ApiError(409, "NOT_ACTIVE", "This membership is already cancelled.")
+    remove = body.remove_payments
+    if remove is None:
+        remove = ctx.has("payments.void")
+    elif remove:
+        ctx.require("payments.void")
     now = utcnow()
     for f in freezes_of(db, ms.id):
         if f.ended_at is None:
@@ -557,10 +586,30 @@ def cancel(id: str, body: CancelIn, user: User = Depends(current_user), db: Sess
     ms.state, ms.cancelled_at, ms.cancel_reason, ms.refund_note = "cancelled", now, body.reason, body.refund_note
     audit(db, ctx.gym.id, user.id, "membership.cancel", "membership", ms.id,
           f"Cancelled {member.display_name}’s {ms.plan_name}: {body.reason}", before, {"state": "cancelled"})
+    voided = (0, 0)
+    if remove:
+        voided = _void_membership_payments(db, ctx, user, ms, member, f"Membership cancelled: {body.reason}")
     db.commit()
     from app.services.whatsapp import fire_later
     fire_later(ctx.gym.id, "membership_cancelled", member.id, ms.id, dedupe=f"cancelled:{ms.id}")
-    return {"membership": ser_membership(ms, ctx.gym, db, can_pay=ctx.can_pay)}
+    return {"membership": ser_membership(ms, ctx.gym, db, can_pay=ctx.can_pay),
+            "payments_voided": voided[0], "voided_paise": voided[1]}
+
+
+@router.post("/memberships/{id}/remove-payments", response_model=MembershipWrapOut,
+             summary="Cancelled membership: take its payments out of collections (payments.void)",
+             description="For memberships cancelled before cancelling did this automatically. Voids the payments "
+                         "recorded for this cancelled membership; they stay visible as voided. Nothing is deleted.")
+def remove_cancelled_payments(id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ms, ctx, member = _membership_ctx(db, user, id)
+    ctx.require("payments.void")
+    if ms.state != "cancelled":
+        raise ApiError(409, "NOT_ACTIVE", "Only a cancelled membership’s payments can be removed this way. "
+                                          "Void a single payment from Payments instead.")
+    n, paise = _void_membership_payments(db, ctx, user, ms, member,
+                                         f"Membership cancelled: {ms.cancel_reason or 'cancelled'}")
+    db.commit()
+    return {"membership": ser_membership(ms, ctx.gym, db, can_pay=ctx.can_pay), "payments_voided": n, "voided_paise": paise}
 
 
 # ---------------- suspend / resume ----------------
