@@ -1040,9 +1040,15 @@ def handle_evolution(payload: dict, gym_id: str) -> dict:
     with session_scope() as db:
         cfg = get_config(db, gym_id)
         if not cfg or cfg.provider != "web" or cfg.instance_name != payload.get("instance"):
+            if event in ("connection.update", "qrcode.updated"):
+                log.info("wa link %s: %s ignored (WhatsApp not being linked for this gym now)", gym_id[:8], event)
             return {"ignored": True}
+        if event == "qrcode.updated":   # a new QR / pairing code, or "QR code limit reached" (session gave up)
+            log.info("wa link %s: new code%s", gym_id[:8], (" — " + str(data.get("message"))[:120]) if data.get("message") else "")
         if event == "connection.update":
             state = data.get("state")
+            # one line per linking event, so a failed link shows WhatsApp's reason in the server log
+            log.info("wa link %s: state=%s reason=%s was=%s", gym_id[:8], state, data.get("statusReason"), cfg.status)
             if state == "open":
                 prof = {}
                 try:
