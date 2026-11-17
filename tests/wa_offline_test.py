@@ -9,7 +9,7 @@ from datetime import timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("EVOLUTION_API_URL", "http://fake")
 os.environ.setdefault("EVOLUTION_API_KEY", "x")
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import func, select  # noqa: E402
 
 from app.config import settings  # noqa: E402
 from app.db import engine, session_scope  # noqa: E402
@@ -134,6 +134,26 @@ expect("reminder waits for the morning", r[("expiry_reminder", A)][0], "queued")
 for ev in ("welcome", "payment_received", "payment_failed", "membership_cancelled", "membership_frozen", "membership_resumed"):
     expect(f"{ev} is on by default", wa.DEFAULT_SETTINGS["automations"].get(ev), True)
 settings.wa_web_quiet_start, settings.wa_web_quiet_end = 24, 0
+
+print("== reminder sent by hand today is not sent again automatically")
+with session_scope() as db:
+    def ended(n):
+        u = User(phone=f"+9193{n}{digits[:7]}", name=f"E{n}")
+        db.add(u); db.flush()
+        gm = GymMember(gym_id=GID, user_id=u.id, member_code=f"{tag}E{n}", display_name=f"Ended {n}", joined_on=today)
+        db.add(gm); db.flush()
+        db.add(Membership(gym_id=GID, member_id=gm.id, plan_name="Monthly", price_paise=100000,
+                          start_date=today - timedelta(days=31), end_date=today - timedelta(days=1)))
+        return gm.id
+    HAND, NOHAND = ended(1), ended(2)
+    db.add(WaMessage(id=uuid7(), gym_id=GID, member_id=HAND, phone="+919300000001", event="expired", category="UTILITY",
+                     template_key="expired", body="x", status="sent", dedupe_key=f"manual:expired:{HAND}", trigger="manual"))
+wa.run_expiry_automation(force=True)
+with session_scope() as db:
+    auto_for = lambda mid: db.scalar(select(func.count()).select_from(WaMessage).where(
+        WaMessage.gym_id == GID, WaMessage.member_id == mid, WaMessage.event == "expired", WaMessage.trigger == "auto"))
+    expect("member reminded by hand this morning: no automatic copy", auto_for(HAND), 0)
+    expect("member not reminded yet: gets the automatic one", auto_for(NOHAND), 1)
 
 print("== never linked: nothing is created")
 with session_scope() as db:

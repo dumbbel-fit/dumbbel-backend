@@ -736,13 +736,23 @@ def run_expiry_automation(force: bool = False) -> int:
                 continue
             tpls = {t.key: t for t in db.scalars(select(WaTemplate).where(WaTemplate.gym_id == gym.id))}
             auto = s["automations"]
+            # a reminder the gym already sent by hand today (or that went out automatically) isn't sent again:
+            # manual and automatic sends use different dedupe keys
+            day0 = local_midnight_utc(today_in(gym.timezone), gym.timezone)
+            done_today = set(db.execute(select(WaMessage.member_id, WaMessage.event).where(
+                WaMessage.gym_id == gym.id, WaMessage.created_at >= day0, WaMessage.event.in_(("expiry_reminder", "expired")),
+                WaMessage.status.notin_(("failed", "cancelled")))).all())
             if auto.get("expiry_reminder"):
                 for ms, gm, u, left in expiry_targets(db, gym, days=[int(d) for d in s["expiry_days_before"]]):
+                    if (gm.id, "expiry_reminder") in done_today:
+                        continue
                     m, _ = queue_message(db, gym, gm, "expiry_reminder", ms=ms, dedupe=f"expiry:{ms.id}:{left}",
                                          cfg=cfg, tpl=tpls.get("expiry_reminder"), user=u)
                     queued += bool(m)
             if auto.get("expired"):
                 for ms, gm, u, left in expiry_targets(db, gym, days=[-int(d) for d in s["expired_days_after"]]):
+                    if (gm.id, "expired") in done_today:
+                        continue
                     m, _ = queue_message(db, gym, gm, "expired", ms=ms, dedupe=f"expired:{ms.id}:{-left}",
                                          cfg=cfg, tpl=tpls.get("expired"), user=u)
                     queued += bool(m)
