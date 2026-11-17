@@ -246,24 +246,40 @@ def _wait_for_code(gym_id: str, want_code: bool, first: dict) -> dict:
     return out
 
 
-def web_create(gym_id: str, pairing_number: str | None = None) -> dict:
-    """Start linking from a clean session and return {state, qr_base64, pairing_code}.
+def _wait_gone(gym_id: str, limit: float = 12.0) -> bool:
+    """Evolution deletes an instance in the background after answering. Wait until it is really gone."""
+    end = time.time() + limit
+    while time.time() < end:
+        try:
+            web_state(gym_id)
+        except MetaError:
+            return True
+        time.sleep(0.8)
+    return False
 
-    A session left over from an earlier try (QR mode, another number, or timed out) is removed first: while a
-    session is connecting, Evolution ignores a new pairing number, so the code would never come."""
+
+def web_create(gym_id: str, pairing_number: str | None = None) -> dict:
+    """Start linking and return {state, qr_base64, pairing_code}.
+
+    Reuses this gym's session when it can. Only a session still waiting for a scan while a pairing code is wanted
+    is replaced: Evolution ignores a new number on a waiting session, so the code would never come. The old one
+    is deleted and we wait until it's really gone before creating the new one (deleting is asynchronous)."""
     name = instance_name(gym_id)
     try:
-        if web_state(gym_id) == "open":
-            _PAIRING.pop(gym_id, None)
-            return {"state": "open", "qr_base64": None, "pairing_code": None}
-        web_remove(gym_id)
-        time.sleep(1)
+        state = web_state(gym_id)
     except MetaError:
-        pass   # no session yet
+        state = None   # no session yet
+    if state == "open":
+        _PAIRING.pop(gym_id, None)
+        return {"state": "open", "qr_base64": None, "pairing_code": None}
     if pairing_number:
         _PAIRING[gym_id] = pairing_number
     else:
         _PAIRING.pop(gym_id, None)
+    if state == "connecting" and pairing_number:
+        web_remove(gym_id)
+        _wait_gone(gym_id)
+        state = None
     body = {"instanceName": name, "integration": "WHATSAPP-BAILEYS", "qrcode": True, "groupsIgnore": True,
             "rejectCall": False, "alwaysOnline": False, "readMessages": False, "readStatus": False,
             "syncFullHistory": False,
@@ -271,14 +287,27 @@ def web_create(gym_id: str, pairing_number: str | None = None) -> dict:
                         "headers": {"x-dumbbel-token": web_hook_secret(gym_id)}, "events": WEB_EVENTS}}
     if pairing_number:
         body["number"] = pairing_number
-    try:
-        d = evo("POST", "/instance/create", json=body)
-        q = d.get("qrcode") or {}
-        first = {"state": "connecting", "qr_base64": q.get("base64"), "pairing_code": q.get("pairingCode")}
-    except MetaError as e:
-        if "already in use" not in e.message.lower() and "already exists" not in e.message.lower():
-            raise
-        # existing instance: make sure the webhook points here (URL / secret may have changed)
+    first = None
+    if state is None:
+        for attempt in range(4):
+            try:
+                d = evo("POST", "/instance/create", json=body)
+                q = d.get("qrcode") or {}
+                first = {"state": "connecting", "qr_base64": q.get("base64"), "pairing_code": q.get("pairingCode")}
+                break
+            except MetaError as e:
+                msg = e.message.lower()
+                if "already in use" not in msg and "already exists" not in msg:
+                    raise
+                try:            # still being deleted, or it exists after all: use it if it's there
+                    state = web_state(gym_id)
+                    break
+                except MetaError:
+                    time.sleep(1.5)
+        else:
+            raise MetaError("WhatsApp linking is busy. Please try again in a few seconds.", status=409)
+    if first is None:
+        # existing session: make sure the webhook points here (URL / secret may have changed), then (re)connect
         evo("POST", f"/webhook/set/{name}", json={"webhook": body["webhook"]})
         first = web_connect(gym_id, pairing_number)
     return _wait_for_code(gym_id, bool(pairing_number), first)
