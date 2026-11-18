@@ -27,7 +27,7 @@ from app.services.cache import cache, rate_limit
 from app.services.core import gym_settings, user_names
 from app.services.jobs import enqueue
 from app.services.push import send_push
-from app.services.rules import days_left, member_state, streaks, visit_days
+from app.services.rules import LIVE, PLAN_DENIALS, days_left, load_states, member_state, streaks, visit_days
 from app.utils import iso, local_date_of, local_midnight_utc, today_in, tz, utcnow
 from app.responses import DocRoute, ERRORS, CheckinFeedOut, CheckinResultOut, CheckinStatsOut, GymQrOut
 
@@ -201,8 +201,9 @@ def manual(body: ManualCheckinIn, ctx: GymCtx = Depends(perm_ctx("checkins.manag
 
 
 @router.get("/gyms/{gymId}/checkins", response_model=CheckinFeedOut, summary="Check-in feed (poll every 10 s with `since`)")
-def feed(date: str | None = Query(None, examples=["2026-11-12"]), result: Literal["success", "denied"] | None = None,
+def feed(date: str | None = Query(None, examples=["2026-11-12"]), result: Literal["success", "denied", "plan"] | None = None,
          since: datetime | None = Query(None, description="Only items after this timestamp (polling)"),
+         order: Literal["latest", "earliest"] = Query("latest", description="earliest = the day in arrival order (first in at the top)"),
          limit: int = Query(100, ge=1, le=200), ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
     gym = ctx.gym
     from datetime import date as _date
@@ -214,25 +215,114 @@ def feed(date: str | None = Query(None, examples=["2026-11-12"]), result: Litera
         conds.append(Checkin.result == "success")
     elif result == "denied":
         conds.append(Checkin.result != "success")
+    elif result == "plan":
+        conds.append(Checkin.result.in_(PLAN_DENIALS))
     if since:
         conds.append(Checkin.at > (since if since.tzinfo else since.replace(tzinfo=tz("UTC"))))
-    rows = db.scalars(select(Checkin).where(*conds).order_by(Checkin.at.desc()).limit(limit)).all()
-    members = {m.id: m for m in db.scalars(select(GymMember).where(GymMember.id.in_([r.member_id for r in rows if r.member_id] or [""])))}
+    rows = db.scalars(select(Checkin).where(*conds).order_by(Checkin.at.asc() if order == "earliest" else Checkin.at.desc())
+                      .limit(limit)).all()
+    member_ids = list({r.member_id for r in rows if r.member_id})
+    members = {m.id: m for m in db.scalars(select(GymMember).where(GymMember.id.in_(member_ids or [""])))}
     users = {u.id: u for u in db.scalars(select(User).where(User.id.in_([m.user_id for m in members.values()] or [""])))}
-    plans = {m.id: m.plan_name for m in db.scalars(select(Membership).where(Membership.id.in_([r.membership_id for r in rows if r.membership_id] or [""])))}
+    mss = {m.id: m for m in db.scalars(select(Membership).where(Membership.id.in_([r.membership_id for r in rows if r.membership_id] or [""])))}
     staff = user_names(db, [r.staff_user_id for r in rows])
+    # each member's very first successful check-in here, and the first successful one of this day
+    first_ever = dict(db.execute(select(Checkin.member_id, func.min(Checkin.at)).where(
+        Checkin.gym_id == gym.id, Checkin.result == "success", Checkin.member_id.in_(member_ids or [""]))
+        .group_by(Checkin.member_id)).all())
+    first_today = db.scalar(select(func.min(Checkin.at)).where(
+        Checkin.gym_id == gym.id, Checkin.local_date == d, Checkin.result == "success"))
+    counts_plan = db.scalar(select(func.count()).select_from(Checkin).where(
+        Checkin.gym_id == gym.id, Checkin.local_date == d, Checkin.result.in_(PLAN_DENIALS))) or 0
     items = []
     for r in rows:
         m = members.get(r.member_id)
         u = users.get(m.user_id) if m else None
-        items.append({"id": r.id, "at": iso(r.at), "method": r.method, "result": r.result,
-                      "member": {"id": m.id, "name": m.display_name, "member_code": m.member_code,
-                                 "photo_url": storage.public_url(u.photo_url) if u else None} if m else None,
-                      "plan_name": plans.get(r.membership_id), "staff_name": staff.get(r.staff_user_id)})
+        ms = mss.get(r.membership_id)
+        it = {"id": r.id, "at": iso(r.at), "method": r.method, "result": r.result,
+              "message": MESSAGES.get(r.result),
+              "member": {"id": m.id, "name": m.display_name, "member_code": m.member_code,
+                         "phone": u.phone if u else None,
+                         "photo_url": storage.public_url(u.photo_url) if u else None} if m else None,
+              "plan_name": ms.plan_name if ms else None, "staff_name": staff.get(r.staff_user_id),
+              "first_visit": r.result == "success" and first_ever.get(r.member_id) == r.at,
+              "first_in_today": r.result == "success" and first_today is not None and r.at == first_today}
+        if ms:
+            it["plan_end_date"] = ms.end_date.isoformat()
+            if r.result == "expired":
+                it["days_since_expiry"] = (r.local_date - ms.end_date).days
+        items.append(it)
     return {"date": d.isoformat(), "items": items,
             "counts": {"success": int(counts.get(1, 0) or counts.get(True, 0)),
-                       "denied": int(counts.get(0, 0) or counts.get(False, 0))},
-            "server_time": iso(utcnow())}
+                       "denied": int(counts.get(0, 0) or counts.get(False, 0)), "plan_denied": int(counts_plan)},
+            "first_in": iso(first_today), "server_time": iso(utcnow())}
+
+
+def _range_start(range: str, today):
+    return {"today": today, "week": today - timedelta(days=6), "month": today.replace(day=1),
+            "30d": today - timedelta(days=29)}[range]
+
+
+@router.get("/gyms/{gymId}/checkins/denied",
+            summary="People who tried to check in but were turned away (expired plan etc.), one row per member",
+            description="`range`: today · week (last 7 days) · month (1st→today) · 30d. `kind`: plan (default — expired, "
+                        "cancelled, frozen, suspended, not started) or all (every refusal except ‘already checked in’). "
+                        "Each row: attempts, what they hit, first/last attempt, the plan that ran out and how many days "
+                        "ago, their status now (`renewed` = they have a live plan now) and dues (payments.view).")
+def denied_members(range: Literal["today", "week", "month", "30d"] = "week", kind: Literal["plan", "all"] = "plan",
+                   ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+    gym = ctx.gym
+    today = today_in(gym.timezone)
+    start = _range_start(range, today)
+    res = Checkin.result.in_(PLAN_DENIALS) if kind == "plan" else Checkin.result.notin_(("success", "duplicate"))
+    rows = db.scalars(select(Checkin).where(Checkin.gym_id == gym.id, Checkin.local_date >= start,
+                                            Checkin.local_date <= today, res).order_by(Checkin.at)).all()
+    unknown = sum(1 for r in rows if not r.member_id)
+    by_member: dict[str, list] = {}
+    for r in rows:
+        if r.member_id:
+            by_member.setdefault(r.member_id, []).append(r)
+    ids = list(by_member)
+    members = {m.id: m for m in db.scalars(select(GymMember).where(GymMember.id.in_(ids or [""])))}
+    users = {u.id: u for u in db.scalars(select(User).where(User.id.in_([m.user_id for m in members.values()] or [""])))}
+    mss = {m.id: m for m in db.scalars(select(Membership).where(
+        Membership.id.in_([r.membership_id for r in rows if r.membership_id] or [""])))}
+    states = load_states(db, gym, [i for i in ids if i in members])
+    got_in = dict(db.execute(select(Checkin.member_id, func.count()).where(
+        Checkin.gym_id == gym.id, Checkin.local_date >= start, Checkin.result == "success",
+        Checkin.member_id.in_(ids or [""])).group_by(Checkin.member_id)).all())
+    out = []
+    for mid, rs in by_member.items():
+        m = members.get(mid)
+        if not m:
+            continue
+        u = users.get(m.user_id)
+        st = states.get(mid)
+        last = rs[-1]
+        ms = mss.get(last.membership_id) or (st.current if st else None)
+        it = {"member": {"id": m.id, "name": m.display_name, "member_code": m.member_code, "phone": u.phone if u else None,
+                         "photo_url": storage.public_url(u.photo_url) if u else None},
+              "attempts": len(rs), "days": len({r.local_date for r in rs}),
+              "results": dict(Counter(r.result for r in rs)), "last_result": last.result,
+              "first_at": iso(rs[0].at), "last_at": iso(last.at),
+              "methods": sorted({r.method for r in rs}),
+              "plan_name": ms.plan_name if ms else None, "plan_end_date": ms.end_date.isoformat() if ms else None,
+              "days_since_expiry": (today - ms.end_date).days if ms and ms.end_date < today else None,
+              "status_now": st.status if st else None, "renewed": bool(st and st.status in LIVE),
+              "successful_checkins_in_range": int(got_in.get(mid, 0))}
+        if ctx.can_pay and st:
+            it["due_paise"] = st.due_paise
+        out.append(it)
+    # still not renewed first, newest attempt first within each group
+    out = sorted([x for x in out if not x["renewed"]], key=lambda x: x["last_at"], reverse=True) + \
+        sorted([x for x in out if x["renewed"]], key=lambda x: x["last_at"], reverse=True)
+    totals = {"members": len(out), "attempts": sum(x["attempts"] for x in out),
+              "not_renewed": sum(1 for x in out if not x["renewed"]), "renewed": sum(1 for x in out if x["renewed"]),
+              "unknown_attempts": unknown,
+              "by_result": dict(Counter(r.result for r in rows))}
+    if ctx.can_pay:
+        totals["due_paise"] = sum(x.get("due_paise", 0) for x in out if not x["renewed"])
+    return {"range": range, "kind": kind, "from": start.isoformat(), "to": today.isoformat(), "items": out, "totals": totals}
 
 
 @router.get("/gyms/{gymId}/checkins/stats", response_model=CheckinStatsOut,

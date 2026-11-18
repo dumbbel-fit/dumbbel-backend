@@ -31,7 +31,7 @@ from app.responses import DocRoute, ERRORS, NoteListOut, NoteOut, MemberCheckins
 router = APIRouter(tags=["Members & memberships"], route_class=DocRoute, responses=ERRORS)
 
 StatusFilter = Literal["all", "active", "expiring", "expired", "frozen", "suspended", "upcoming", "cancelled",
-                       "no_plan", "dues", "away", "not_on_app", "archived"]
+                       "no_plan", "dues", "away", "not_on_app", "archived", "new_month", "renewed_month"]
 TAB_KEYS = ["all", "active", "expiring", "expired", "frozen", "suspended", "upcoming", "cancelled", "no_plan", "away",
             "not_on_app", "archived"]
 
@@ -113,6 +113,22 @@ def list_item(m: GymMember, u: User, st, today, can_pay: bool) -> dict:
     return it
 
 
+def month_member_ids(db: Session, gym, today, which: str) -> set[str]:
+    """Same rules as the home screen's “New this month” / “Renewals” numbers."""
+    start = local_midnight_utc(today.replace(day=1), gym.timezone)
+    if which == "new_month":
+        return set(db.scalars(select(GymMember.id).where(GymMember.gym_id == gym.id, GymMember.created_at >= start,
+                                                         GymMember.source != "import")))
+    out = set()
+    for mid, created in db.execute(select(Membership.member_id, Membership.created_at).where(
+            Membership.gym_id == gym.id, Membership.created_at >= start, Membership.source == "manual",
+            Membership.state != "cancelled")).all():
+        if db.scalar(select(Membership.id).where(Membership.member_id == mid, Membership.created_at < created,
+                                                 Membership.state != "cancelled").limit(1)):
+            out.add(mid)
+    return out
+
+
 def _filtered(db: Session, ctx: GymCtx, q, status, sort):
     gym = ctx.gym
     today = today_in(gym.timezone)
@@ -123,7 +139,11 @@ def _filtered(db: Session, ctx: GymCtx, q, status, sort):
         enriched = [e for e in enriched if matches(q, e[0], e[1])]
     keys = TAB_KEYS + (["dues"] if ctx.can_pay else [])
     counts = {k: sum(1 for *_, t in enriched if k in t) for k in keys}
-    sel = [e for e in enriched if status in e[3]]
+    if status in ("new_month", "renewed_month"):
+        ids = month_member_ids(db, gym, today, status)
+        sel = [e for e in enriched if e[0].id in ids]
+    else:
+        sel = [e for e in enriched if status in e[3]]
     if sort == "expiry":
         sel.sort(key=lambda e: (e[2].current is None, e[2].current.end_date if e[2].current else today,
                                 e[0].display_name.lower()))

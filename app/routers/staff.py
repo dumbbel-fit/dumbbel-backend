@@ -18,7 +18,7 @@ from app.services.storage import public_url
 from app.services.core import get_or_create_user
 from app.services.cache import rate_limit
 from app.permissions import PERMISSIONS, ROLE_PRESETS, effective_permissions
-from app.services.rules import LIVE, days_left, hour_label, load_states
+from app.services.rules import LIVE, PLAN_DENIALS, days_left, hour_label, load_states
 from app.utils import (clamp_limit, decode_cursor, encode_cursor, first_name, iso, local_midnight_utc,
                        normalize_phone, rupees, today_in, tz, utcnow)
 
@@ -263,6 +263,21 @@ def build_insights(db: Session, ctx: GymCtx) -> dict:
                          "count": len(not_on_app),
                          "rule": "Active members who have never logged in to the member app.",
                          "action": {"type": "open_members", "filter": "not_on_app"}})
+    # people who tried to check in but their plan had run out (or was frozen / cancelled) — last 7 days
+    tried = db.execute(select(Checkin.member_id, func.count()).where(
+        Checkin.gym_id == gym.id, Checkin.local_date >= today - timedelta(days=6), Checkin.result.in_(PLAN_DENIALS),
+        Checkin.member_id.isnot(None)).group_by(Checkin.member_id)).all()
+    tried_ids = [mid for mid, _ in tried]
+    tried_states = load_states(db, gym, tried_ids) if tried_ids else {}
+    turned_away = [mid for mid in tried_ids if mid in tried_states and tried_states[mid].status not in LIVE]
+    if turned_away:
+        k = len(turned_away)
+        insights.insert(0, {"key": "expired_checkins",
+                            "title": f"{k} {'person' if k == 1 else 'people'} tried to check in on an expired plan",
+                            "detail": "In the last 7 days, and still haven’t renewed", "count": k,
+                            "rule": "A check-in was refused in the last 7 days because the plan had expired, was "
+                                    "cancelled, frozen, suspended or not started — and they still have no live plan.",
+                            "action": {"type": "open_denied_checkins", "range": "week"}})
     if hours:
         h, n = hours.most_common(1)[0]
         insights.append({"key": "peak_hour", "title": f"Busiest around {hour_label(h)} on {today.strftime('%A')}s",
@@ -270,7 +285,7 @@ def build_insights(db: Session, ctx: GymCtx) -> dict:
                          "rule": f"Busiest hour on the same weekday over the last 4 weeks.",
                          "action": {"type": "open_checkins"}})
     return {"rows": rows, "states": states, "live": live, "dues": dues, "insights": insights, "renew": renew,
-            "away": away, "today": today}
+            "away": away, "today": today, "turned_away_7d": turned_away}
 
 
 INSIDE_WINDOW_MIN = 90
@@ -300,6 +315,9 @@ def summary(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
     ok_today = [Checkin.gym_id == gym.id, Checkin.local_date == today, Checkin.result == "success"]
     checkins_today = db.scalar(select(func.count(func.distinct(Checkin.member_id))).where(*ok_today)) or 0
     visits_today = db.scalar(select(func.count()).select_from(Checkin).where(*ok_today)) or 0
+    plan_denied_today = db.scalar(select(func.count(func.distinct(Checkin.member_id))).where(
+        Checkin.gym_id == gym.id, Checkin.local_date == today, Checkin.result.in_(PLAN_DENIALS))) or 0
+    first_in = db.scalar(select(Checkin).where(*ok_today).order_by(Checkin.at).limit(1))
     inside_now = db.scalar(select(func.count(func.distinct(Checkin.member_id))).where(
         Checkin.gym_id == gym.id, Checkin.result == "success",
         Checkin.at >= now - timedelta(minutes=INSIDE_WINDOW_MIN))) or 0
@@ -325,7 +343,8 @@ def summary(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
                "expiring_7d": expiring_7d, "expired_count": status_counts.get("expired", 0),
                "frozen_count": status_counts.get("frozen", 0), "suspended_count": status_counts.get("suspended", 0),
                "upcoming_count": status_counts.get("upcoming", 0), "no_plan_count": status_counts.get("no_plan", 0),
-               "dues_count": len(data["dues"]), "dues_members": len(data["dues"])}
+               "dues_count": len(data["dues"]), "dues_members": len(data["dues"]),
+               "plan_denied_today": plan_denied_today, "expired_tried_7d": len(data["turned_away_7d"])}
     if ctx.can_pay:
         day_start = local_midnight_utc(today, gym.timezone)
         lw_start = local_midnight_utc(today - timedelta(days=7), gym.timezone)
@@ -351,8 +370,12 @@ def summary(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
                 it["due_paise"] = st.due_paise
             expiring.append(it)
     expiring.sort(key=lambda x: x["end_date"])
+    first = None
+    if first_in:
+        fm = db.get(GymMember, first_in.member_id) if first_in.member_id else None
+        first = {"at": iso(first_in.at), "member_id": fm.id if fm else None, "name": fm.display_name if fm else None}
     return {"date": today.isoformat(), "gym": {"id": gym.id, "name": gym.name, "status": gym.status},
-            "numbers": numbers, "insights": data["insights"], "expiring": expiring[:20]}
+            "numbers": numbers, "first_in_today": first, "insights": data["insights"], "expiring": expiring[:20]}
 
 
 TEMPLATES = {

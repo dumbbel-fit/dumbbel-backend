@@ -104,6 +104,9 @@ def overview(rng: Range = Query("30d", alias="range"), admin: User = Depends(pla
                 "today": q1(db, "SELECT COUNT(*) FROM checkins WHERE result='success' AND local_date = :td", **P),
                 "unique_members": q1(db, "SELECT COUNT(DISTINCT member_id) FROM checkins WHERE result='success' AND local_date >= :sd", **P),
                 "per_day": round(ci_now / w["n"], 1), "by_method": by_method, "denied": denied,
+                "plan_denied_members": q1(db, f"SELECT COUNT(DISTINCT member_id) FROM checkins WHERE result IN {PLAN_IN} AND local_date >= :sd", **P),
+                "plan_denied_attempts": q1(db, f"SELECT COUNT(*) FROM checkins WHERE result IN {PLAN_IN} AND local_date >= :sd", **P),
+                "plan_denied_today": q1(db, f"SELECT COUNT(DISTINCT member_id) FROM checkins WHERE result IN {PLAN_IN} AND local_date = :td", **P),
                 "self_share_pct": round(by_method.get("self", 0) / ci_now * 100, 1) if ci_now else 0}
 
     g_now = q1(db, "SELECT COALESCE(SUM(amount_paise),0) FROM payments WHERE status='recorded' AND source<>'import' AND paid_at >= :s", **P)
@@ -192,9 +195,19 @@ SELECT g.id, g.name, g.code_prefix, g.city, g.area, g.status, g.is_test, g.creat
   (SELECT COALESCE(SUM(p.amount_paise),0) FROM payments p WHERE p.gym_id=g.id AND p.status='recorded') collected_all,
   (SELECT COALESCE(SUM(p.amount_paise),0) FROM payments p WHERE p.gym_id=g.id AND p.status='recorded' AND p.source='import') imported_all,
   (SELECT w.status FROM gym_whatsapp w WHERE w.gym_id=g.id) whatsapp,
-  (SELECT MAX(a.at) FROM audit_log a WHERE a.gym_id=g.id) last_activity_at
+  (SELECT MAX(a.at) FROM audit_log a WHERE a.gym_id=g.id) last_activity_at,
+  (SELECT COUNT(*) FROM payments p WHERE p.gym_id=g.id AND p.status='recorded' AND p.source<>'import' AND p.paid_at>=:s) payments,
+  (SELECT COUNT(*) FROM memberships m WHERE m.gym_id=g.id AND m.source='manual' AND m.created_at>=:s) sold,
+  (SELECT COUNT(*) FROM memberships m WHERE m.gym_id=g.id AND m.state<>'cancelled' AND m.end_date>=:sd AND m.end_date<:td) ended,
+  (SELECT COUNT(*) FROM memberships m WHERE m.gym_id=g.id AND m.state<>'cancelled' AND m.end_date>=:sd AND m.end_date<:td
+     AND EXISTS (SELECT 1 FROM memberships n WHERE n.member_id=m.member_id AND n.state<>'cancelled' AND n.start_date>m.start_date)) renewed,
+  (SELECT COUNT(*) FROM memberships m WHERE m.gym_id=g.id AND m.state<>'cancelled' AND m.end_date>=:td AND m.end_date<=DATE_ADD(:td, INTERVAL 7 DAY)) expiring_7d,
+  (SELECT COUNT(DISTINCT c.member_id) FROM checkins c WHERE c.gym_id=g.id AND c.result IN ('expired','cancelled','frozen','suspended','not_started') AND c.local_date>=:sd) plan_denied,
+  (SELECT COUNT(DISTINCT c.member_id) FROM checkins c WHERE c.gym_id=g.id AND c.result IN ('expired','cancelled','frozen','suspended','not_started') AND c.local_date=:td) plan_denied_today,
+  (SELECT COUNT(*) FROM users uu JOIN gym_members gm ON gm.user_id=uu.id WHERE gm.gym_id=g.id AND gm.status='active' AND uu.last_login_at>=DATE_SUB(:tu, INTERVAL 30 DAY)) mau
 FROM gyms g LEFT JOIN users u ON u.id = g.owner_user_id"""
 
+PLAN_IN = "('expired','cancelled','frozen','suspended','not_started')"  # check-ins refused because of the plan
 DUES_BY_GYM = DUES_SQL.replace("SELECT COALESCE(SUM(", "SELECT m.gym_id, COALESCE(SUM(", 1) + " GROUP BY m.gym_id"
 
 
@@ -266,7 +279,8 @@ def gym_rows(db: Session, rng: str, status: str | None = None, q: str | None = N
                  gmv=int(r["gmv"]), gmv_prev=int(r["gmv_prev"]), dues_paise=dues.get(r["id"], 0),
                  collected_today=int(r["collected_today"]), collected_month=int(r["collected_month"]),
                  collected_all=int(r["collected_all"]), imported_all=int(r["imported_all"]),
-                 whatsapp=r["whatsapp"] or "not_set_up")
+                 whatsapp=r["whatsapp"] or "not_set_up",
+                 renewal_rate_pct=round(r["renewed"] / r["ended"] * 100, 1) if r["ended"] else None)
         out.append(r)
     return out
 
@@ -302,7 +316,8 @@ def analytics_gyms(rng: Range = Query("30d", alias="range"), sort: Literal["gmv"
            "people": int(people["people"] or 0), "people_on_app": int(people["people_on_app"] or 0),
            "staff": S("staff"), "gmv": S("gmv"), "checkins": S("checkins"), "checkins_today": S("checkins_today"),
            "collected_today": S("collected_today"), "collected_month": S("collected_month"), "collected_all": S("collected_all"),
-           "dues_paise": S("dues_paise"), "whatsapp_connected": sum(1 for r in data if r["whatsapp"] == "connected"),
+           "dues_paise": S("dues_paise"), "sold": S("sold"), "plan_denied": S("plan_denied"),
+           "plan_denied_today": S("plan_denied_today"), "whatsapp_connected": sum(1 for r in data if r["whatsapp"] == "connected"),
            "at_risk": sum(1 for r in data if r["status"] == "active" and r["health"] < 60)}
     tabs = {"live": sum(1 for r in every if not r["is_test"]), "test": sum(1 for r in every if r["is_test"]), "all": len(every)}
     return {"items": page, "test_counts": tabs, "next_cursor": encode_cursor({"o": off + lim}) if off + lim < len(data) else None, "totals": tot}

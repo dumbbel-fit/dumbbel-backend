@@ -10,6 +10,8 @@ from app.models import Checkin, CreditApplication, Gym, Membership, MembershipFr
 from app.utils import local_date_of, today_in, tz
 
 LIVE = ("active", "expiring", "frozen", "suspended")
+# check-in refusals caused by the plan (not by a bad QR / location): what a gym wants to see
+PLAN_DENIALS = ("expired", "cancelled", "frozen", "suspended", "not_started")
 
 
 def freeze_covers(fr: MembershipFreeze, d: date) -> bool:
