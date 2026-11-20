@@ -508,3 +508,135 @@ def ai_summary(rng: Range = Query("30d", alias="range"), refresh: bool = False, 
     out["generated_at"] = utcnow().isoformat()
     cache.set(key, json.dumps(out, default=str), ex=1800)
     return out
+
+
+# ---------- One gym, record by record (read only) ----------
+# Every list a gym has, exactly as stored, for the console's gym page. SELECTs only: nothing here changes data.
+_LAST_MS = """(SELECT m2.id FROM memberships m2 WHERE m2.member_id = gm.id AND m2.state <> 'cancelled'
+               ORDER BY m2.end_date DESC, m2.created_at DESC LIMIT 1)"""
+_PAID = "(SELECT SUM(amount_paise) FROM payments pp WHERE pp.membership_id = m.id AND pp.status='recorded')"
+_CREDIT = "(SELECT SUM(amount_paise) FROM credit_applications ca WHERE ca.membership_id = m.id AND ca.reversed_at IS NULL)"
+RAW = {
+    "members": dict(
+        sql=f"""SELECT gm.id, gm.member_code code, gm.display_name name, u.phone, gm.status, gm.source, gm.joined_on,
+                gm.last_checkin_at, gm.pt_enabled pt, gm.pt_trainer trainer, gm.pt_fee_paise pt_fee_paise,
+                (gm.user_id IS NOT NULL AND u.last_login_at IS NOT NULL) on_app, gm.wa_opted_out_at,
+                m.plan_name plan, m.start_date, m.end_date, CASE WHEN m.id IS NULL THEN NULL WHEN m.state='cancelled' THEN 'cancelled' WHEN m.suspended_at IS NOT NULL AND m.end_date >= DATE(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE)) THEN 'suspended'
+                WHEN m.state='frozen' THEN 'frozen' WHEN m.start_date > DATE(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE)) THEN 'upcoming' WHEN m.end_date < DATE(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE)) THEN 'expired' ELSE 'active' END plan_state, m.price_paise,
+                GREATEST(0, COALESCE(m.price_paise,0) - COALESCE({_PAID},0) - COALESCE({_CREDIT},0)) due_paise,
+                (SELECT SUM(amount_paise) FROM payments p3 WHERE p3.member_id = gm.id AND p3.status='recorded') paid_all_paise,
+                (SELECT COUNT(*) FROM checkins c3 WHERE c3.member_id = gm.id AND c3.result='success') visits,
+                gm.created_at
+                FROM gym_members gm JOIN users u ON u.id = gm.user_id LEFT JOIN memberships m ON m.id = {_LAST_MS}
+                WHERE gm.gym_id = :g {{w}} ORDER BY gm.created_at DESC""",
+        q="(gm.display_name LIKE :q OR u.phone LIKE :q OR gm.member_code LIKE :q)",
+        cols=["code", "name", "phone", "status", "plan", "start_date", "end_date", "plan_state", "price_paise", "due_paise",
+              "paid_all_paise", "visits", "last_checkin_at", "pt", "trainer", "pt_fee_paise", "on_app", "source", "joined_on"]),
+    "memberships": dict(
+        sql=f"""SELECT m.id, gm.display_name name, u.phone, m.plan_name plan, m.start_date, m.end_date, CASE WHEN m.id IS NULL THEN NULL WHEN m.state='cancelled' THEN 'cancelled' WHEN m.suspended_at IS NOT NULL AND m.end_date >= DATE(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE)) THEN 'suspended'
+                WHEN m.state='frozen' THEN 'frozen' WHEN m.start_date > DATE(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE)) THEN 'upcoming' WHEN m.end_date < DATE(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 330 MINUTE)) THEN 'expired' ELSE 'active' END state, m.price_paise,
+                m.discount_paise, COALESCE({_PAID},0) paid_paise,
+                GREATEST(0, m.price_paise - COALESCE({_PAID},0) - COALESCE({_CREDIT},0)) due_paise,
+                m.source, m.cancel_reason, m.suspended_at, m.created_at
+                FROM memberships m JOIN gym_members gm ON gm.id = m.member_id JOIN users u ON u.id = gm.user_id
+                WHERE m.gym_id = :g {{w}} ORDER BY m.created_at DESC""",
+        q="(gm.display_name LIKE :q OR u.phone LIKE :q OR m.plan_name LIKE :q)",
+        cols=["name", "phone", "plan", "start_date", "end_date", "state", "price_paise", "discount_paise", "paid_paise",
+              "due_paise", "source", "cancel_reason", "created_at"]),
+    "payments": dict(
+        sql="""SELECT p.id, p.receipt_no, p.paid_at, gm.display_name name, u.phone, p.amount_paise, p.method, p.source,
+               p.status, p.reference, m.plan_name plan, p.void_reason, ru.name recorded_by, p.note
+               FROM payments p JOIN gym_members gm ON gm.id = p.member_id JOIN users u ON u.id = gm.user_id
+               LEFT JOIN memberships m ON m.id = p.membership_id LEFT JOIN users ru ON ru.id = p.recorded_by
+               WHERE p.gym_id = :g {w} ORDER BY p.paid_at DESC""",
+        q="(gm.display_name LIKE :q OR u.phone LIKE :q OR p.receipt_no LIKE :q OR p.reference LIKE :q)",
+        cols=["paid_at", "receipt_no", "name", "phone", "amount_paise", "method", "source", "status", "reference", "plan",
+              "recorded_by", "void_reason", "note"]),
+    "checkins": dict(
+        sql="""SELECT c.id, c.at, gm.display_name name, u.phone, c.method, c.result, m.plan_name plan, m.end_date plan_end_date,
+               su.name staff
+               FROM checkins c LEFT JOIN gym_members gm ON gm.id = c.member_id LEFT JOIN users u ON u.id = gm.user_id
+               LEFT JOIN memberships m ON m.id = c.membership_id LEFT JOIN users su ON su.id = c.staff_user_id
+               WHERE c.gym_id = :g {w} ORDER BY c.at DESC""",
+        q="(gm.display_name LIKE :q OR u.phone LIKE :q OR c.result LIKE :q)",
+        cols=["at", "name", "phone", "method", "result", "plan", "plan_end_date", "staff"]),
+    "upi": dict(
+        sql="""SELECT r.id, r.created_at, gm.display_name name, u.phone, r.amount_paise, r.status, r.created_via, r.purpose,
+               r.vpa, r.utr, r.claimed_at, r.decided_at, r.reject_reason, p.receipt_no
+               FROM upi_payment_requests r JOIN gym_members gm ON gm.id = r.member_id JOIN users u ON u.id = gm.user_id
+               LEFT JOIN payments p ON p.id = r.payment_id
+               WHERE r.gym_id = :g {w} ORDER BY r.created_at DESC""",
+        q="(gm.display_name LIKE :q OR u.phone LIKE :q OR r.utr LIKE :q OR r.status LIKE :q)",
+        cols=["created_at", "name", "phone", "amount_paise", "status", "created_via", "purpose", "vpa", "utr", "claimed_at",
+              "decided_at", "receipt_no", "reject_reason"]),
+    "whatsapp": dict(
+        sql="""SELECT w.id, w.created_at, gm.display_name name, w.phone, w.event, w.category, w.status, w.attempts,
+               w.error, w.sent_at, w.delivered_at, w.trigger, w.body
+               FROM wa_messages w LEFT JOIN gym_members gm ON gm.id = w.member_id
+               WHERE w.gym_id = :g {w} ORDER BY w.created_at DESC""",
+        q="(gm.display_name LIKE :q OR w.phone LIKE :q OR w.event LIKE :q OR w.status LIKE :q)",
+        cols=["created_at", "name", "phone", "event", "status", "attempts", "sent_at", "delivered_at", "error", "trigger", "body"]),
+    "plans": dict(
+        sql="""SELECT pl.id, pl.name, pl.duration_days, pl.price_paise, pl.offer_price_paise, pl.joining_fee_paise, pl.active,
+               (SELECT COUNT(*) FROM memberships m WHERE m.plan_id = pl.id AND m.state <> 'cancelled') sold, pl.created_at
+               FROM plans pl WHERE pl.gym_id = :g {w} ORDER BY pl.sort_order, pl.name""",
+        q="(pl.name LIKE :q)",
+        cols=["name", "duration_days", "price_paise", "offer_price_paise", "joining_fee_paise", "active", "sold"]),
+    "staff": dict(
+        sql="""SELECT s.id, u.name, u.phone, s.role, s.staff_role, s.status, s.can_record_payments, s.joined_at, u.last_login_at
+               FROM gym_staff s JOIN users u ON u.id = s.user_id WHERE s.gym_id = :g {w} ORDER BY s.role, u.name""",
+        q="(u.name LIKE :q OR u.phone LIKE :q)",
+        cols=["name", "phone", "role", "staff_role", "status", "can_record_payments", "joined_at", "last_login_at"]),
+    "activity": dict(
+        sql="""SELECT a.id, a.at, au.name actor, a.action, a.entity_type, a.summary
+               FROM audit_log a LEFT JOIN users au ON au.id = a.actor_user_id WHERE a.gym_id = :g {w} ORDER BY a.id DESC""",
+        q="(a.summary LIKE :q OR a.action LIKE :q OR au.name LIKE :q)",
+        cols=["at", "actor", "action", "entity_type", "summary"]),
+}
+RawKind = Literal["members", "memberships", "payments", "checkins", "upi", "whatsapp", "plans", "staff", "activity"]
+
+
+def _plain(v):
+    if isinstance(v, datetime):
+        return iso(v.replace(tzinfo=timezone.utc))
+    if isinstance(v, date):
+        return v.isoformat()
+    if hasattr(v, "is_integer"):  # Decimal / float sums
+        return int(v) if float(v).is_integer() else float(v)
+    return v
+
+
+def _raw(db: Session, gymId: str, kind: str, q: str | None, limit: int | None, offset: int):
+    if not db.execute(text("SELECT 1 FROM gyms WHERE id=:g"), {"g": gymId}).scalar():
+        raise ApiError(404, "NOT_FOUND", "That gym wasn’t found.")
+    spec = RAW[kind]
+    p = {"g": gymId}
+    w = ""
+    if q and q.strip():
+        w, p["q"] = f"AND {spec['q']}", f"%{q.strip()}%"
+    sql = spec["sql"].format(w=w)
+    total = db.execute(text(f"SELECT COUNT(*) FROM ({sql}) t"), p).scalar() or 0
+    if limit:
+        sql += f" LIMIT {int(limit)} OFFSET {int(offset)}"
+    out = [{k: _plain(v) for k, v in r._mapping.items()} for r in db.execute(text(sql), p)]
+    return out, total, spec["cols"]
+
+
+@router.get("/gyms/{gymId}/raw/{kind}", summary="One gym's records as stored: members, memberships, payments, check-ins, UPI, WhatsApp, plans, staff, activity")
+def gym_raw(gymId: str, kind: RawKind, q: str | None = None, limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0),
+            admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
+    items, total, cols = _raw(db, gymId, kind, q, limit, offset)
+    return {"kind": kind, "items": items, "total": total, "columns": cols, "offset": offset,
+            "next_offset": offset + len(items) if offset + len(items) < total else None}
+
+
+@router.get("/gyms/{gymId}/raw-csv/{kind}", summary="Download one of a gym's record lists as CSV", responses={200: {"content": {"text/csv": {}}}})
+def gym_raw_csv(gymId: str, kind: RawKind, q: str | None = None, admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
+    items, _, cols = _raw(db, gymId, kind, q, None, 0)
+    buf = io.StringIO()
+    wr = csv.writer(buf)
+    wr.writerow([c.replace("_paise", " (₹)").replace("_", " ") for c in cols])
+    for r in items:
+        wr.writerow([(f"{r[c] / 100:.2f}" if c.endswith("_paise") and r.get(c) is not None else ("" if r.get(c) is None else r[c])) for c in cols])
+    return Response("﻿" + buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="gym-{kind}-{date.today().isoformat()}.csv"'})
