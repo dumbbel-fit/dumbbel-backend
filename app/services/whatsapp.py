@@ -894,6 +894,17 @@ def revive_waiting(db: Session, gym_id: str) -> int:
         WaMessage.trigger == "auto", or_(WaMessage.event == LIVE_EVENT, WaMessage.created_at >= cutoff))
         .values(status="queued", next_attempt_at=utcnow(), error=None, error_code=None, attempts=0, failed_at=None)
         .execution_options(synchronize_session=False))
+    return (r.rowcount or 0) + wake_backed_off(db, gym_id)
+
+
+def wake_backed_off(db: Session, gym_id: str) -> int:
+    """The link works now: messages that failed a try while it didn't (link server down, reconnecting) go out
+    now instead of waiting for their next retry slot (up to 2 hours away). Quiet-hour holds carry no error and are
+    left alone. Caller commits."""
+    r = db.execute(update(WaMessage).where(
+        WaMessage.gym_id == gym_id, WaMessage.status == "queued", WaMessage.error_code.is_not(None),
+        WaMessage.next_attempt_at > utcnow(), WaMessage.created_at >= utcnow() - timedelta(hours=WAITING_HOURS))
+        .values(next_attempt_at=utcnow(), attempts=0).execution_options(synchronize_session=False))
     return r.rowcount or 0
 
 
@@ -1153,7 +1164,10 @@ def _watch_one(gym_id: str) -> int:
         cfg.checked_at = now
         if state == "open":
             if cfg.status == "connected" and not cfg.link_lost_at:
-                return 0
+                if wake_backed_off(db, gym_id):   # e.g. the link server itself was down for a while
+                    log.info("wa link %s: retrying messages that failed while the link server was down", gym_id[:8])
+                    nudge = True
+                return 0 if not nudge else 1
             back = cfg.status != "connected"
             log.info("wa link %s: online again (was %s)", gym_id[:8], cfg.status)
             if back:
@@ -1219,6 +1233,9 @@ def handle_evolution(payload: dict, gym_id: str) -> dict:
                 if cfg.status != "connected":
                     cfg.connected_at = utcnow()
                     onboard_later(gym_id)
+                elif wake_backed_off(db, gym_id):
+                    from app.services.jobs import enqueue
+                    enqueue("wa.send_now", process_queue)
                 cfg.status, cfg.last_error, cfg.checked_at, cfg.link_lost_at = "connected", None, utcnow(), None
             elif state == "close":
                 reason = data.get("statusReason")
