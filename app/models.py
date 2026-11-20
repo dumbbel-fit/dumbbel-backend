@@ -205,6 +205,10 @@ class GymMember(Base):
     claim_dispute_note: Mapped[str | None] = mapped_column(Text)
     wa_opted_out_at = mapped_column(TS, nullable=True)  # member said STOP / staff switched WhatsApp off
     wa_opt_source: Mapped[str | None] = mapped_column(String(16))  # member | staff
+    # personal training (info only: the fee is what the gym charges for PT, not a payment record)
+    pt_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
+    pt_fee_paise: Mapped[int | None] = mapped_column(Integer)
+    pt_trainer: Mapped[str | None] = mapped_column(String(120))
     created_at = created()
     updated_at = updated()
     __table_args__ = (UniqueConstraint("gym_id", "user_id", name="uq_member_gym_user"),

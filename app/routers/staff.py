@@ -344,7 +344,9 @@ def summary(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
                "frozen_count": status_counts.get("frozen", 0), "suspended_count": status_counts.get("suspended", 0),
                "upcoming_count": status_counts.get("upcoming", 0), "no_plan_count": status_counts.get("no_plan", 0),
                "dues_count": len(data["dues"]), "dues_members": len(data["dues"]),
-               "plan_denied_today": plan_denied_today, "expired_tried_7d": len(data["turned_away_7d"])}
+               "plan_denied_today": plan_denied_today, "expired_tried_7d": len(data["turned_away_7d"]),
+               "pt_members": sum(1 for m, _ in data["rows"] if m.pt_enabled),
+               "pt_active_members": sum(1 for m, _ in data["rows"] if m.pt_enabled and states[m.id].status in LIVE)}
     if ctx.can_pay:
         day_start = local_midnight_utc(today, gym.timezone)
         lw_start = local_midnight_utc(today - timedelta(days=7), gym.timezone)
@@ -355,6 +357,7 @@ def summary(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
             "last_week_same_day_paise": _sum_paid(db, gym.id, lw_start, lw_start + timedelta(days=1)),
             "last_week_same_time_paise": _sum_paid(db, gym.id, lw_start, now - timedelta(days=7)),
             "dues_paise": sum(s.due_paise for *_, s in data["dues"]),
+            "pt_fees_paise": sum(m.pt_fee_paise or 0 for m, _ in data["rows"] if m.pt_enabled and states[m.id].status in LIVE),
             "upi_to_verify": db.scalar(select(func.count()).select_from(UpiPaymentRequest).where(
                 UpiPaymentRequest.gym_id == gym.id, UpiPaymentRequest.status == "claimed")) or 0,
         })

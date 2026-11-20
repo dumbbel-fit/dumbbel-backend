@@ -22,7 +22,8 @@ MAX_ROWS = 5000
 MAX_BYTES = 10 * 1024 * 1024
 BATCH = 200
 
-FIELDS = ["name", "phone", "plan", "start_date", "end_date", "paid", "paid_on", "email", "dob", "gender", "notes"]
+FIELDS = ["name", "phone", "plan", "start_date", "end_date", "paid", "paid_on", "email", "dob", "gender", "notes",
+          "pt", "pt_fee", "pt_trainer"]
 SYNONYMS = {
     "name": ["name", "member name", "full name", "customer", "client", "customer name", "client name"],
     "phone": ["mobile", "phone", "contact", "mobile no", "whatsapp", "number", "mobile number", "phone number",
@@ -37,7 +38,12 @@ SYNONYMS = {
     "dob": ["dob", "birthday", "date of birth", "birth date"],
     "gender": ["gender", "sex"],
     "notes": ["notes", "remarks", "note", "comments", "remark"],
+    "pt": ["personal trainer", "personal training", "pt", "pt yes no", "pt taken", "trainer yes no"],
+    "pt_fee": ["pt amount", "pt fee", "pt fees", "pt charges", "pt price", "personal training fee",
+               "personal training amount", "personal trainer fee", "trainer fee", "trainer fees", "trainer amount"],
+    "pt_trainer": ["trainer", "trainer name", "pt trainer", "coach", "coach name", "personal trainer name", "pt name"],
 }
+YES = {"yes", "y", "true", "1", "pt", "taken", "✓", "✔", "x"}
 BLOCKING = {"NAME_MISSING", "PHONE_MISSING", "PHONE_DIGITS", "PHONE_START", "PLAN_UNKNOWN", "DATE_INVALID",
             "END_BEFORE_START", "PAID_INVALID", "DATES_INCOMPLETE"}
 MSG = {
@@ -395,6 +401,12 @@ def normalize_row(raw: dict, mapping: dict, overrides: dict, plans: list[Plan], 
     g = (val.get("gender") or "").strip().lower()
     n["gender"] = {"m": "male", "male": "male", "f": "female", "female": "female", "o": "other", "other": "other"}.get(g)
     n["notes"] = (val.get("notes") or "").strip() or None
+    fee, ok = parse_paid(val.get("pt_fee", ""))
+    n["pt_fee_paise"] = fee if ok and fee else None
+    n["pt_trainer"] = (val.get("pt_trainer") or "").strip()[:120] or None
+    flag = str(val.get("pt") or "").strip().lower()
+    # "Yes" in a PT column, a PT fee above 0, or a trainer's name all mean they take personal training
+    n["pt_enabled"] = flag in YES or bool(n["pt_fee_paise"]) or (bool(n["pt_trainer"]) and flag not in ("no", "n", "0", "false"))
     n["has_membership"] = bool(start and end)
     return n, issues, suggestion
 
@@ -504,6 +516,10 @@ def _commit_row(db: Session, gym: Gym, imp: Import, r: ImportRow, plans_by_id: d
                                joined_on=date.fromisoformat(n["start_date"]) if n.get("start_date") else today)
             db.add(member)
             db.flush()
+    if n.get("pt_enabled"):  # an existing member's PT details are only ever added, never cleared, by an import
+        member.pt_enabled = True
+        member.pt_fee_paise = n.get("pt_fee_paise") or member.pt_fee_paise
+        member.pt_trainer = n.get("pt_trainer") or member.pt_trainer
     ms = None
     if n.get("has_membership") and not n.get("skip_membership"):
         start, end = date.fromisoformat(n["start_date"]), date.fromisoformat(n["end_date"])

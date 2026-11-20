@@ -234,6 +234,10 @@ def ser_payment(p: Payment, member_name: str | None = None, plan_name: str | Non
             "recorded_by": {"id": p.recorded_by, "name": recorder_name}, "note": p.note}
 
 
+def pt_out(m: GymMember) -> dict:
+    return {"enabled": bool(m.pt_enabled), "fee_paise": m.pt_fee_paise, "trainer": m.pt_trainer}
+
+
 def ser_member_basic(m: GymMember, u: User, include_notes: bool = True) -> dict:
     d = {"id": m.id, "member_code": m.member_code, "name": m.display_name, "phone": u.phone, "email": u.email,
          "dob": dstr(u.dob), "gender": u.gender, "photo_url": storage.public_url(u.photo_url),
@@ -241,7 +245,8 @@ def ser_member_basic(m: GymMember, u: User, include_notes: bool = True) -> dict:
          "joined_on": dstr(m.joined_on), "joined_at": dstr(m.joined_on), "last_checkin_at": iso(m.last_checkin_at),
          "last_visit_at": iso(m.last_checkin_at), "on_app": u.first_login_at is not None,
          "claimed_at": iso(m.claimed_at), "claim_disputed_at": iso(m.claim_disputed_at), "created_at": iso(m.created_at),
-         "wa_opted_out": m.wa_opted_out_at is not None, "wa_opted_out_at": iso(m.wa_opted_out_at), "wa_opt_source": m.wa_opt_source}
+         "wa_opted_out": m.wa_opted_out_at is not None, "wa_opted_out_at": iso(m.wa_opted_out_at), "wa_opt_source": m.wa_opt_source,
+         "pt": pt_out(m)}
     if include_notes:
         d["notes"] = m.notes
     return d

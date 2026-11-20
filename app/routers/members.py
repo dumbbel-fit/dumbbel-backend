@@ -18,7 +18,7 @@ from app.schemas import CancelIn, FreezeIn, MemberCreate, MemberPatch, Membershi
 from app.services.storage import public_url
 from app.services.audit import audit, diff
 from app.services.cache import cache
-from app.services.core import (add_payment, check_duplicate_reference, create_membership, default_start,
+from app.services.core import (pt_out, add_payment, check_duplicate_reference, create_membership, default_start,
                                get_or_create_user, gym_settings, next_member_code, ser_member_basic, settle_credit,
                                ser_membership, ser_payment, user_names, validate_paid_at, validate_reference)
 from app.services.rules import LIVE, days_left, freezes_of, load_states, member_state, membership_due, membership_status, \
@@ -31,9 +31,9 @@ from app.responses import DocRoute, ERRORS, NoteListOut, NoteOut, MemberCheckins
 router = APIRouter(tags=["Members & memberships"], route_class=DocRoute, responses=ERRORS)
 
 StatusFilter = Literal["all", "active", "expiring", "expired", "frozen", "suspended", "upcoming", "cancelled",
-                       "no_plan", "dues", "away", "not_on_app", "archived", "new_month", "renewed_month"]
+                       "no_plan", "dues", "away", "not_on_app", "archived", "new_month", "renewed_month", "pt"]
 TAB_KEYS = ["all", "active", "expiring", "expired", "frozen", "suspended", "upcoming", "cancelled", "no_plan", "away",
-            "not_on_app", "archived"]
+            "not_on_app", "archived", "pt"]
 
 
 def get_member(db: Session, ctx: GymCtx, member_id: str) -> tuple[GymMember, User]:
@@ -97,6 +97,8 @@ def enrich_members(db: Session, ctx: GymCtx, rows, today):
                 tags.add("away")
             if live and u.first_login_at is None:
                 tags.add("not_on_app")
+            if m.pt_enabled:
+                tags.add("pt")
         out.append((m, u, st, tags))
     return out
 
@@ -107,7 +109,7 @@ def list_item(m: GymMember, u: User, st, today, can_pay: bool) -> dict:
           "photo_url": public_url(u.photo_url), "on_app": u.first_login_at is not None,
           "status": "archived" if m.status == "archived" else st.status, "source": m.source,
           "joined_at": dstr(m.joined_on), "last_checkin_at": iso(m.last_checkin_at), "last_visit_at": iso(m.last_checkin_at),
-          "current": cur, "current_membership": cur, "has_dues": st.due_paise > 0}
+          "current": cur, "current_membership": cur, "has_dues": st.due_paise > 0, "pt": pt_out(m)}
     if can_pay:
         it["due_paise"] = st.due_paise
     return it
@@ -187,7 +189,7 @@ def export_members(q: str | None = None, status: StatusFilter = "all",
     buf = io.StringIO()
     w = csv.writer(buf)
     head = ["Member code", "Name", "Mobile", "Email", "Gender", "Status", "Plan", "Start", "End", "Days left",
-            "Joined", "Last visit", "On app", "Source"]
+            "Joined", "Last visit", "On app", "Source", "Personal training", "PT fee (₹)", "Trainer"]
     if ctx.can_pay:
         head.append("Due (₹)")
     w.writerow(head)
@@ -198,7 +200,8 @@ def export_members(q: str | None = None, status: StatusFilter = "all",
                dstr(c.start_date) if c else "", dstr(c.end_date) if c else "",
                days_left(c, st.status, today) if c else "", dstr(m.joined_on),
                m.last_checkin_at.astimezone(tz(ctx.gym.timezone)).strftime("%Y-%m-%d %H:%M") if m.last_checkin_at else "",
-               "yes" if u.first_login_at else "no", m.source]
+               "yes" if u.first_login_at else "no", m.source, "yes" if m.pt_enabled else "no",
+               f"{m.pt_fee_paise / 100:.2f}" if m.pt_fee_paise else "", m.pt_trainer or ""]
         if ctx.can_pay:
             row.append(f"{st.due_paise / 100:.2f}")
         w.writerow(row)
@@ -235,7 +238,9 @@ def create_member(body: MemberCreate, ctx: GymCtx = Depends(perm_ctx("members.ed
     today = today_in(gym.timezone)
     member = GymMember(gym_id=gym.id, user_id=user.id, member_code=next_member_code(db, gym.id),
                        display_name=body.name.strip(), source="manual", emergency_contact=body.emergency_contact,
-                       notes=body.notes, status="active", joined_on=today)
+                       notes=body.notes, status="active", joined_on=today,
+                       pt_enabled=bool(body.pt_enabled or body.pt_fee_paise or body.pt_trainer),
+                       pt_fee_paise=body.pt_fee_paise, pt_trainer=(body.pt_trainer or "").strip() or None)
     db.add(member)
     db.flush()
     audit(db, gym.id, ctx.user.id, "member.create", "member", member.id, f"Added member {member.display_name}")
@@ -392,9 +397,13 @@ def patch_member(memberId: str, body: MemberPatch, ctx: GymCtx = Depends(perm_ct
             u = db.get(User, m.user_id)
     if "name" in data and data["name"]:
         m.display_name = data["name"].strip()
-    for f in ("emergency_contact", "notes"):
+    for f in ("emergency_contact", "notes", "pt_fee_paise"):
         if f in data:
             setattr(m, f, data[f])
+    if "pt_enabled" in data:
+        m.pt_enabled = bool(data["pt_enabled"])
+    if "pt_trainer" in data:
+        m.pt_trainer = (data["pt_trainer"] or "").strip() or None
     on_app = u.first_login_at is not None
     for f in ("email", "dob", "gender"):
         if f in data and not (on_app and data[f] is None):

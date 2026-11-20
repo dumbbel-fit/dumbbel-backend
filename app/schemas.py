@@ -169,6 +169,9 @@ class MemberCreate(BaseModel):
     emergency_contact: str | None = None
     notes: str | None = None
     photo_key: str | None = None
+    pt_enabled: bool | None = Field(None, description="Takes personal training")
+    pt_fee_paise: int | None = Field(None, ge=0, le=10_000_000, description="Personal training fee (info only)")
+    pt_trainer: str | None = Field(None, max_length=120, description="Trainer's name")
     membership: MembershipInline | None = None
     payment: PaymentInline | None = None
 
@@ -181,6 +184,9 @@ class MemberPatch(StrictModel):
     emergency_contact: str | None = None
     notes: str | None = None
     photo_key: str | None = None
+    pt_enabled: bool | None = Field(None, description="Takes personal training")
+    pt_fee_paise: int | None = Field(None, ge=0, le=10_000_000, description="Personal training fee (info only)")
+    pt_trainer: str | None = Field(None, max_length=120, description="Trainer's name")
     status: Literal["archived", "active"] | None = None
     phone: Phone | None = None
 
