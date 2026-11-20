@@ -27,9 +27,9 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import session_scope
-from app.models import (Gym, GymMember, GymUpiAccount, GymWhatsApp, Membership, Payment, Plan, RenewalToken, User,
+from app.models import (AuditLog, Gym, GymMember, GymUpiAccount, GymWhatsApp, Membership, Payment, Plan, RenewalToken, User,
                         WaMessage, WaTemplate)
-from app.utils import local_midnight_utc, rupees, today_in, utcnow, uuid7
+from app.utils import iso, local_midnight_utc, rupees, today_in, utcnow, uuid7
 
 log = logging.getLogger("dumbbel.whatsapp")
 
@@ -664,7 +664,12 @@ def fire(gym_id: str, event: str, member_id: str, membership_id: str | None = No
             if not gym or not member or member.gym_id != gym_id:
                 return
             ms = db.get(Membership, membership_id) if membership_id else latest_membership(db, member_id)
-            m, _ = queue_message(db, gym, member, event, ms=ms, dedupe=dedupe, extra=extra, cfg=cfg, offline=not online)
+            m, why = queue_message(db, gym, member, event, ms=ms, dedupe=dedupe, extra=extra, cfg=cfg, offline=not online)
+            if why and why != "duplicate":  # keep the reason, so "why didn't they get it?" has an answer
+                from app.services.audit import audit
+                audit(db, gym_id, None, "whatsapp.not_sent", "member", member_id,
+                      f"WhatsApp “{EVENTS.get(event, {}).get('label', event)}” not sent to {member.display_name}: "
+                      f"{SKIP.get(why, why)}", after={"event": event, "reason": why})
         if m is not None and online:
             from app.services.jobs import enqueue
             enqueue("wa.send_now", process_queue)   # don't wait for the next sender tick
@@ -683,6 +688,59 @@ def fire_later(gym_id: str, event: str, member_id: str, membership_id: str | Non
         time.sleep(1.5)  # let the request that triggered this commit first
         fire(gym_id, event, member_id, membership_id, extra, dedupe)
     enqueue("wa.trigger", run)
+
+
+# ---------------------------------------------------------------- "why didn't they get the welcome?"
+def welcome_status(db: Session, gym: Gym, member: GymMember, user: User | None, cfg: GymWhatsApp | None) -> dict:
+    """The welcome's state for one member, with a plain reason when it never went out."""
+    msgs = db.scalars(select(WaMessage).where(WaMessage.gym_id == gym.id, WaMessage.member_id == member.id,
+                                              WaMessage.event.in_(("welcome", "renewal_confirmed")))
+                      .order_by(WaMessage.created_at)).all()
+    w = next((m for m in msgs if m.event == "welcome"), None)
+
+    def out(state, code, reason, m=None):
+        return {"state": state, "code": code, "reason": reason, "message_id": m.id if m else None,
+                "at": iso(m.created_at) if m else None}
+    if w:
+        if w.status in ("sent", "delivered", "read"):
+            return out("sent", w.status, {"sent": "Sent (not yet delivered to the phone)", "delivered": "Delivered",
+                                          "read": "Delivered and read"}[w.status], w)
+        if w.status in ("queued", "sending"):
+            return out("sending", w.error_code or "queued",
+                       "Waiting for WhatsApp to reconnect" if w.error_code == "reconnecting" else "Being sent now", w)
+        if w.status == "cancelled" and w.error_code == "disconnected":
+            return out("not_sent", "disconnected", "WhatsApp was disconnected when they were added. "
+                       "It goes out automatically if WhatsApp is linked again within 24 hours; after that, send it by hand.", w)
+        return out("not_sent", w.error_code or w.status, w.error or "WhatsApp couldn’t deliver it", w)
+    renewed = next((m for m in msgs if m.event == "renewal_confirmed"), None)
+    if renewed:
+        return out("not_needed", "had_plan_before", "They had a plan here before, so they got “membership confirmed” "
+                   "instead of a welcome", renewed)
+    if not db.scalar(select(Membership.id).where(Membership.member_id == member.id).limit(1)):
+        return out("not_sent", "no_plan", "They were added without a plan. The welcome goes out when their first "
+                   "plan is added (it says the plan and its end date).")
+    if member.source == "import":
+        return out("not_sent", "imported", "Imported members don’t get a welcome automatically (they may be old "
+                   "members). Send it by hand if they’re new.")
+    if not cfg or not cfg.connected_at:
+        return out("not_sent", "not_linked", "WhatsApp isn’t linked for this gym")
+    if member.created_at and cfg.connected_at and member.created_at < cfg.connected_at:
+        return out("not_sent", "before_linked", "WhatsApp was linked (or linked again) after they were added, so it probably wasn’t connected at that moment")
+    logged = db.scalar(select(AuditLog).where(AuditLog.gym_id == gym.id, AuditLog.action == "whatsapp.not_sent",
+                                              AuditLog.entity_id == member.id).order_by(AuditLog.id.desc()).limit(1))
+    if logged and (logged.after or {}).get("event") == "welcome":
+        r = logged.after.get("reason")
+        return out("not_sent", r, SKIP.get(r, r))
+    if not wa_settings(cfg)["automations"].get("welcome", False):
+        return out("not_sent", "automation_off", "The “New member welcome” automation is switched off")
+    if member.wa_opted_out_at is not None:
+        return out("not_sent", "opted_out", SKIP["opted_out"])
+    if not wa_number(user.phone if user else None):
+        return out("not_sent", "no_phone", SKIP["no_phone"])
+    if member.status != "active":
+        return out("not_sent", "archived", SKIP["archived"])
+    return out("not_sent", "unknown", "No welcome was queued for them and no reason was recorded (before "
+               "20 Nov 2026 skips weren’t logged). Most likely WhatsApp wasn’t connected at that moment.")
 
 
 # ---------------------------------------------------------------- who is eligible

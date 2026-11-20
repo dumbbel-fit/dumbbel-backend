@@ -789,6 +789,37 @@ class OptIn(BaseModel):
     opted_out: bool
 
 
+@router.get("/gyms/{gymId}/members/{memberId}/whatsapp",
+            summary="One member's WhatsApp: did the welcome go out (and why not), and every message sent to them",
+            description="`welcome.state`: sent · sending · not_sent · not_needed, with `code` and a plain `reason`. "
+                        "`not_sent_log`: automatic messages that were skipped for this member, with the reason "
+                        "(recorded from 20 Nov 2026).")
+def member_whatsapp(memberId: str, ctx: GymCtx = Depends(perm_ctx(VIEW)), db: Session = Depends(get_db)):
+    from app.models import AuditLog
+    gym = ctx.gym
+    m = db.get(GymMember, memberId)
+    if not m or m.gym_id != gym.id:
+        raise ApiError(404, "NOT_FOUND", "That member wasn’t found.")
+    u = db.get(User, m.user_id)
+    cfg = wa.get_config(db, gym.id)
+    rows = db.scalars(select(WaMessage).where(WaMessage.gym_id == gym.id, WaMessage.member_id == m.id)
+                      .order_by(WaMessage.created_at.desc()).limit(30)).all()
+    plans = {x.id: x.plan_name for x in db.scalars(select(Membership).where(
+        Membership.id.in_([r.membership_id for r in rows if r.membership_id] or [""])))}
+    skipped = db.scalars(select(AuditLog).where(AuditLog.gym_id == gym.id, AuditLog.action == "whatsapp.not_sent",
+                                                AuditLog.entity_id == m.id).order_by(AuditLog.id.desc()).limit(20)).all()
+    welcome = wa.welcome_status(db, gym, m, u, cfg)
+    welcome["can_send_now"] = (welcome["state"] == "not_sent" and wa.is_connected(cfg) and gym.status == "active"
+                               and welcome["code"] not in ("no_plan", "opted_out", "no_phone", "archived"))
+    return {"connection": {"status": cfg.status if cfg else "not_set_up", "connected": wa.is_connected(cfg),
+                           "provider": cfg.provider if cfg else None,
+                           "reconnecting": bool(cfg and cfg.status == "connected" and getattr(cfg, "link_lost_at", None))},
+            "welcome": welcome,
+            "messages": [ser_msg(r, m.display_name, plans.get(r.membership_id)) for r in rows],
+            "not_sent_log": [{"at": iso(a.at), "event": (a.after or {}).get("event"), "reason": (a.after or {}).get("reason"),
+                              "summary": a.summary} for a in skipped]}
+
+
 @router.post("/gyms/{gymId}/members/{memberId}/whatsapp-opt", summary="Switch WhatsApp messages off/on for a member (members.edit)")
 def member_opt(memberId: str, body: OptIn, ctx: GymCtx = Depends(perm_ctx(SEND)), db: Session = Depends(get_db)):
     gm = db.get(GymMember, memberId)
