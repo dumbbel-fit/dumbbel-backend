@@ -507,6 +507,8 @@ def bulk_members(body: BulkMembersIn, ctx: GymCtx = Depends(perm_ctx("members.ed
         if len(name) < 2:
             raise validation({"people": "Enter the full name of every person."})
         user, _ = get_or_create_user(db, ph, name)
+        if p.photo_key:  # a photo the desk just took or picked is always saved (same as Add member)
+            user.photo_url = p.photo_key
         m = db.scalar(select(GymMember).where(GymMember.gym_id == gym.id, GymMember.user_id == user.id))
         existing = m is not None
         if not existing:

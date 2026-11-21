@@ -157,6 +157,7 @@ class PaymentInline(BaseModel):
 class BulkPerson(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     phone: Phone  # {country, number} like Add member, or a plain number
+    photo_key: str | None = Field(None, description="From POST /uploads/presign with purpose member_photo")
 
 
 class BulkMembersIn(BaseModel):
