@@ -195,8 +195,7 @@ def ser_plan(p: Plan, active_members: int | None = None) -> dict:
          "joining_fee_paise": p.joining_fee_paise, "gst_mode": p.gst_mode, "gst_rate": p.gst_rate,
          "facilities": p.facilities or [], "description": p.description, "freeze_allowed": p.freeze_allowed,
          "max_freeze_days": p.max_freeze_days, "cancellation_policy": p.cancellation_policy,
-         "refund_policy": p.refund_policy, "active": p.active, "sort_order": p.sort_order,
-         "group_size": p.group_size, "group_total_paise": plan_price(p) * p.group_size if p.group_size else None}
+         "refund_policy": p.refund_policy, "active": p.active, "sort_order": p.sort_order}
     if active_members is not None:
         d["active_members"] = active_members
     return d
@@ -213,7 +212,7 @@ def ser_membership(m: Membership, gym: Gym, db: Session | None = None, status: s
          "days_left": days_left(m, st, today), "source": m.source, "cancelled_at": iso(m.cancelled_at),
          "cancel_reason": m.cancel_reason, "suspended_at": iso(m.suspended_at), "suspend_reason": m.suspend_reason,
          "created_at": iso(m.created_at), "group_id": m.group_id}
-    if m.group_id and db is not None:  # the other people who joined on the same group plan
+    if m.group_id and db is not None:  # the other people this plan was assigned together with
         d["group"] = [{"member_id": mid, "name": nm} for mid, nm in db.execute(
             select(GymMember.id, GymMember.display_name).join(Membership, Membership.member_id == GymMember.id)
             .where(Membership.group_id == m.group_id, Membership.id != m.id)).all()]

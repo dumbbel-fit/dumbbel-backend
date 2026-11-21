@@ -237,7 +237,7 @@ class Plan(Base):
     max_freeze_days: Mapped[int | None] = mapped_column(Integer)  # per-plan override of the gym setting
     cancellation_policy: Mapped[str | None] = mapped_column(Text)
     refund_policy: Mapped[str | None] = mapped_column(Text)
-    group_size: Mapped[int | None] = mapped_column(SmallInteger)  # 2+ = group plan; price_paise is per person
+    group_size: Mapped[int | None] = mapped_column(SmallInteger)  # no longer used (group plans were removed); kept so no data is dropped
     active_name_key = mapped_column(String(120), Computed("IF(active, LOWER(name), NULL)", persisted=True))
     created_at = created()
     updated_at = updated()
@@ -267,7 +267,7 @@ class Membership(Base):
     suspended_at = mapped_column(TS, nullable=True)  # access paused, days keep running
     suspended_by: Mapped[str | None] = mapped_column(String(36))
     suspend_reason: Mapped[str | None] = mapped_column(Text)
-    group_id: Mapped[str | None] = mapped_column(String(36))  # memberships bought together on a group plan
+    group_id: Mapped[str | None] = mapped_column(String(36))  # memberships assigned together (Add member → Custom)
     created_at = created()
     updated_at = updated()
     __table_args__ = (Index("ix_ms_gym_end", "gym_id", "end_date"),)
@@ -471,6 +471,30 @@ class GymUpiAccount(Base):
     created_at = created()
     updated_at = updated()
     __table_args__ = (UniqueConstraint("gym_id", "vpa", name="uq_gym_vpa"),)
+
+
+class StaffShift(Base):
+    """A staff member's day at the gym: check-in and check-out from their phone, with where they were at that moment
+    (only at those two moments; nothing is tracked in between)."""
+    __tablename__ = "staff_shifts"
+    id: Mapped[str] = pk()
+    gym_id: Mapped[str] = fk("gyms.id", index=True)
+    staff_id: Mapped[str] = fk("gym_staff.id", index=True)
+    user_id: Mapped[str] = fk("users.id")
+    local_date = mapped_column(Date, nullable=False)
+    in_at = mapped_column(TS, nullable=False)
+    in_lat = mapped_column(Numeric(9, 6), nullable=True)
+    in_lng = mapped_column(Numeric(9, 6), nullable=True)
+    in_accuracy_m: Mapped[int | None] = mapped_column(Integer)
+    in_distance_m: Mapped[int | None] = mapped_column(Integer)  # from the gym; null = gym location not set or not shared
+    out_at = mapped_column(TS, nullable=True)
+    out_lat = mapped_column(Numeric(9, 6), nullable=True)
+    out_lng = mapped_column(Numeric(9, 6), nullable=True)
+    out_accuracy_m: Mapped[int | None] = mapped_column(Integer)
+    out_distance_m: Mapped[int | None] = mapped_column(Integer)
+    created_at = created()
+    updated_at = updated()
+    __table_args__ = (Index("ix_shift_gym_date", "gym_id", "local_date"),)
 
 
 class UpiPaymentRequest(Base):

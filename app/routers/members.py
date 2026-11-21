@@ -14,7 +14,7 @@ from app.deps import GymCtx, Idem, current_user, gym_ctx, idem_header, load_gym_
 from app.errors import ApiError, validation
 from app.models import (Checkin, GymMember, GymStaff, MemberNote, Membership, MembershipFreeze, Payment, Plan,
                         User)
-from app.schemas import CancelIn, FreezeIn, GroupMembershipIn, MemberCreate, MemberPatch, MembershipCreate, NoteIn, SuspendIn
+from app.schemas import BulkMembersIn, CancelIn, FreezeIn, MemberCreate, TogetherDiscount, TogetherIn, MemberPatch, MembershipCreate, NoteIn, SuspendIn
 from app.services.storage import public_url
 from app.services.audit import audit, diff
 from app.services.cache import cache
@@ -486,13 +486,51 @@ def assign_membership(memberId: str, body: MembershipCreate, ctx: GymCtx = Depen
     return resp
 
 
-@router.post("/gyms/{gymId}/group-memberships", status_code=201, summary="Group plan: several people join together",
-             description="Requires `Idempotency-Key`. Each person gets their own membership at the plan's per-person price, "
-                         "linked by a shared `group_id`. New people (name + phone) are added as members; a phone that is "
-                         "already a member here is reused. The optional payment is the group's total, split equally.")
-def group_membership(body: GroupMembershipIn, ctx: GymCtx = Depends(perm_ctx("memberships.manage")),
-                     db: Session = Depends(get_db), idempotency_key: str | None = Depends(idem_header)):
-    idem = Idem(db, ctx.user, idempotency_key, f"POST /gyms/{ctx.gym.id}/group-memberships")
+# ---------------- several people at once (Add member → Custom) ----------------
+@router.post("/gyms/{gymId}/members/bulk", status_code=201, summary="Add several people at once (Add member → Custom)",
+             description="Requires `Idempotency-Key`. A phone that is already a member here is returned as is "
+                         "(`existing: true`), never duplicated. No plan is assigned here.")
+def bulk_members(body: BulkMembersIn, ctx: GymCtx = Depends(perm_ctx("members.edit")), db: Session = Depends(get_db),
+                 idempotency_key: str | None = Depends(idem_header)):
+    idem = Idem(db, ctx.user, idempotency_key, f"POST /gyms/{ctx.gym.id}/members/bulk")
+    if idem.replay:
+        return idem.replay
+    gym = ctx.gym
+    today = today_in(gym.timezone)
+    phones = [normalize_phone(p.phone, f"people.{i}.phone") for i, p in enumerate(body.people)]
+    for i, ph in enumerate(phones):
+        if phones.index(ph) != i:
+            raise validation({f"people.{i}.phone": "This number is in the list twice."})
+    out, new_ids = [], []
+    for p, ph in zip(body.people, phones):
+        name = p.name.strip()
+        if len(name) < 2:
+            raise validation({"people": "Enter the full name of every person."})
+        user, _ = get_or_create_user(db, ph, name)
+        m = db.scalar(select(GymMember).where(GymMember.gym_id == gym.id, GymMember.user_id == user.id))
+        existing = m is not None
+        if not existing:
+            m = GymMember(gym_id=gym.id, user_id=user.id, member_code=next_member_code(db, gym.id), display_name=name,
+                          source="manual", status="active", joined_on=today)
+            db.add(m)
+            db.flush()
+            audit(db, gym.id, ctx.user.id, "member.create", "member", m.id, f"Added member {m.display_name}")
+            new_ids.append(m.id)
+        out.append({"member": ser_member_basic(m, user), "existing": existing})
+    resp = idem.respond(201, {"members": out})
+    from app.services.whatsapp import fire_later
+    for mid in new_ids:
+        fire_later(gym.id, "gym_live", mid, None, dedupe=f"live:{mid}")
+    return resp
+
+
+@router.post("/gyms/{gymId}/memberships/together", status_code=201, summary="Assign one plan to several members together",
+             description="Requires `Idempotency-Key`. Each member gets their own membership (own QR, dues, reminders), "
+                         "linked by a shared `group_id`. Discount is either per member or one amount off the total "
+                         "(split equally). The payment is what was paid for everyone, split equally.")
+def assign_together(body: TogetherIn, ctx: GymCtx = Depends(perm_ctx("memberships.manage")),
+                    db: Session = Depends(get_db), idempotency_key: str | None = Depends(idem_header)):
+    idem = Idem(db, ctx.user, idempotency_key, f"POST /gyms/{ctx.gym.id}/memberships/together")
     if idem.replay:
         return idem.replay
     if body.payment:
@@ -501,80 +539,67 @@ def group_membership(body: GroupMembershipIn, ctx: GymCtx = Depends(perm_ctx("me
     plan = db.get(Plan, body.plan_id)
     if not plan or plan.gym_id != gym.id:
         raise validation({"plan_id": "Pick a plan from this gym."})
-    if plan.group_size and len(body.people) != plan.group_size:
-        raise validation({"people": f"{plan.name} is for {plan.group_size} people. Add exactly {plan.group_size}."})
-    today = today_in(gym.timezone)
-    people: list[tuple[GymMember, bool]] = []  # (member, is_new)
-    seen: set[str] = set()
-    for i, gp in enumerate(body.people):
-        if gp.member_id:
-            m, _ = get_member(db, ctx, gp.member_id)
-            new = False
-        else:
-            if not (gp.name or "").strip() or not gp.phone:
-                raise validation({f"people.{i}": "Add a name and phone number for each person."})
-            phone = normalize_phone(gp.phone, f"people.{i}.phone")
-            user, _ = get_or_create_user(db, phone, gp.name.strip())
-            m = db.scalar(select(GymMember).where(GymMember.gym_id == gym.id, GymMember.user_id == user.id))
-            new = m is None
-            if new:
-                m = GymMember(gym_id=gym.id, user_id=user.id, member_code=next_member_code(db, gym.id),
-                              display_name=gp.name.strip(), source="manual", status="active", joined_on=today)
-                db.add(m)
-                db.flush()
-                audit(db, gym.id, ctx.user.id, "member.create", "member", m.id, f"Added member {m.display_name}")
-        if m.id in seen:
-            raise validation({f"people.{i}": f"{m.display_name} is in the group twice."})
-        seen.add(m.id)
-        people.append((m, new))
+    if len(set(body.member_ids)) != len(body.member_ids):
+        raise validation({"member_ids": "The same person is in the list twice."})
+    members = [get_member(db, ctx, mid)[0] for mid in body.member_ids]
+    n = len(members)
+    disc = body.discount or TogetherDiscount()
+    if disc.mode == "per_member":
+        discounts = [disc.amount_paise] * n
+    else:
+        share, extra = divmod(disc.amount_paise, n)
+        discounts = [share + (1 if k < extra else 0) for k in range(n)]
     gid = uuid7()
-    names = ", ".join(m.display_name for m, _ in people)
+    names = ", ".join(m.display_name for m in members)
     rows = []
-    for m, new in people:
-        ever_had = not new and db.scalar(select(Membership.id).where(Membership.member_id == m.id).limit(1))
+    for m, d in zip(members, discounts):
+        ever_had = db.scalar(select(Membership.id).where(Membership.member_id == m.id).limit(1))
+        had_live = db.scalar(select(Membership.id).where(Membership.member_id == m.id, Membership.state != "cancelled").limit(1))
         start = body.start_date or default_start(db, gym, m.id)
-        ms = create_membership(db, gym, ctx.user.id, m, plan=plan, start=start)
+        try:
+            ms = create_membership(db, gym, ctx.user.id, m, plan=plan, start=start, discount_paise=d)
+        except ApiError as e:
+            if e.code == "VALIDATION":
+                raise validation({"discount": "The discount is more than the plan price for one person."})
+            raise
         ms.group_id = gid
-        audit(db, gym.id, ctx.user.id, "membership.assign", "membership", ms.id,
-              f"Group plan {ms.plan_name} for {m.display_name} with {names} ({dstr(ms.start_date)} → {dstr(ms.end_date)})")
+        audit(db, gym.id, ctx.user.id, "membership.renew" if had_live else "membership.assign", "membership", ms.id,
+              f"{'Renewed' if had_live else 'Assigned'} {ms.plan_name} for {m.display_name}, together with {names} "
+              f"({dstr(ms.start_date)} → {dstr(ms.end_date)})")
         rows.append([m, ms, None, ever_had])
     if body.payment:
         p = body.payment
         ref = validate_reference(p.method, p.reference)
         check_duplicate_reference(db, gym.id, p.method, ref)
-        total_price = sum(ms.price_paise for _, ms, _, _ in rows)
+        total_price = sum(r[1].price_paise for r in rows)
         if p.amount_paise > total_price:
             raise ApiError(422, "OVERPAYMENT", None, {"due_paise": total_price})
-        share, extra = divmod(p.amount_paise, len(rows))
-        paid_at = validate_paid_at(gym, p.paid_at)
-        left = p.amount_paise
+        # equal shares, never more than a person's own price; anything left over goes to whoever still owes
+        share, extra = divmod(p.amount_paise, n)
+        amounts = [min(r[1].price_paise, share + (1 if k < extra else 0)) for k, r in enumerate(rows)]
+        left = p.amount_paise - sum(amounts)
         for k, r in enumerate(rows):
-            amt = min(r[1].price_paise, share + (1 if k < extra else 0), left)
-            if k == len(rows) - 1:
-                amt = min(r[1].price_paise, left)
-            if amt <= 0:
+            add = min(left, r[1].price_paise - amounts[k])
+            amounts[k] += add
+            left -= add
+        paid_at = validate_paid_at(gym, p.paid_at)
+        for k, r in enumerate(rows):
+            if amounts[k] <= 0:
                 continue
-            note = f"Group payment of {rupees(p.amount_paise)} for {names}" + (f" (ref {ref})" if ref and k else "")
-            r[2] = add_payment(db, gym, ctx.user.id, r[0], r[1], amt, p.method, ref if k == 0 else None, paid_at, note=note)
-            left -= amt
+            note = f"Paid together: {rupees(p.amount_paise)} for {names}" + (f" (ref {ref})" if ref and k else "")
+            r[2] = add_payment(db, gym, ctx.user.id, r[0], r[1], amounts[k], p.method, ref if k == 0 else None, paid_at, note=note)
             audit(db, gym.id, ctx.user.id, "payment.record", "payment", r[2].id,
-                  f"Recorded {rupees(amt)} {p.method.upper()} from {r[0].display_name} (group)")
-        if left > 0:  # shares capped by a cheaper membership: put the rest on whoever still owes
-            for r in rows:
-                room = r[1].price_paise - sum(x.amount_paise for x in [r[2]] if x)
-                if left > 0 and room > 0 and r[2]:
-                    add = min(room, left)
-                    r[2].amount_paise += add
-                    left -= add
+                  f"Recorded {rupees(amounts[k])} {p.method.upper()} from {r[0].display_name} (paid together)")
     for m, ms, _, _ in rows:
         settle_credit(db, gym, m, ctx.user.id, ms.id)
-    out = {"group_id": gid, "plan": {"id": plan.id, "name": plan.name, "group_size": plan.group_size},
+    out = {"group_id": gid,
            "members": [{"member": ser_member_basic(m, db.get(User, m.user_id)),
                         "membership": ser_membership(ms, gym, db, can_pay=ctx.can_pay, due=membership_due(db, ms)),
                         "payment": ser_payment(pay, m.display_name, ms.plan_name, ctx.user.name) if pay else None}
                        for m, ms, pay, _ in rows]}
     if ctx.can_pay:
-        out["due_paise"] = sum(membership_due(db, ms) for _, ms, _, _ in rows)
+        out["total_paise"] = sum(r[1].price_paise for r in rows)
+        out["due_paise"] = sum(membership_due(db, r[1]) for r in rows)
     resp = idem.respond(201, out)
     from app.services.whatsapp import fire_later
     for m, ms, pay, ever_had in rows:

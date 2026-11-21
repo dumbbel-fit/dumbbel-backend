@@ -128,7 +128,6 @@ class PlanExtras(BaseModel):
     max_freeze_days: int | None = Field(None, ge=0, le=365, description="Overrides the gym’s max_freeze_days")
     cancellation_policy: str | None = None
     refund_policy: str | None = None
-    group_size: int | None = Field(None, ge=0, le=20, description="2+ makes it a group plan: the price is per person, and that many people join together. 0 turns it back into a normal plan.")
 
 
 class PlanCreate(PlanExtras):
@@ -155,17 +154,27 @@ class PaymentInline(BaseModel):
     paid_at: datetime | None = None
 
 
-class GroupPerson(BaseModel):
-    member_id: str | None = Field(None, description="An existing member of this gym")
-    name: str | None = Field(None, max_length=200)
-    phone: str | None = Field(None, description="New person (or an existing one, matched by phone)")
+class BulkPerson(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    phone: str
 
 
-class GroupMembershipIn(BaseModel):
+class BulkMembersIn(BaseModel):
+    people: list[BulkPerson] = Field(..., min_length=1, max_length=20)
+
+
+class TogetherDiscount(BaseModel):
+    mode: Literal["per_member", "total"] = Field("total", description="per_member: this amount off each person's plan; "
+                                                                      "total: this amount off the whole bill, split equally")
+    amount_paise: int = Field(0, ge=0)
+
+
+class TogetherIn(BaseModel):
     plan_id: str
     start_date: date | None = None
-    people: list[GroupPerson] = Field(..., min_length=2, max_length=20)
-    payment: PaymentInline | None = Field(None, description="What the group paid in total; split equally per person")
+    member_ids: list[str] = Field(..., min_length=2, max_length=20)
+    discount: TogetherDiscount | None = None
+    payment: PaymentInline | None = Field(None, description="What was paid for everyone together; split equally")
 
 
 class MembershipInline(BaseModel):

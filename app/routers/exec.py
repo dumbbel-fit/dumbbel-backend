@@ -640,3 +640,58 @@ def gym_raw_csv(gymId: str, kind: RawKind, q: str | None = None, admin: User = D
         wr.writerow([(f"{r[c] / 100:.2f}" if c.endswith("_paise") and r.get(c) is not None else ("" if r.get(c) is None else r[c])) for c in cols])
     return Response("﻿" + buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": f'attachment; filename="gym-{kind}-{date.today().isoformat()}.csv"'})
+
+
+# ---------- UPI payments made through DUMBBEL.fit (our QR / payment requests), every gym ----------
+UpiStatus = Literal["all", "verified", "claimed", "pending", "rejected", "expired", "cancelled"]
+
+
+@router.get("/upi-payments", summary="Every UPI payment request across gyms: who paid through our QR, how much, verified or not")
+def upi_payments(rng: Literal["7d", "30d", "90d", "365d", "all"] = Query("30d", alias="range"), status: UpiStatus = "all",
+                 q: str | None = None, gym_id: str | None = None, include_test: bool = False,
+                 limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0),
+                 admin: User = Depends(platform_admin), db: Session = Depends(get_db)):
+    where, p = ["1=1"], {}
+    if rng != "all":
+        where.append("r.created_at >= :s")
+        p["s"] = _window(rng)["start_utc"]
+    if not include_test:
+        where.append("COALESCE(g.is_test,0)=0")
+    if gym_id:
+        where.append("r.gym_id = :gid")
+        p["gid"] = gym_id
+    if q and q.strip():
+        where.append("(gm.display_name LIKE :q OR u.phone LIKE :q OR g.name LIKE :q OR r.utr LIKE :q)")
+        p["q"] = f"%{q.strip()}%"
+    # a pending request past its expiry is expired, whatever the row still says
+    st_sql = "CASE WHEN r.status='pending' AND r.expires_at < UTC_TIMESTAMP() THEN 'expired' ELSE r.status END"
+    base = f"""FROM upi_payment_requests r JOIN gyms g ON g.id=r.gym_id JOIN gym_members gm ON gm.id=r.member_id
+               JOIN users u ON u.id=gm.user_id LEFT JOIN payments pay ON pay.id=r.payment_id
+               LEFT JOIN users du ON du.id=r.decided_by WHERE {' AND '.join(where)}"""
+    totals = {k: {"count": 0, "paise": 0} for k in ("verified", "claimed", "pending", "rejected", "expired", "cancelled")}
+    for st, n, v in db.execute(text(f"SELECT {st_sql} st, COUNT(*), SUM(r.amount_paise) {base} GROUP BY st"), p):
+        totals[st] = {"count": n, "paise": int(v or 0)}
+    by_gym = [{"gym_id": r["gym_id"], "name": r["name"], "requests": r["n"], "verified": int(r["verified"] or 0),
+               "verified_paise": int(r["verified_paise"] or 0), "waiting": int(r["waiting"] or 0)}
+              for r in rows(db, f"""SELECT r.gym_id, g.name, COUNT(*) n, SUM({st_sql}='verified') verified,
+                                    SUM(CASE WHEN {st_sql}='verified' THEN r.amount_paise END) verified_paise,
+                                    SUM({st_sql}='claimed') waiting {base} GROUP BY r.gym_id, g.name
+                                    ORDER BY verified_paise DESC, n DESC""", all_gyms=True, **p)]
+    filt = "" if status == "all" else f" AND {st_sql} = :st"
+    if status != "all":
+        p["st"] = status
+    total = db.execute(text(f"SELECT COUNT(*) {base}{filt}"), p).scalar() or 0
+    items = []
+    for r in rows(db, f"""SELECT r.id, r.created_at, g.id gym_id, g.name gym_name, gm.id member_id, gm.display_name member_name, u.phone,
+                          r.amount_paise, {st_sql} status, r.created_via, r.purpose, r.vpa, r.account_type, r.utr, r.claimed_at,
+                          r.decided_at, du.name decided_by, r.reject_reason, pay.receipt_no, pay.paid_at
+                          {base}{filt} ORDER BY r.created_at DESC LIMIT {int(limit)} OFFSET {int(offset)}""", all_gyms=True, **p):
+        for k in ("created_at", "claimed_at", "decided_at", "paid_at"):
+            r[k] = iso(r[k].replace(tzinfo=timezone.utc)) if r[k] else None
+        mins = None
+        if r["claimed_at"] and r["decided_at"]:
+            mins = int((datetime.fromisoformat(r["decided_at"]) - datetime.fromisoformat(r["claimed_at"])).total_seconds() // 60)
+        r["verify_minutes"] = mins
+        items.append(r)
+    return {"range": rng, "totals": totals, "requests": sum(t["count"] for t in totals.values()), "by_gym": by_gym,
+            "items": items, "total": total, "next_offset": offset + len(items) if offset + len(items) < total else None}
