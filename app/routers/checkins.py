@@ -234,6 +234,7 @@ def feed(date: str | None = Query(None, examples=["2026-11-12"]), result: Litera
         Checkin.gym_id == gym.id, Checkin.local_date == d, Checkin.result == "success"))
     counts_plan = db.scalar(select(func.count()).select_from(Checkin).where(
         Checkin.gym_id == gym.id, Checkin.local_date == d, Checkin.result.in_(PLAN_DENIALS))) or 0
+    staff_users = set(db.scalars(select(GymStaff.user_id).where(GymStaff.gym_id == gym.id, GymStaff.status != "deactivated")))
     items = []
     for r in rows:
         m = members.get(r.member_id)
@@ -246,7 +247,8 @@ def feed(date: str | None = Query(None, examples=["2026-11-12"]), result: Litera
                          "photo_url": storage.public_url(u.photo_url) if u else None} if m else None,
               "plan_name": ms.plan_name if ms else None, "staff_name": staff.get(r.staff_user_id),
               "first_visit": r.result == "success" and first_ever.get(r.member_id) == r.at,
-              "first_in_today": r.result == "success" and first_today is not None and r.at == first_today}
+              "first_in_today": r.result == "success" and first_today is not None and r.at == first_today,
+              "is_staff": bool(m and m.user_id in staff_users)}
         if ms:
             it["plan_end_date"] = ms.end_date.isoformat()
             if r.result == "expired":
