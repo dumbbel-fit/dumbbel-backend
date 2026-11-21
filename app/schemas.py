@@ -220,6 +220,10 @@ class MembershipCreate(BaseModel):
     start_date: date | None = None
     discount_paise: int = Field(0, ge=0)
     payment: PaymentInline | None = None
+    replace: bool = Field(False, description="Upgrade / change plan: memberships that overlap the new one are replaced. "
+                                             "One starting on/after the new start is replaced entirely and what was paid for it "
+                                             "moves to the new plan; one that started earlier ends the day before.")
+    carry_paise: int = Field(0, ge=0, description="With replace: credit for the unused days of a plan that ends early, taken off the new price")
 
 
 class FreezeIn(BaseModel):

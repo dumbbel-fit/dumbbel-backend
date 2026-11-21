@@ -6,7 +6,7 @@ from datetime import timedelta
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Response
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -454,7 +454,41 @@ def assign_membership(memberId: str, body: MembershipCreate, ctx: GymCtx = Depen
     # the welcome goes once per member, so it would be skipped and they'd only get the payment receipt
     ever_had = had_any or db.scalar(select(Membership.id).where(Membership.member_id == m.id).limit(1))
     start = body.start_date or default_start(db, gym, m.id)
-    ms = create_membership(db, gym, ctx.user.id, m, plan=plan, start=start, discount_paise=body.discount_paise)
+    moved, cut = [], []
+    if body.replace:  # upgrade / change plan: the overlapping plan(s) give way to the new one
+        end = start + timedelta(days=plan.duration_days - 1)
+        for old in db.scalars(select(Membership).where(Membership.member_id == m.id, Membership.state != "cancelled",
+                                                       Membership.start_date <= end, Membership.end_date >= start)):
+            if old.start_date >= start:
+                old.state, old.cancelled_at, old.cancel_reason = "cancelled", utcnow(), f"Changed to {plan.name}"
+                moved.append(old)
+            else:
+                old.end_date = start - timedelta(days=1)
+                cut.append(old)
+        db.flush()
+        paid_on_cut = sum(_paid_on(db, x) for x in cut)
+        if body.carry_paise > paid_on_cut:
+            raise validation({"carry_paise": f"Credit can’t be more than what was paid for the earlier plan ({rupees(paid_on_cut)})."})
+    elif body.carry_paise:
+        raise validation({"carry_paise": "Credit for unused days only applies when replacing a plan."})
+    try:
+        ms = create_membership(db, gym, ctx.user.id, m, plan=plan, start=start, discount_paise=body.discount_paise + body.carry_paise)
+    except ApiError as e:
+        if e.code == "VALIDATION" and body.carry_paise:
+            raise validation({"carry_paise": "Discount and credit together are more than the new plan’s price."})
+        raise
+    from app.models import CreditApplication
+    for old in moved:  # what was paid for the replaced plan now counts towards the new one
+        db.execute(update(Payment).where(Payment.membership_id == old.id, Payment.status == "recorded").values(membership_id=ms.id))
+        db.execute(update(CreditApplication).where(CreditApplication.membership_id == old.id, CreditApplication.reversed_at.is_(None))
+                   .values(membership_id=ms.id))
+        audit(db, gym.id, ctx.user.id, "membership.replace", "membership", old.id,
+              f"Replaced {old.plan_name} ({dstr(old.start_date)} → {dstr(old.end_date)}) with {plan.name} for {m.display_name}; "
+              f"{rupees(_paid_on(db, ms))} already paid moved to the new plan")
+    for old in cut:
+        audit(db, gym.id, ctx.user.id, "membership.replace", "membership", old.id,
+              f"{old.plan_name} for {m.display_name} now ends {dstr(old.end_date)} (changed to {plan.name})"
+              + (f"; {rupees(body.carry_paise)} credit for unused days" if body.carry_paise else ""))
     action = "membership.renew" if had_any else "membership.assign"
     audit(db, gym.id, ctx.user.id, action, "membership", ms.id,
           f"{'Renewed' if had_any else 'Assigned'} {ms.plan_name} for {m.display_name} ({dstr(ms.start_date)} → {dstr(ms.end_date)})")
@@ -463,8 +497,8 @@ def assign_membership(memberId: str, body: MembershipCreate, ctx: GymCtx = Depen
         p = body.payment
         ref = validate_reference(p.method, p.reference)
         check_duplicate_reference(db, gym.id, p.method, ref)
-        if p.amount_paise > ms.price_paise:
-            raise ApiError(422, "OVERPAYMENT", None, {"due_paise": ms.price_paise})
+        if p.amount_paise > membership_due(db, ms):
+            raise ApiError(422, "OVERPAYMENT", None, {"due_paise": membership_due(db, ms)})
         pay = add_payment(db, gym, ctx.user.id, m, ms, p.amount_paise, p.method, ref, validate_paid_at(gym, p.paid_at))
         audit(db, gym.id, ctx.user.id, "payment.record", "payment", pay.id,
               f"Recorded {rupees(pay.amount_paise)} {pay.method.upper()} from {m.display_name}")
