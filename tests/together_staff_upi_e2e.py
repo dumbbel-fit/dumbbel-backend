@@ -53,7 +53,7 @@ P = P.get("plan", P)["id"]
 print("== Add member → Custom")
 old = c.post(f"{B}/gyms/{G}/members", headers=H(T, True), json={"name": "Old Ravi", "phone": (op := rnd())}).json()["member"]
 a, b = rnd(), rnd()
-r = c.post(f"{B}/gyms/{G}/members/bulk", headers=H(T, True), json={"people": [{"name": "Anil", "phone": a}, {"name": "Bala", "phone": b}, {"name": "Ravi again", "phone": op}]})
+r = c.post(f"{B}/gyms/{G}/members/bulk", headers=H(T, True), json={"people": [{"name": "Anil", "phone": {"country": "IN", "number": a}}, {"name": "Bala", "phone": b}, {"name": "Ravi again", "phone": {"country": "IN", "number": op}}]})
 expect("added", r.status_code, 201)
 ms = r.json()["members"]
 expect("existing phone reused", [(x["member"]["name"], x["existing"]) for x in ms], [("Anil", False), ("Bala", False), ("Old Ravi", True)])

@@ -156,7 +156,7 @@ class PaymentInline(BaseModel):
 
 class BulkPerson(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
-    phone: str
+    phone: Phone  # {country, number} like Add member, or a plain number
 
 
 class BulkMembersIn(BaseModel):
