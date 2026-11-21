@@ -18,7 +18,7 @@ from app.db import get_db
 from app.config import settings
 from app.deps import GymCtx, Idem, current_user, gym_ctx, idem_header, perm_ctx
 from app.errors import ApiError
-from app.models import Checkin, Gym, GymMember, Membership, User
+from app.models import Checkin, Gym, GymMember, GymStaff, Membership, User
 from app.schemas import ManualCheckinIn, ScanIn
 from app.security import gym_static_sig, parse_gym_display_token, parse_qr_token
 from app.services import storage
@@ -407,6 +407,7 @@ class SelfCheckinIn(BaseModel):
     lng: float | None = Field(None, ge=-180, le=180)
     accuracy_m: float | None = Field(None, ge=0)
     device_id: str | None = None
+    as_member: bool = Field(False, description="Staff of this gym who came to work out: check in as a member, not a shift")
 
 
 def parse_gym_code(code: str) -> tuple[str | None, str | None, str | None]:
@@ -437,6 +438,21 @@ def self_checkin(body: SelfCheckinIn, user: User = Depends(current_user), db: Se
         ok = bool(data and data["g"] == gym.id)
     elif sig and gym.checkin_secret:
         ok = hmac.compare_digest(gym_static_sig(gym.id, gym.checkin_secret), sig)
+    # Staff of this gym scanning its QR: that's their attendance (start / end of shift), however they signed in.
+    staff = db.scalar(select(GymStaff).where(GymStaff.gym_id == gym.id, GymStaff.user_id == user.id,
+                                             GymStaff.status.in_(("invited", "active"))))
+    if staff and not body.as_member:
+        from app.routers.staff_work import do_staff_scan
+        base = {"checkin_id": "", "at": iso(utcnow()), "method": "staff", "gym": {"id": gym.id, "name": gym.name},
+                "member": None, "can_check_in_as_member": bool(db.scalar(select(GymMember.id).where(
+                    GymMember.gym_id == gym.id, GymMember.user_id == user.id, GymMember.status == "active")))}
+        try:
+            r = do_staff_scan(db, gym, staff, user, body.code, body.lat, body.lng, body.accuracy_m)
+        except ApiError as e:
+            db.rollback()
+            return {**base, "result": "staff_not_marked", "message": e.message, "staff_error": e.code}
+        return {**base, "result": "staff_shift", "message": "Shift started" if r["action"] == "in" else "Shift ended",
+                "staff_shift": {"action": r["action"], "shift": r["shift"]}}
     member = db.scalar(select(GymMember).where(GymMember.gym_id == gym.id, GymMember.user_id == user.id))
     if body.member_id and member and member.id != body.member_id:
         raise ApiError(404, "NOT_FOUND", "That membership wasn’t found.")

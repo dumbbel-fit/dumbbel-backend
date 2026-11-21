@@ -112,8 +112,24 @@ with engine.begin() as cn:
     g2 = cn.execute(text("SELECT id FROM gyms WHERE id<>:g AND checkin_secret IS NOT NULL LIMIT 1"), {"g": G}).scalar()
 if g2:
     expect("another branch's QR refused", c.post(SC, headers=H(S), json={"code": QR.replace(G, g2), **at_gym}).json()["error"]["code"], "WRONG_QR")
+# a friend who was a member somewhere else, added as staff here, signs in as a MEMBER and scans with the phone camera
+fp = rnd()
+T0 = login(rnd())
+G0 = c.post(f"{B}/gyms", headers=H(T0), json={"name": "Old Gym " + rnd()[-4:], "city": "Hyderabad"}).json()["id"]
+c.post(f"{B}/gyms/{G0}/members", headers=H(T0, True), json={"name": "Friend Kiran", "phone": fp})
+c.post(f"{B}/gyms/{G}/staff", headers=H(T), json={"name": "Friend Kiran", "phone": fp, "staff_role": "trainer"})
+F = login(fp)
+MC = f"{B}/me/checkin"
+r = c.post(MC, headers=H(F, app="member"), json={"code": QR, **at_gym}).json()
+expect("staff signed in as member: shift started, not 'not a member'", (r["result"], r.get("staff_shift", {}).get("action")), ("staff_shift", "in"))
+r = c.post(MC, headers=H(F, app="member"), json={"code": QR, "lat": 17.5, "lng": 78.5}).json()
+expect("from far away: told why", (r["result"], r.get("staff_error")), ("staff_not_marked", "TOO_FAR"))
+r = c.post(MC, headers=H(F, app="member"), json={"code": QR, **at_gym, "as_member": True}).json()
+expect("'check in as member' still works as before", r["result"], "not_member")
 w = c.get(f"{B}/gyms/{G}/staff/work", headers=H(T), params={"range": "today"}).json()
 row = [x for x in w["items"] if x["name"] == "Suresh Desk"][0]
+row = [x for x in w["items"] if x["name"] == "Suresh Desk"][0]
+expect("friend shows as on shift", [x["on_shift"] for x in w["items"] if x["name"] == "Friend Kiran"], [True])
 expect("owner sees: on shift, 1 day, at the gym", (row["on_shift"], row["days_present"], row["today"]["place"], row["minutes"] >= 180), (True, 1, "at_gym", True))
 expect("owner sees the work done", (row["work"]["members_added"], row["work"]["checkins_handled"]), (1, 1))
 expect("owner's own row: payments he recorded", [x["work"]["collected_paise"] for x in w["items"] if x["role"] == "owner"], [740000])

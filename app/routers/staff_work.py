@@ -2,6 +2,7 @@
 each person did at the gym (members added, payments collected, renewals, check-ins handled, last active).
 The owner sees everyone (staff.manage); every staff member sees and records only their own shift."""
 import hmac
+from types import SimpleNamespace
 from datetime import timedelta, timezone
 from typing import Literal
 
@@ -115,9 +116,14 @@ JUST_STARTED_MIN = 2  # a second scan within this many minutes is a double scan,
                          "Errors: WRONG_QR (not this branch's current QR), LOCATION_REQUIRED, TOO_FAR, "
                          "GYM_LOCATION_NOT_SET (owner must set it first), JUST_STARTED (scanned twice).")
 def scan(body: ScanIn, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
-    rate_limit(f"staffscan:{ctx.user.id}", 12, 60)
-    gym = ctx.gym
-    gym_id, token, sig = parse_gym_code(body.code)
+    return do_staff_scan(db, ctx.gym, ctx.staff, ctx.user, body.code, body.lat, body.lng, body.accuracy_m)
+
+
+def do_staff_scan(db: Session, gym, staff: GymStaff, user: User, code: str, lat, lng, accuracy_m) -> dict:
+    """Start or end a staff member's shift from a scanned gym QR. Also used by the member check-in page
+    (POST /me/checkin), so a staff member is recognised however they signed in. Raises ApiError when refused."""
+    rate_limit(f"staffscan:{user.id}", 12, 60)
+    gym_id, token, sig = parse_gym_code(code)
     ok = False
     if gym_id == gym.id:
         if token:
@@ -130,28 +136,30 @@ def scan(body: ScanIn, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get
     if gym.lat is None or gym.lng is None:
         raise ApiError(409, "GYM_LOCATION_NOT_SET", "The gym’s location isn’t set yet, so attendance can’t be checked. "
                                                      "Ask the owner to set it under Check-in QR → Rules & location.")
-    if body.lat is None or body.lng is None:
+    if lat is None or lng is None:
         raise ApiError(422, "LOCATION_REQUIRED", "Allow location for this site and scan again. It confirms you’re at the gym.")
-    w = _where(gym, Where(lat=body.lat, lng=body.lng, accuracy_m=body.accuracy_m))
+    w = _where(gym, Where(lat=lat, lng=lng, accuracy_m=accuracy_m))
     radius = int(gym_settings(gym).get("checkin_radius_m", 150))
     if w["dist"] > radius + min(w["acc"] or 0, 100):
         raise ApiError(422, "TOO_FAR", f"You’re {w['dist']} m from the gym. Scan from inside the gym.", {"distance_m": w["dist"]})
-    s = _open_shift(db, ctx)
+    if staff.status == "invited":  # first scan counts as joining, like a first dashboard sign-in
+        staff.status, staff.joined_at = "active", utcnow()
+    s = _open_shift(db, SimpleNamespace(staff=staff))
     if s and utcnow() - _utc(s.in_at) < timedelta(minutes=JUST_STARTED_MIN):
         raise ApiError(409, "JUST_STARTED", "Your shift has just started. Scan again when you leave to end it.")
     if s:
         s.out_at, s.out_lat, s.out_lng, s.out_accuracy_m, s.out_distance_m = utcnow(), w["lat"], w["lng"], w["acc"], w["dist"]
         out = ser_shift(gym, s)
         h, m = divmod(out["minutes"] or 0, 60)
-        audit(db, gym.id, ctx.user.id, "staff.check_out", "staff", ctx.staff.id, f"{ctx.user.name or 'Staff'} ended shift after {h}h {m}m (QR)")
+        audit(db, gym.id, user.id, "staff.check_out", "staff", staff.id, f"{user.name or 'Staff'} ended shift after {h}h {m}m (QR)")
         action = "out"
     else:
-        s = StaffShift(gym_id=gym.id, staff_id=ctx.staff.id, user_id=ctx.user.id, local_date=today_in(gym.timezone), in_at=utcnow(),
+        s = StaffShift(gym_id=gym.id, staff_id=staff.id, user_id=user.id, local_date=today_in(gym.timezone), in_at=utcnow(),
                        in_lat=w["lat"], in_lng=w["lng"], in_accuracy_m=w["acc"], in_distance_m=w["dist"])
         db.add(s)
         db.flush()
         out = ser_shift(gym, s)
-        audit(db, gym.id, ctx.user.id, "staff.check_in", "staff", ctx.staff.id, f"{ctx.user.name or 'Staff'} started shift at the gym (QR)")
+        audit(db, gym.id, user.id, "staff.check_in", "staff", staff.id, f"{user.name or 'Staff'} started shift at the gym (QR)")
         action = "in"
     db.commit()
     return {"action": action, "shift": out, "gym": {"id": gym.id, "name": gym.name}}
