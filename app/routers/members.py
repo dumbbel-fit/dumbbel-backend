@@ -6,14 +6,14 @@ from datetime import timedelta
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Response
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.deps import GymCtx, Idem, current_user, gym_ctx, idem_header, load_gym_ctx, perm_ctx
 from app.errors import ApiError, validation
-from app.models import (Checkin, GymMember, GymStaff, MemberNote, Membership, MembershipFreeze, Payment, Plan,
-                        User)
+from app.models import (Checkin, CreditApplication, GymMember, GymStaff, GymVisit, ImportRow, Invite, MemberNote,
+                        Membership, MembershipFreeze, Payment, Plan, RenewalToken, UpiPaymentRequest, User, WaMessage)
 from app.schemas import BulkMembersIn, CancelIn, FreezeIn, MemberCreate, TogetherDiscount, TogetherIn, MemberPatch, MembershipCreate, NoteIn, SuspendIn
 from app.services.storage import public_url
 from app.services.audit import audit, diff
@@ -874,3 +874,61 @@ def delete_note(memberId: str, noteId: str, ctx: GymCtx = Depends(perm_ctx("memb
     audit(db, ctx.gym.id, ctx.user.id, "member.note_delete", "member", m.id, f"Deleted a note on {m.display_name}")
     db.commit()
     return Response(status_code=204)
+
+
+@router.post("/gyms/{gymId}/members/{memberId}/clear-dispute", status_code=204,
+             summary="Clear the member’s “This isn’t mine” flag (members.edit)")
+def clear_dispute(memberId: str, ctx: GymCtx = Depends(perm_ctx("members.edit")), db: Session = Depends(get_db)):
+    m, _ = get_member(db, ctx, memberId)
+    if m.claim_disputed_at:
+        m.claim_disputed_at = None
+        m.claim_dispute_note = None
+        audit(db, ctx.gym.id, ctx.user.id, "member.claim_clear", "member", m.id,
+              f"Cleared the “not mine” flag on {m.display_name}")
+        db.commit()
+    return Response(status_code=204)
+
+
+@router.delete("/gyms/{gymId}/members/{memberId}", status_code=200,
+               summary="Delete a member permanently (owner only)",
+               description="Removes the member from this gym with every membership, payment, check-in, note, UPI request "
+                           "and WhatsApp message of theirs. Cannot be undone. `confirm` must be the member’s name. "
+                           "Their DUMBBEL.fit account (used at other gyms / in the app) is not touched.")
+def delete_member(memberId: str, confirm: str = Query(..., description="The member’s name, typed to confirm"),
+                  ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+    if not ctx.is_owner:
+        raise ApiError(403, "FORBIDDEN", "Only the gym owner can delete a member permanently.")
+    m, u = get_member(db, ctx, memberId)
+    if " ".join(confirm.split()).lower() != " ".join(m.display_name.split()).lower():
+        raise ApiError(422, "CONFIRM_MISMATCH", "Type the member’s name exactly to confirm.")
+    mid = m.id
+    ms_ids = list(db.scalars(select(Membership.id).where(Membership.member_id == mid)))
+    pay_ids = list(db.scalars(select(Payment.id).where(Payment.member_id == mid)))
+    paid = db.scalar(select(func.coalesce(func.sum(Payment.amount_paise), 0)).where(
+        Payment.member_id == mid, Payment.status != "voided")) or 0
+    counts = {"memberships": len(ms_ids), "payments": len(pay_ids), "paid_paise": int(paid),
+              "checkins": db.scalar(select(func.count()).select_from(Checkin).where(Checkin.member_id == mid)) or 0}
+    snapshot = {"member": {"id": mid, "name": m.display_name, "member_code": m.member_code,
+                           "phone": u.phone if u else None, "joined_on": dstr(m.joined_on)}, **counts}
+    ms_or_member = lambda col_m, col_ms: or_(col_m == mid, col_ms.in_(ms_ids or [""]))  # noqa: E731
+    db.execute(delete(CreditApplication).where(ms_or_member(CreditApplication.member_id, CreditApplication.membership_id)))
+    db.execute(delete(UpiPaymentRequest).where(or_(UpiPaymentRequest.member_id == mid,
+                                                   UpiPaymentRequest.membership_id.in_(ms_ids or [""]),
+                                                   UpiPaymentRequest.payment_id.in_(pay_ids or [""]))))
+    db.execute(delete(Checkin).where(ms_or_member(Checkin.member_id, Checkin.membership_id)))
+    db.execute(delete(Payment).where(ms_or_member(Payment.member_id, Payment.membership_id)))
+    db.execute(delete(MembershipFreeze).where(MembershipFreeze.membership_id.in_(ms_ids or [""])))
+    db.execute(delete(Membership).where(Membership.member_id == mid))
+    db.execute(delete(MemberNote).where(MemberNote.member_id == mid))
+    db.execute(delete(RenewalToken).where(RenewalToken.member_id == mid))
+    db.execute(delete(WaMessage).where(WaMessage.gym_id == ctx.gym.id, WaMessage.member_id == mid))
+    db.execute(update(ImportRow).where(ImportRow.member_id == mid).values(member_id=None))
+    db.execute(update(Invite).where(Invite.member_id == mid).values(member_id=None))
+    db.execute(update(GymVisit).where(GymVisit.member_id == mid).values(member_id=None))
+    db.delete(m)
+    db.flush()
+    audit(db, ctx.gym.id, ctx.user.id, "member.delete", "member", mid,
+          f"Deleted member {snapshot['member']['name']} permanently ({counts['memberships']} plans, "
+          f"{counts['payments']} payments, {counts['checkins']} check-ins)", snapshot, None)
+    db.commit()
+    return {"deleted": True, **counts}

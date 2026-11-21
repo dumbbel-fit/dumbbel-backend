@@ -173,3 +173,19 @@ def dispute(memberId: str, body: DisputeIn | None = None, user: User = Depends(c
             f"{gm.display_name} ({gm.member_code}) says this membership isn’t theirs. Check the phone number.",
             {"type": "claim_disputed", "member_id": gm.id})
     return Response(status_code=204)
+
+
+@router.post("/claims/{memberId}/confirm", status_code=204,
+             summary="Undo “This isn’t mine” — “Yes, this is my membership”",
+             description="Clears the member’s own “not mine” flag so the membership shows again and check-in works.")
+def confirm_claim(memberId: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    gm = db.get(GymMember, memberId)
+    if not gm or gm.user_id != user.id:
+        raise ApiError(404, "NOT_FOUND", "That membership wasn’t found.")
+    if gm.claim_disputed_at:
+        gm.claim_disputed_at = None
+        gm.claim_dispute_note = None
+        audit(db, gm.gym_id, user.id, "member.claim_confirm", "member", gm.id,
+              f"{gm.display_name} confirmed this membership is theirs")
+        db.commit()
+    return Response(status_code=204)

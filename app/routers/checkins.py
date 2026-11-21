@@ -110,6 +110,12 @@ def process_checkin(db: Session, ctx, method: str, *, token: str | None = None,
     if not member or member.gym_id != gym.id or member.status == "archived" or member.claim_disputed_at:
         if member and member.gym_id != gym.id:
             member = None
+        elif member and member.status == "archived":
+            extra.update(message="Your membership here was deactivated by the gym.", archived=True)
+        elif member and member.claim_disputed_at:
+            # they once tapped “This isn’t mine” in the app: let them undo it right here
+            extra.update(message="You marked this membership as “not mine” in the app.", disputed=True,
+                         disputed_member_id=member.id)
         return finish("not_member")
     if method == "self":
         # 4b. the gym QR the member scanned must be genuine & current
@@ -248,7 +254,10 @@ def feed(date: str | None = Query(None, examples=["2026-11-12"]), result: Litera
               "plan_name": ms.plan_name if ms else None, "staff_name": staff.get(r.staff_user_id),
               "first_visit": r.result == "success" and first_ever.get(r.member_id) == r.at,
               "first_in_today": r.result == "success" and first_today is not None and r.at == first_today,
-              "is_staff": bool(m and m.user_id in staff_users)}
+              "is_staff": bool(m and m.user_id in staff_users),
+              # why a real member got “Not a member”: they tapped “This isn't mine”, or the gym deactivated them
+              "member_flag": ("Said “not mine”" if m.claim_disputed_at else "Deactivated" if m.status == "archived" else None)
+              if m and r.result == "not_member" else None}
         if ms:
             it["plan_end_date"] = ms.end_date.isoformat()
             if r.result == "expired":
