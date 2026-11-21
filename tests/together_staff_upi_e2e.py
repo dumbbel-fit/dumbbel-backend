@@ -105,7 +105,9 @@ c.post(f"{B}/gyms/{G}/checkins/manual", headers=H(S, True), json={"member_id": i
 with engine.begin() as cn:
     cn.execute(text("UPDATE staff_shifts SET in_at = DATE_SUB(in_at, INTERVAL 3 HOUR) WHERE gym_id=:g"), {"g": G})
 r = c.post(SC, headers=H(S), json={"code": QR, **at_gym})
-expect("next scan ends it", (r.json()["action"], r.json()["shift"]["minutes"] >= 180), ("out", True))
+expect("a repeat scan asks first, never ends the shift by itself", (r.status_code, r.json()["error"]["code"]), (409, "CONFIRM_END"))
+r = c.post(SC, headers=H(S), json={"code": QR, **at_gym, "end": True})
+expect("confirming ends it", (r.json()["action"], r.json()["shift"]["minutes"] >= 180), ("out", True))
 r = c.post(SC, headers=H(S), json={"code": QR, **at_gym})
 expect("and the next starts a new one", r.json()["action"], "in")
 with engine.begin() as cn:
@@ -122,6 +124,10 @@ F = login(fp)
 MC = f"{B}/me/checkin"
 r = c.post(MC, headers=H(F, app="member"), json={"code": QR, **at_gym}).json()
 expect("staff signed in as member: shift started, not 'not a member'", (r["result"], r.get("staff_shift", {}).get("action")), ("staff_shift", "in"))
+with engine.begin() as cn:
+    cn.execute(text("UPDATE staff_shifts SET in_at = DATE_SUB(in_at, INTERVAL 1 HOUR) WHERE user_id=(SELECT id FROM users WHERE phone LIKE :p)"), {"p": f"%{fp}"})
+r = c.post(MC, headers=H(F, app="member"), json={"code": QR, **at_gym}).json()
+expect("camera link reopened later: asks, shift stays open", (r["result"], r.get("staff_error")), ("staff_not_marked", "CONFIRM_END"))
 r = c.post(MC, headers=H(F, app="member"), json={"code": QR, "lat": 17.5, "lng": 78.5}).json()
 expect("from far away: told why", (r["result"], r.get("staff_error")), ("staff_not_marked", "TOO_FAR"))
 r = c.post(MC, headers=H(F, app="member"), json={"code": QR, **at_gym, "as_member": True}).json()
@@ -136,7 +142,7 @@ expect("non-staff can't", c.post(f"{B}/auth/staff-session", headers=H(T0)).statu
 w = c.get(f"{B}/gyms/{G}/staff/work", headers=H(T), params={"range": "today"}).json()
 row = [x for x in w["items"] if x["name"] == "Suresh Desk"][0]
 row = [x for x in w["items"] if x["name"] == "Suresh Desk"][0]
-expect("friend shows as on shift", [x["on_shift"] for x in w["items"] if x["name"] == "Friend Kiran"], [True])
+expect("friend still on shift", [x["on_shift"] for x in w["items"] if x["name"] == "Friend Kiran"], [True])
 expect("owner sees: on shift, 1 day, at the gym", (row["on_shift"], row["days_present"], row["today"]["place"], row["minutes"] >= 180), (True, 1, "at_gym", True))
 expect("owner sees the work done", (row["work"]["members_added"], row["work"]["checkins_handled"]), (1, 1))
 expect("owner's own row: payments he recorded", [x["work"]["collected_paise"] for x in w["items"] if x["role"] == "owner"], [740000])

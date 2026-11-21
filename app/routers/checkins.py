@@ -408,6 +408,7 @@ class SelfCheckinIn(BaseModel):
     accuracy_m: float | None = Field(None, ge=0)
     device_id: str | None = None
     as_member: bool = Field(False, description="Staff of this gym who came to work out: check in as a member, not a shift")
+    end: bool = Field(False, description="Staff: end my shift (after CONFIRM_END)")
 
 
 def parse_gym_code(code: str) -> tuple[str | None, str | None, str | None]:
@@ -447,10 +448,11 @@ def self_checkin(body: SelfCheckinIn, user: User = Depends(current_user), db: Se
                 "member": None, "can_check_in_as_member": bool(db.scalar(select(GymMember.id).where(
                     GymMember.gym_id == gym.id, GymMember.user_id == user.id, GymMember.status == "active")))}
         try:
-            r = do_staff_scan(db, gym, staff, user, body.code, body.lat, body.lng, body.accuracy_m)
+            r = do_staff_scan(db, gym, staff, user, body.code, body.lat, body.lng, body.accuracy_m, end=body.end)
         except ApiError as e:
             db.rollback()
-            return {**base, "result": "staff_not_marked", "message": e.message, "staff_error": e.code}
+            return {**base, "result": "staff_not_marked", "message": e.message, "staff_error": e.code,
+                    "staff_shift": {"action": None, "shift": e.details.get("shift")} if e.details.get("shift") else None}
         return {**base, "result": "staff_shift", "message": "Shift started" if r["action"] == "in" else "Shift ended",
                 "staff_shift": {"action": r["action"], "shift": r["shift"]}}
     member = db.scalar(select(GymMember).where(GymMember.gym_id == gym.id, GymMember.user_id == user.id))

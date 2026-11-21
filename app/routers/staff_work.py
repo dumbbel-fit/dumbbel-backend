@@ -105,6 +105,8 @@ class ScanIn(BaseModel):
     lat: float | None = Field(None, ge=-90, le=90)
     lng: float | None = Field(None, ge=-180, le=180)
     accuracy_m: float | None = Field(None, ge=0)
+    end: bool = Field(False, description="True = end my shift if I'm on one. False (a scan from the camera link) never ends "
+                                         "a shift by itself: it answers CONFIRM_END so the person confirms first.")
 
 
 JUST_STARTED_MIN = 2  # a second scan within this many minutes is a double scan, not "end my shift"
@@ -116,10 +118,10 @@ JUST_STARTED_MIN = 2  # a second scan within this many minutes is a double scan,
                          "Errors: WRONG_QR (not this branch's current QR), LOCATION_REQUIRED, TOO_FAR, "
                          "GYM_LOCATION_NOT_SET (owner must set it first), JUST_STARTED (scanned twice).")
 def scan(body: ScanIn, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
-    return do_staff_scan(db, ctx.gym, ctx.staff, ctx.user, body.code, body.lat, body.lng, body.accuracy_m)
+    return do_staff_scan(db, ctx.gym, ctx.staff, ctx.user, body.code, body.lat, body.lng, body.accuracy_m, end=body.end)
 
 
-def do_staff_scan(db: Session, gym, staff: GymStaff, user: User, code: str, lat, lng, accuracy_m) -> dict:
+def do_staff_scan(db: Session, gym, staff: GymStaff, user: User, code: str, lat, lng, accuracy_m, end: bool = False) -> dict:
     """Start or end a staff member's shift from a scanned gym QR. Also used by the member check-in page
     (POST /me/checkin), so a staff member is recognised however they signed in. Raises ApiError when refused."""
     rate_limit(f"staffscan:{user.id}", 12, 60)
@@ -147,6 +149,9 @@ def do_staff_scan(db: Session, gym, staff: GymStaff, user: User, code: str, lat,
     s = _open_shift(db, SimpleNamespace(staff=staff))
     if s and utcnow() - _utc(s.in_at) < timedelta(minutes=JUST_STARTED_MIN):
         raise ApiError(409, "JUST_STARTED", "Your shift has just started. Scan again when you leave to end it.")
+    if s and not end:  # a reopened link / repeated scan must never end a shift by itself
+        cur = ser_shift(gym, s)
+        raise ApiError(409, "CONFIRM_END", "You’re on shift. End your shift now?", {"shift": cur})
     if s:
         s.out_at, s.out_lat, s.out_lng, s.out_accuracy_m, s.out_distance_m = utcnow(), w["lat"], w["lng"], w["acc"], w["dist"]
         out = ser_shift(gym, s)
