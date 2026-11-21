@@ -3,7 +3,7 @@ each person did at the gym (members added, payments collected, renewals, check-i
 The owner sees everyone (staff.manage); every staff member sees and records only their own shift."""
 import hmac
 from types import SimpleNamespace
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query
@@ -21,7 +21,7 @@ from app.security import gym_static_sig, parse_gym_display_token
 from app.services.cache import rate_limit
 from app.services.audit import audit
 from app.services.core import gym_settings
-from app.utils import dstr, iso, local_midnight_utc, today_in, utcnow
+from app.utils import dstr, iso, local_midnight_utc, today_in, tz, utcnow
 
 router = APIRouter(tags=["Staff at work"], route_class=DocRoute, responses=ERRORS)
 RANGES = {"today": 1, "7d": 7, "30d": 30}
@@ -240,3 +240,31 @@ def staff_shifts(staffId: str, rng: Range = Query("30d", alias="range"), ctx: Gy
     u = db.get(User, st.user_id)
     return {"staff": {"id": st.id, "name": u.name if u else None, "phone": u.phone if u else None},
             "items": [ser_shift(gym, s) for s in rows], **_gym_place_info(gym)}
+
+
+@router.get("/gyms/{gymId}/staff/me/attendance", summary="My attendance (any staff member): days, hours and every shift in a month")
+def my_attendance(month: str | None = Query(None, pattern=r"^\d{4}-\d{2}$", examples=["2026-11"]),
+                  ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+    gym = ctx.gym
+    today = today_in(gym.timezone)
+    y, m = (int(x) for x in (month or today.strftime("%Y-%m")).split("-"))
+    first = today.replace(year=y, month=m, day=1)
+    nxt = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+    rows = db.scalars(select(StaffShift).where(StaffShift.staff_id == ctx.staff.id, StaffShift.local_date >= first,
+                                               StaffShift.local_date < nxt).order_by(StaffShift.in_at.desc())).all()
+    shifts = [ser_shift(gym, s) for s in rows]
+    days = sorted({x["date"] for x in shifts})
+    mins = sum(x["minutes"] or 0 for x in shifts)
+    local = [datetime.fromisoformat(x["in_at"]).astimezone(tz(gym.timezone)) for x in shifts]
+    starts = [d.hour * 60 + d.minute for d in local]
+    avg = round(sum(starts) / len(starts)) if starts else None
+    open_s = _open_shift(db, ctx)
+    last_day = min(today, nxt - timedelta(days=1))
+    working_days = max(0, (last_day - first).days + 1) if first <= today else 0
+    return {"month": first.strftime("%Y-%m"), "staff": {"id": ctx.staff.id, "name": ctx.user.name, "role": ctx.role_name},
+            "on_shift": open_s is not None, "current": ser_shift(gym, open_s) if open_s else None,
+            "summary": {"days_present": len(days), "days_so_far": working_days, "minutes": mins,
+                        "avg_minutes_per_day": round(mins / len(days)) if days else 0,
+                        "avg_start": f"{avg // 60:02d}:{avg % 60:02d}" if avg is not None else None,
+                        "not_ended": sum(1 for x in shifts if x["forgot_checkout"])},
+            "days": days, "shifts": shifts, **_gym_place_info(gym)}

@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_db
-from app.deps import Auth, get_auth
+from app.deps import Auth, current_user, get_auth
 from app.errors import ApiError
 from app.models import Gym, GymMember, GymStaff, Invite, OtpCode, Session as DbSession, User
 from app.schemas import FirebaseLoginIn, OtpSendIn, OtpVerifyIn, RefreshIn
@@ -213,3 +213,17 @@ def firebase_login(body: FirebaseLoginIn, db: Session = Depends(get_db)):
     phone = normalize_phone(verify_phone_token(body.id_token))
     _check_lock(phone)
     return complete_login(db, phone, body.app, body.device)
+
+
+@router.post("/staff-session", response_model=LoginOut, summary="Open the staff dashboard for someone already signed in (no new OTP)",
+             description="For staff who scanned the gym QR while signed in to the member app: gives the dashboard its own "
+                         "session for the same person, so both stay signed in. 403 NOT_GYM_STAFF if they're not staff anywhere.")
+def staff_session(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    gyms = staff_of(db, user.id, activate=True)
+    if not gyms:
+        raise ApiError(403, "NOT_GYM_STAFF")
+    user.last_login_at = utcnow()
+    tokens = create_session(db, user, "admin")
+    resp = {**tokens, "user": {**ser_user(user), "is_new": not user.name}, "staff_of": gyms}
+    db.commit()
+    return resp

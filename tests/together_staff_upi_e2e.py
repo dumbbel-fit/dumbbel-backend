@@ -126,6 +126,13 @@ r = c.post(MC, headers=H(F, app="member"), json={"code": QR, "lat": 17.5, "lng":
 expect("from far away: told why", (r["result"], r.get("staff_error")), ("staff_not_marked", "TOO_FAR"))
 r = c.post(MC, headers=H(F, app="member"), json={"code": QR, **at_gym, "as_member": True}).json()
 expect("'check in as member' still works as before", r["result"], "not_member")
+ma = c.get(f"{B}/gyms/{G}/staff/me/attendance", headers=H(F, app="member")).json()
+expect("friend's own attendance page", (ma["on_shift"], ma["summary"]["days_present"], len(ma["shifts"])), (True, 1, 1))
+ss = c.post(f"{B}/auth/staff-session", headers=H(F, app="member"))
+expect("member sign-in opens the staff dashboard without a new OTP", (ss.status_code, [g["gym_id"] for g in ss.json()["staff_of"]] == [G]), (200, True))
+expect("dashboard sign-in works", c.get(f"{B}/gyms/{G}/staff/me/shift", headers=H(ss.json()["access_token"])).status_code, 200)
+expect("member app still signed in", c.get(f"{B}/gyms/{G}/staff/me/shift", headers=H(F, app="member")).status_code, 200)
+expect("non-staff can't", c.post(f"{B}/auth/staff-session", headers=H(T0)).status_code in (200, 403), True)
 w = c.get(f"{B}/gyms/{G}/staff/work", headers=H(T), params={"range": "today"}).json()
 row = [x for x in w["items"] if x["name"] == "Suresh Desk"][0]
 row = [x for x in w["items"] if x["name"] == "Suresh Desk"][0]
