@@ -442,3 +442,60 @@ def activity(actor_id: str | None = None, entity_type: str | None = None, limit:
     return {"items": [{"id": r.id, "at": iso(r.at), "actor": {"id": r.actor_user_id, "name": names.get(r.actor_user_id)},
                        "action": r.action, "summary": r.summary, "entity_type": r.entity_type, "entity_id": r.entity_id,
                        "before": r.before, "after": r.after} for r in rows], "next_cursor": nxt}
+
+
+# ---------------- getting started (setup checklist on the Overview) ----------------
+SETUP_FLAGS = ("qr_poster_at", "setup_dismissed_at")
+
+
+@router.get("/gyms/{gymId}/setup", summary="Setup checklist: what this gym has done and what's next (owner)",
+            description="Each step is worked out from the gym's own data, so it ticks itself as soon as it's done.")
+def setup_checklist(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+    from app.models import GymUpiAccount, GymWhatsApp, StaffShift
+    gym = ctx.gym
+    s = gym.settings or {}
+    n = lambda q: db.scalar(q) or 0  # noqa: E731
+    plans = n(select(func.count()).select_from(Plan).where(Plan.gym_id == gym.id, Plan.active.is_(True)))
+    members = n(select(func.count()).select_from(GymMember).where(GymMember.gym_id == gym.id, GymMember.status == "active"))
+    with_plan = n(select(func.count(func.distinct(Membership.member_id))).where(Membership.gym_id == gym.id, Membership.state != "cancelled"))
+    self_scans = n(select(func.count()).select_from(Checkin).where(Checkin.gym_id == gym.id, Checkin.method == "self"))
+    shifts = n(select(func.count()).select_from(StaffShift).where(StaffShift.gym_id == gym.id))
+    staff = n(select(func.count()).select_from(GymStaff).where(GymStaff.gym_id == gym.id, GymStaff.role != "owner", GymStaff.status != "deactivated"))
+    wa = db.get(GymWhatsApp, gym.id)
+    upi = n(select(func.count()).select_from(GymUpiAccount).where(GymUpiAccount.gym_id == gym.id, GymUpiAccount.active.is_(True)))
+    steps = [
+        {"key": "plans", "title": "Add your membership plans", "why": "Monthly, Quarterly, Yearly… Members need a plan to check in.",
+         "done": plans > 0, "count": plans, "go": "/admin/plans", "action": "Create a plan"},
+        {"key": "members", "title": "Add or import your members", "why": "Upload your Excel sheet, or add people one by one (or a family together).",
+         "done": members > 0, "count": members, "go": "/admin/members", "action": "Add members"},
+        {"key": "memberships", "title": "Give members their plan", "why": "Assign a plan and record what they paid. Dues are worked out for you.",
+         "done": with_plan > 0, "count": with_plan, "go": "/admin/members", "action": "Assign a plan"},
+        {"key": "location", "title": "Set your gym’s location", "why": "Needed so members and staff can only check in when they’re at the gym.",
+         "done": gym.lat is not None and gym.lng is not None, "go": "/admin/checkin-qr?tab=settings", "action": "Set location"},
+        {"key": "qr", "title": "Print the check-in QR poster", "why": "Stick it at the entrance. Members scan it to check in; staff scan it for attendance.",
+         "done": bool(s.get("qr_poster_at")) or self_scans > 0 or shifts > 0, "go": "/admin/checkin-qr", "action": "Get the poster"},
+        {"key": "whatsapp", "title": "Link your WhatsApp", "why": "Welcome messages, expiry reminders and receipts go out by themselves.",
+         "done": bool(wa and wa.status == "connected"), "go": "/admin/whatsapp", "action": "Link WhatsApp"},
+        {"key": "staff", "title": "Add your staff", "why": "Front desk, trainers and managers each sign in with their own number.",
+         "done": staff > 0, "count": staff, "go": "/admin/staff", "action": "Add staff", "optional": True},
+        {"key": "upi", "title": "Add your UPI ID", "why": "Members can pay dues and renew by UPI straight to your account.",
+         "done": upi > 0, "go": "/admin/upi", "action": "Add UPI ID", "optional": True},
+    ]
+    need = [x for x in steps if not x.get("optional")]
+    return {"steps": steps, "done": sum(1 for x in steps if x["done"]), "total": len(steps),
+            "required_done": sum(1 for x in need if x["done"]), "required_total": len(need),
+            "complete": all(x["done"] for x in need), "dismissed": bool(s.get("setup_dismissed_at"))}
+
+
+@router.post("/gyms/{gymId}/setup/{flag}", status_code=204, summary="Mark a setup step (poster printed) or hide the checklist")
+def setup_flag(flag: Literal["qr_poster", "dismiss", "show"], ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+    s = dict(ctx.gym.settings or {})
+    if flag == "qr_poster":
+        s["qr_poster_at"] = utcnow().isoformat()
+    elif flag == "dismiss":
+        s["setup_dismissed_at"] = utcnow().isoformat()
+    else:
+        s.pop("setup_dismissed_at", None)
+    ctx.gym.settings = s
+    db.commit()
+    return Response(status_code=204)
