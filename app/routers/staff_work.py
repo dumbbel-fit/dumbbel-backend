@@ -1,6 +1,7 @@
-"""Staff at work: check-in / check-out from their phone with location (taken only at those two moments), and what
+"""Staff at work: staff scan the gym QR to start / end their shift, with location (taken only at those two moments), and what
 each person did at the gym (members added, payments collected, renewals, check-ins handled, last active).
 The owner sees everyone (staff.manage); every staff member sees and records only their own shift."""
+import hmac
 from datetime import timedelta, timezone
 from typing import Literal
 
@@ -14,7 +15,9 @@ from app.deps import GymCtx, gym_ctx, perm_ctx
 from app.errors import ApiError
 from app.models import AuditLog, Checkin, GymStaff, Payment, StaffShift, User
 from app.responses import DocRoute, ERRORS
-from app.routers.checkins import haversine_m
+from app.routers.checkins import haversine_m, parse_gym_code
+from app.security import gym_static_sig, parse_gym_display_token
+from app.services.cache import rate_limit
 from app.services.audit import audit
 from app.services.core import gym_settings
 from app.utils import dstr, iso, local_midnight_utc, today_in, utcnow
@@ -96,37 +99,62 @@ def my_shift(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
             "minutes_today": sum(s["minutes"] or 0 for s in shifts), **_gym_place_info(gym)}
 
 
-@router.post("/gyms/{gymId}/staff/me/check-in", status_code=201, summary="Start my shift (location is saved with it)")
-def check_in(body: Where | None = None, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
-    gym = ctx.gym
-    if _open_shift(db, ctx):
-        raise ApiError(409, "ALREADY_ON_SHIFT", "You’re already checked in. Check out first.")
-    w = _where(gym, body)
-    s = StaffShift(gym_id=gym.id, staff_id=ctx.staff.id, user_id=ctx.user.id, local_date=today_in(gym.timezone),
-                   in_at=utcnow(), in_lat=w["lat"], in_lng=w["lng"], in_accuracy_m=w["acc"], in_distance_m=w["dist"])
-    db.add(s)
-    db.flush()
-    out = ser_shift(gym, s)
-    where = {"at_gym": "at the gym", "away": f"{w['dist']} m from the gym", "not_shared": "location not shared",
-             "unknown": "gym location not set"}[out["in"]["place"]]
-    audit(db, gym.id, ctx.user.id, "staff.check_in", "staff", ctx.staff.id, f"{ctx.user.name or 'Staff'} checked in ({where})")
-    db.commit()
-    return {"shift": out, **_gym_place_info(gym)}
+class ScanIn(BaseModel):
+    code: str = Field(..., description="The scanned gym QR: the full https://dumbbel.fit/checkin?... URL (or its query)")
+    lat: float | None = Field(None, ge=-90, le=90)
+    lng: float | None = Field(None, ge=-180, le=180)
+    accuracy_m: float | None = Field(None, ge=0)
 
 
-@router.post("/gyms/{gymId}/staff/me/check-out", summary="End my shift (location is saved with it)")
-def check_out(body: Where | None = None, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+JUST_STARTED_MIN = 2  # a second scan within this many minutes is a double scan, not "end my shift"
+
+
+@router.post("/gyms/{gymId}/staff/me/scan", summary="Staff attendance: scan the gym QR to start, scan again to end the shift",
+             description="The only way staff mark attendance. Needs the genuine, current QR of this branch and the phone's "
+                         "location inside the check-in radius. First scan starts the shift, the next one ends it. "
+                         "Errors: WRONG_QR (not this branch's current QR), LOCATION_REQUIRED, TOO_FAR, "
+                         "GYM_LOCATION_NOT_SET (owner must set it first), JUST_STARTED (scanned twice).")
+def scan(body: ScanIn, ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
+    rate_limit(f"staffscan:{ctx.user.id}", 12, 60)
     gym = ctx.gym
+    gym_id, token, sig = parse_gym_code(body.code)
+    ok = False
+    if gym_id == gym.id:
+        if token:
+            data = parse_gym_display_token(token)
+            ok = bool(data and data["g"] == gym.id)
+        elif sig and gym.checkin_secret:
+            ok = hmac.compare_digest(gym_static_sig(gym.id, gym.checkin_secret), sig)
+    if not ok:
+        raise ApiError(422, "WRONG_QR", "This isn’t the current check-in QR of this branch. Scan the QR poster at the entrance.")
+    if gym.lat is None or gym.lng is None:
+        raise ApiError(409, "GYM_LOCATION_NOT_SET", "The gym’s location isn’t set yet, so attendance can’t be checked. "
+                                                     "Ask the owner to set it under Check-in QR → Rules & location.")
+    if body.lat is None or body.lng is None:
+        raise ApiError(422, "LOCATION_REQUIRED", "Allow location for this site and scan again. It confirms you’re at the gym.")
+    w = _where(gym, Where(lat=body.lat, lng=body.lng, accuracy_m=body.accuracy_m))
+    radius = int(gym_settings(gym).get("checkin_radius_m", 150))
+    if w["dist"] > radius + min(w["acc"] or 0, 100):
+        raise ApiError(422, "TOO_FAR", f"You’re {w['dist']} m from the gym. Scan from inside the gym.", {"distance_m": w["dist"]})
     s = _open_shift(db, ctx)
-    if not s:
-        raise ApiError(409, "NOT_ON_SHIFT", "You’re not checked in.")
-    w = _where(gym, body)
-    s.out_at, s.out_lat, s.out_lng, s.out_accuracy_m, s.out_distance_m = utcnow(), w["lat"], w["lng"], w["acc"], w["dist"]
-    out = ser_shift(gym, s)
-    h, m = divmod(out["minutes"] or 0, 60)
-    audit(db, gym.id, ctx.user.id, "staff.check_out", "staff", ctx.staff.id, f"{ctx.user.name or 'Staff'} checked out after {h}h {m}m")
+    if s and utcnow() - _utc(s.in_at) < timedelta(minutes=JUST_STARTED_MIN):
+        raise ApiError(409, "JUST_STARTED", "Your shift has just started. Scan again when you leave to end it.")
+    if s:
+        s.out_at, s.out_lat, s.out_lng, s.out_accuracy_m, s.out_distance_m = utcnow(), w["lat"], w["lng"], w["acc"], w["dist"]
+        out = ser_shift(gym, s)
+        h, m = divmod(out["minutes"] or 0, 60)
+        audit(db, gym.id, ctx.user.id, "staff.check_out", "staff", ctx.staff.id, f"{ctx.user.name or 'Staff'} ended shift after {h}h {m}m (QR)")
+        action = "out"
+    else:
+        s = StaffShift(gym_id=gym.id, staff_id=ctx.staff.id, user_id=ctx.user.id, local_date=today_in(gym.timezone), in_at=utcnow(),
+                       in_lat=w["lat"], in_lng=w["lng"], in_accuracy_m=w["acc"], in_distance_m=w["dist"])
+        db.add(s)
+        db.flush()
+        out = ser_shift(gym, s)
+        audit(db, gym.id, ctx.user.id, "staff.check_in", "staff", ctx.staff.id, f"{ctx.user.name or 'Staff'} started shift at the gym (QR)")
+        action = "in"
     db.commit()
-    return {"shift": out}
+    return {"action": action, "shift": out, "gym": {"id": gym.id, "name": gym.name}}
 
 
 def _since(gym, rng: str):

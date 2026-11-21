@@ -89,18 +89,32 @@ st = c.post(f"{B}/gyms/{G}/staff", headers=H(T), json={"name": "Suresh Desk", "p
 S = login(sp)
 me = c.get(f"{B}/gyms/{G}/staff/me/shift", headers=H(S)).json()
 expect("not on shift yet", (me["on_shift"], me["gym_location_set"]), (False, True))
-r = c.post(f"{B}/gyms/{G}/staff/me/check-in", headers=H(S), json={"lat": 17.4484, "lng": 78.3916, "accuracy_m": 20})
-expect("check-in at the gym", (r.status_code, r.json()["shift"]["in"]["place"]), (201, "at_gym"))
-expect("twice refused", c.post(f"{B}/gyms/{G}/staff/me/check-in", headers=H(S), json={}).status_code, 409)
+QR = c.get(f"{B}/gyms/{G}/checkin-qr", headers=H(T)).json()["qr"]["url"]
+SC = f"{B}/gyms/{G}/staff/me/scan"
+at_gym = {"lat": 17.4484, "lng": 78.3916, "accuracy_m": 20}
+expect("old buttons are gone", c.post(f"{B}/gyms/{G}/staff/me/check-in", headers=H(S), json=at_gym).status_code, 404)
+expect("fake QR refused", c.post(SC, headers=H(S), json={"code": QR[:-4] + "abcd", **at_gym}).json()["error"]["code"], "WRONG_QR")
+expect("no location refused", c.post(SC, headers=H(S), json={"code": QR}).json()["error"]["code"], "LOCATION_REQUIRED")
+far = c.post(SC, headers=H(S), json={"code": QR, "lat": 17.5, "lng": 78.5})
+expect("from far away refused", (far.status_code, far.json()["error"]["code"]), (422, "TOO_FAR"))
+r = c.post(SC, headers=H(S), json={"code": QR, **at_gym})
+expect("scan at the gym starts the shift", (r.status_code, r.json()["action"], r.json()["shift"]["in"]["place"]), (200, "in", "at_gym"))
+expect("double scan doesn't end it", c.post(SC, headers=H(S), json={"code": QR, **at_gym}).json()["error"]["code"], "JUST_STARTED")
 mid = c.post(f"{B}/gyms/{G}/members", headers=H(S, True), json={"name": "Desk Added", "phone": rnd()}).json()["member"]["id"]
 c.post(f"{B}/gyms/{G}/checkins/manual", headers=H(S, True), json={"member_id": ids[0]})
-r = c.post(f"{B}/gyms/{G}/staff/me/check-out", headers=H(S), json={"lat": 17.5, "lng": 78.5})
-expect("check-out far away", (r.status_code, r.json()["shift"]["out"]["place"], r.json()["shift"]["out"]["distance_m"] > 1000), (200, "away", True))
-r = c.post(f"{B}/gyms/{G}/staff/me/check-in", headers=H(S), json={})
-expect("second check-in without location", r.json()["shift"]["in"]["place"], "not_shared")
+with engine.begin() as cn:
+    cn.execute(text("UPDATE staff_shifts SET in_at = DATE_SUB(in_at, INTERVAL 3 HOUR) WHERE gym_id=:g"), {"g": G})
+r = c.post(SC, headers=H(S), json={"code": QR, **at_gym})
+expect("next scan ends it", (r.json()["action"], r.json()["shift"]["minutes"] >= 180), ("out", True))
+r = c.post(SC, headers=H(S), json={"code": QR, **at_gym})
+expect("and the next starts a new one", r.json()["action"], "in")
+with engine.begin() as cn:
+    g2 = cn.execute(text("SELECT id FROM gyms WHERE id<>:g AND checkin_secret IS NOT NULL LIMIT 1"), {"g": G}).scalar()
+if g2:
+    expect("another branch's QR refused", c.post(SC, headers=H(S), json={"code": QR.replace(G, g2), **at_gym}).json()["error"]["code"], "WRONG_QR")
 w = c.get(f"{B}/gyms/{G}/staff/work", headers=H(T), params={"range": "today"}).json()
 row = [x for x in w["items"] if x["name"] == "Suresh Desk"][0]
-expect("owner sees: on shift, 1 day, no-location check-in", (row["on_shift"], row["days_present"], row["checkins_no_location"], row["today"]["place"]), (True, 1, 1, "at_gym"))
+expect("owner sees: on shift, 1 day, at the gym", (row["on_shift"], row["days_present"], row["today"]["place"], row["minutes"] >= 180), (True, 1, "at_gym", True))
 expect("owner sees the work done", (row["work"]["members_added"], row["work"]["checkins_handled"]), (1, 1))
 expect("owner's own row: payments he recorded", [x["work"]["collected_paise"] for x in w["items"] if x["role"] == "owner"], [740000])
 log = c.get(f"{B}/gyms/{G}/staff/{st['id']}/shifts", headers=H(T)).json()
