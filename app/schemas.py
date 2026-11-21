@@ -128,6 +128,7 @@ class PlanExtras(BaseModel):
     max_freeze_days: int | None = Field(None, ge=0, le=365, description="Overrides the gym’s max_freeze_days")
     cancellation_policy: str | None = None
     refund_policy: str | None = None
+    group_size: int | None = Field(None, ge=0, le=20, description="2+ makes it a group plan: the price is per person, and that many people join together. 0 turns it back into a normal plan.")
 
 
 class PlanCreate(PlanExtras):
@@ -152,6 +153,19 @@ class PaymentInline(BaseModel):
     method: Method
     reference: str | None = None
     paid_at: datetime | None = None
+
+
+class GroupPerson(BaseModel):
+    member_id: str | None = Field(None, description="An existing member of this gym")
+    name: str | None = Field(None, max_length=200)
+    phone: str | None = Field(None, description="New person (or an existing one, matched by phone)")
+
+
+class GroupMembershipIn(BaseModel):
+    plan_id: str
+    start_date: date | None = None
+    people: list[GroupPerson] = Field(..., min_length=2, max_length=20)
+    payment: PaymentInline | None = Field(None, description="What the group paid in total; split equally per person")
 
 
 class MembershipInline(BaseModel):

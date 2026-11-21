@@ -21,7 +21,7 @@ from app.utils import iso, normalize_phone, rupees, today_in, tz, utcnow
 from app.responses import DocRoute, ERRORS, DocumentOut, GymListOut, GymOut, PlanListOut, PlanOut, VerificationOut
 
 PLAN_EXTRAS = ["offer_price_paise", "joining_fee_paise", "gst_mode", "gst_rate", "facilities", "description",
-               "freeze_allowed", "max_freeze_days", "cancellation_policy", "refund_policy"]
+               "freeze_allowed", "max_freeze_days", "cancellation_policy", "refund_policy", "group_size"]
 NOT_NULL_PLAN_FIELDS = {"name", "duration_days", "price_paise", "active", "sort_order", "joining_fee_paise", "gst_mode",
                         "gst_rate", "freeze_allowed"}
 
@@ -250,6 +250,7 @@ def create_plan(body: PlanCreate, ctx: GymCtx = Depends(perm_ctx("plans.manage")
         v = getattr(body, k)
         if v is not None:
             setattr(p, k, v)
+    p.group_size = p.group_size if (p.group_size or 0) >= 2 else None
     db.add(p)
     db.flush()
     audit(db, ctx.gym.id, ctx.user.id, "plan.create", "plan", p.id,
@@ -278,6 +279,7 @@ def patch_plan(planId: str, body: PlanPatch, ctx: GymCtx = Depends(perm_ctx("pla
         if v is None and k in NOT_NULL_PLAN_FIELDS:
             continue
         setattr(p, k, v)
+    p.group_size = p.group_size if (p.group_size or 0) >= 2 else None
     b, a = diff(before, ser_plan(p))
     audit(db, ctx.gym.id, ctx.user.id, "plan.update", "plan", p.id, f"Updated plan {p.name}", b, a)
     try:
