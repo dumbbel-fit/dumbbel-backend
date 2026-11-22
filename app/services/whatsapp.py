@@ -358,11 +358,17 @@ def get_config(db: Session, gym_id: str) -> GymWhatsApp | None:
     return db.get(GymWhatsApp, gym_id)
 
 
+# “Your gym is on DUMBBEL.fit”: one message to every member at once when a gym links WhatsApp or imports members.
+# That burst got gyms' numbers restricted by WhatsApp, so it is switched off for good and can't be turned on.
+BANNED_EVENT = "gym_live"
+
+
 def wa_settings(cfg: GymWhatsApp | None) -> dict:
     s = dict(DEFAULT_SETTINGS)
     saved = (cfg.settings if cfg else None) or {}
     s.update({k: v for k, v in saved.items() if k != "automations"})
     s["automations"] = {**DEFAULT_SETTINGS["automations"], **(saved.get("automations") or {})}
+    s["automations"][BANNED_EVENT] = False  # banned for every gym (bulk send that got numbers restricted)
     return s
 
 
@@ -1020,6 +1026,10 @@ def process_queue(limit: int = 60) -> int:
 def _process_queue(limit: int) -> int:
     now = utcnow()
     with session_scope() as db:
+        # the banned “gym is on DUMBBEL.fit” message never goes out: any still waiting is cancelled (kept, not deleted)
+        db.execute(update(WaMessage).where(WaMessage.status == "queued", WaMessage.event == BANNED_EVENT)
+                   .values(status="cancelled", error_code="banned", error="This message is switched off for good",
+                           next_attempt_at=None).execution_options(synchronize_session=False))
         # release rows a crashed worker left in "sending"
         db.execute(update(WaMessage).where(WaMessage.status == "sending", WaMessage.updated_at < now - timedelta(minutes=10))
                    .values(status="queued", next_attempt_at=now))

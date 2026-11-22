@@ -116,7 +116,7 @@ drain()
 r = rows()
 expect("A's welcome is sent", r[("welcome", A)][0], "sent")
 expect("member archived meanwhile is not messaged", (r[("welcome", B)][0], r[("payment_received", B)][0]), ("cancelled", "cancelled"))
-expect("go-live is sent", r[("gym_live", OLD)][0], "sent")
+expect("go-live is banned: never sent", r.get(("gym_live", OLD), ("cancelled",))[0], "cancelled")
 expect("revive is a no-op the second time", (wa.onboard_gym(GID), len(rows())), (0, len(r)))
 
 print("== instant messages: during quiet hours, ahead of reminders, template made on demand")

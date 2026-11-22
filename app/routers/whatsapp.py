@@ -300,6 +300,9 @@ def patch_settings(body: SettingsIn, ctx: GymCtx = Depends(perm_ctx(MANAGE)), db
         bad = [k for k in data["automations"] if k not in wa.AUTO_EVENTS]
         if bad:
             raise validation({"automations": f"Unknown automation: {bad[0]}"})
+        if data["automations"].get(wa.BANNED_EVENT):
+            raise ApiError(409, "AUTOMATION_BANNED", "The “Your gym is on DUMBBEL.fit” message is switched off for good. "
+                           "Sending it to every member at once got WhatsApp numbers restricted.")
         s["automations"] = {**s["automations"], **data["automations"]}
     if data.get("consent_confirmed") is not None:
         cfg.consent_confirmed_at = (cfg.consent_confirmed_at or utcnow()) if data["consent_confirmed"] else None

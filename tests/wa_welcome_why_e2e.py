@@ -83,7 +83,7 @@ print("\n== added without a plan")
 mid = add(T, G, "No Plan")
 d = why(T, G, mid)
 expect("reason: no plan", (d["welcome"]["state"], d["welcome"]["code"]), ("not_sent", "no_plan"))
-expect("they still got the 'gym is on DUMBBEL' message", [m["event"] for m in d["messages"]], ["gym_live"])
+expect("no 'gym is on DUMBBEL' message (banned)", [m["event"] for m in d["messages"]], [])
 chk("first plan added later", c.post(f"{B}/gyms/{G}/members/{mid}/memberships", headers=H(T, True), json={"plan_id": P}), 201)
 expect("now the welcome goes out", why(T, G, mid)["welcome"]["message_id"] is not None, True)
 

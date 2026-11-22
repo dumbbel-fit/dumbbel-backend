@@ -73,7 +73,7 @@ def events(member_id, settle=3.0, limit=12.0):
 m = chk("new member with plan + payment", c.post(f"{B}/gyms/{G}/members", headers=H(T, True), json={
     "name": "Ravi", "phone": rnd(), "membership": {"plan_id": P}, "payment": {"amount_paise": 100000, "method": "cash"}}), 201)
 MID, MS = m["member"]["id"], (m.get("membership") or {}).get("id")
-expect("welcome + receipt + go-live", events(MID), ["gym_live", "payment_received", "welcome"])
+expect("welcome + receipt (go-live is banned)", events(MID), ["payment_received", "welcome"])
 
 chk("cancel", c.post(f"{B}/memberships/{MS}/cancel", headers=H(T), json={"reason": "Moving away"}))
 expect("cancelled message", "membership_cancelled" in events(MID), True)

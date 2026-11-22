@@ -2,6 +2,9 @@
 
 Runs the service directly against the TEST database with the WhatsApp gateway replaced by a fake, so nothing is sent.
     DATABASE_URL=...dumbbel_test EVOLUTION_API_URL=http://fake EVOLUTION_API_KEY=x python tests/wa_onboarding_test.py"""
+import sys as _sys
+_sys.exit("RETIRED (22 Nov 2026): the gym_live message is banned; see tests/wa_gym_live_ban_e2e.py")
+
 import os
 import sys
 from datetime import timedelta
