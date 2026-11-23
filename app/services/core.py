@@ -144,6 +144,18 @@ def validate_paid_at(gym: Gym, paid_at: datetime | None) -> datetime:
     return paid_at
 
 
+def paid_at_for_plan(gym: Gym, ms: Membership | None, paid_at: datetime | None) -> datetime:
+    """Date of a payment taken together with a plan (add member / renew / assign / group).
+    A date the desk typed wins; otherwise it is the plan's start date when the plan started earlier
+    (same time of day as now), and now when the plan starts today or later."""
+    if paid_at is not None or ms is None:
+        return validate_paid_at(gym, paid_at)
+    now, today = utcnow(), today_in(gym.timezone)
+    if ms.start_date < today:
+        return now - timedelta(days=(today - ms.start_date).days)
+    return now
+
+
 def add_payment(db: Session, gym: Gym, actor_id: str | None, member: GymMember, membership: Membership | None,
                 amount_paise: int, method: str, reference: str | None = None, paid_at: datetime | None = None,
                 note: str | None = None, source: str = "manual") -> Payment:

@@ -20,7 +20,7 @@ from app.services.audit import audit, diff
 from app.services.cache import cache
 from app.services.core import (pt_out, add_payment, check_duplicate_reference, create_membership, default_start,
                                get_or_create_user, gym_settings, next_member_code, ser_member_basic, settle_credit,
-                               ser_membership, ser_payment, user_names, validate_paid_at, validate_reference)
+                               ser_membership, ser_payment, user_names, paid_at_for_plan, validate_reference)
 from app.services.rules import LIVE, days_left, freezes_of, load_states, member_state, membership_due, membership_status, \
     pick_current
 from app.utils import (uuid7, dstr, iso, local_midnight_utc, month_bounds, normalize_phone, paginate_list, rupees,
@@ -262,7 +262,7 @@ def create_member(body: MemberCreate, ctx: GymCtx = Depends(perm_ctx("members.ed
         if ms and p.amount_paise > ms.price_paise:
             raise ApiError(422, "OVERPAYMENT", None, {"due_paise": ms.price_paise})
         pay = add_payment(db, gym, ctx.user.id, member, ms, p.amount_paise, p.method, ref,
-                          validate_paid_at(gym, p.paid_at))
+                          paid_at_for_plan(gym, ms, p.paid_at))
         audit(db, gym.id, ctx.user.id, "payment.record", "payment", pay.id,
               f"Recorded {rupees(pay.amount_paise)} {pay.method.upper()} from {member.display_name}")
     settle_credit(db, gym, member, ctx.user.id, ms.id if ms else None)
@@ -499,7 +499,7 @@ def assign_membership(memberId: str, body: MembershipCreate, ctx: GymCtx = Depen
         check_duplicate_reference(db, gym.id, p.method, ref)
         if p.amount_paise > membership_due(db, ms):
             raise ApiError(422, "OVERPAYMENT", None, {"due_paise": membership_due(db, ms)})
-        pay = add_payment(db, gym, ctx.user.id, m, ms, p.amount_paise, p.method, ref, validate_paid_at(gym, p.paid_at))
+        pay = add_payment(db, gym, ctx.user.id, m, ms, p.amount_paise, p.method, ref, paid_at_for_plan(gym, ms, p.paid_at))
         audit(db, gym.id, ctx.user.id, "payment.record", "payment", pay.id,
               f"Recorded {rupees(pay.amount_paise)} {pay.method.upper()} from {m.display_name}")
     settle_credit(db, gym, m, ctx.user.id, ms.id)  # use any advance/credit the member already has
@@ -618,12 +618,12 @@ def assign_together(body: TogetherIn, ctx: GymCtx = Depends(perm_ctx("membership
             add = min(left, r[1].price_paise - amounts[k])
             amounts[k] += add
             left -= add
-        paid_at = validate_paid_at(gym, p.paid_at)
         for k, r in enumerate(rows):
             if amounts[k] <= 0:
                 continue
             note = f"Paid together: {rupees(p.amount_paise)} for {names}" + (f" (ref {ref})" if ref and k else "")
-            r[2] = add_payment(db, gym, ctx.user.id, r[0], r[1], amounts[k], p.method, ref if k == 0 else None, paid_at, note=note)
+            r[2] = add_payment(db, gym, ctx.user.id, r[0], r[1], amounts[k], p.method, ref if k == 0 else None,
+                               paid_at_for_plan(gym, r[1], p.paid_at), note=note)
             audit(db, gym.id, ctx.user.id, "payment.record", "payment", r[2].id,
                   f"Recorded {rupees(amounts[k])} {p.method.upper()} from {r[0].display_name} (paid together)")
     for m, ms, _, _ in rows:
