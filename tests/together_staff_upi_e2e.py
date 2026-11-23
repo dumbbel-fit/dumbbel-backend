@@ -47,6 +47,7 @@ T = login(rnd())
 G = c.post(f"{B}/gyms", headers=H(T), json={"name": "Together Gym " + rnd()[-4:], "city": "Hyderabad"}).json()["id"]
 with engine.begin() as cn:
     cn.execute(text("UPDATE gyms SET status='active', lat=17.448300, lng=78.391500 WHERE id=:g"), {"g": G})
+c.patch(f"{B}/gyms/{G}", headers=H(T), json={"settings": {"checkin_require_location": True}})  # this test checks the location rules
 P = c.post(f"{B}/gyms/{G}/plans", headers=H(T), json={"name": "Monthly", "duration_days": 30, "price_paise": 200000}).json()
 P = P.get("plan", P)["id"]
 

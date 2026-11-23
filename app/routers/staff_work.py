@@ -135,14 +135,16 @@ def do_staff_scan(db: Session, gym, staff: GymStaff, user: User, code: str, lat,
             ok = hmac.compare_digest(gym_static_sig(gym.id, gym.checkin_secret), sig)
     if not ok:
         raise ApiError(422, "WRONG_QR", "This isn’t the current check-in QR of this branch. Scan the QR poster at the entrance.")
-    if gym.lat is None or gym.lng is None:
+    w = _where(gym, Where(lat=lat, lng=lng, accuracy_m=accuracy_m))  # kept on the shift whenever the phone shares it
+    need_loc = bool(gym_settings(gym).get("checkin_require_location", False))  # off by default: the QR alone marks the shift
+    if not need_loc:
+        pass
+    elif gym.lat is None or gym.lng is None:
         raise ApiError(409, "GYM_LOCATION_NOT_SET", "The gym’s location isn’t set yet, so attendance can’t be checked. "
                                                      "Ask the owner to set it under Check-in QR → Rules & location.")
-    if lat is None or lng is None:
+    elif lat is None or lng is None:
         raise ApiError(422, "LOCATION_REQUIRED", "Allow location for this site and scan again. It confirms you’re at the gym.")
-    w = _where(gym, Where(lat=lat, lng=lng, accuracy_m=accuracy_m))
-    radius = int(gym_settings(gym).get("checkin_radius_m", 150))
-    if w["dist"] > radius + min(w["acc"] or 0, 100):
+    elif w["dist"] > int(gym_settings(gym).get("checkin_radius_m", 150)) + min(w["acc"] or 0, 100):
         raise ApiError(422, "TOO_FAR", f"You’re {w['dist']} m from the gym. Scan from inside the gym.", {"distance_m": w["dist"]})
     if staff.status == "invited":  # first scan counts as joining, like a first dashboard sign-in
         staff.status, staff.joined_at = "active", utcnow()

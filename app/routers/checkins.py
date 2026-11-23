@@ -121,12 +121,14 @@ def process_checkin(db: Session, ctx, method: str, *, token: str | None = None,
         # 4b. the gym QR the member scanned must be genuine & current
         if not code_ok:
             return finish("invalid_token")
-        # 4c. they must be at the gym (when the gym requires it and has set its location)
+        # 4c. they must be at the gym only when the gym switched that on (off by default) and has set its location
         s = gym_settings(gym)
-        if s.get("checkin_require_location", True) and gym.lat is not None and gym.lng is not None:
+        if location and location.get("lat") is not None and location.get("lng") is not None \
+                and gym.lat is not None and gym.lng is not None:  # shared anyway: keep how far they were
+            distance = int(round(haversine_m(float(gym.lat), float(gym.lng), location["lat"], location["lng"])))
+        if s.get("checkin_require_location", False) and gym.lat is not None and gym.lng is not None:
             if not location or location.get("lat") is None or location.get("lng") is None:
                 return finish("location_required")
-            distance = int(round(haversine_m(float(gym.lat), float(gym.lng), location["lat"], location["lng"])))
             slack = min(float(location.get("accuracy_m") or 0), 100.0)
             if distance > int(s.get("checkin_radius_m", 150)) + slack:
                 return finish("too_far")
@@ -384,7 +386,7 @@ def gym_qr_payload(db: Session, gym: Gym) -> dict:
             "qr": {"url": url, "standard": True},
             "display": {"url": url, "token": None, "expires_at": None, "refresh_in_sec": None},
             "poster": {"url": url, "enabled": True},
-            "settings": {"require_location": bool(s.get("checkin_require_location", True)),
+            "settings": {"require_location": bool(s.get("checkin_require_location", False)),
                          "radius_m": int(s.get("checkin_radius_m", 150)),
                          "static_qr": True},
             "location": {"set": gym.lat is not None and gym.lng is not None,
