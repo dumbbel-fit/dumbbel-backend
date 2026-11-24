@@ -13,7 +13,7 @@ from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -23,8 +23,8 @@ from app.models import AssistantLog, Gym, User
 from app.responses import DocRoute, ERRORS
 from app.services import ai
 from app.services.cache import rate_limit
-from app.services.gym_score import gym_numbers, gym_score
-from app.utils import iso, rupees, utcnow
+from app.services.gym_score import NEXT, gym_numbers, gym_score
+from app.utils import iso, rupees, today_in, utcnow
 
 router = APIRouter(tags=["Gym score & assistant"], route_class=DocRoute, responses=ERRORS)
 console = APIRouter(prefix="/internal/insights", tags=["Executive console"], route_class=DocRoute, responses=ERRORS)
@@ -59,10 +59,11 @@ Rules:
 - For "how do I…" questions, answer from the GUIDE in short numbered steps.
 - Be brief and plain: 2 to 6 short sentences or a short list. No tables, no headings, no markdown symbols except "-" lists and numbers.
 - Reply in the language the user wrote in (English, Hindi, Telugu, or a mix like Hinglish).
-- You do not have member names or phone numbers; for lists of people, point to the Members list and its filters.
+- You do not have member names or phone numbers; for lists of people, say they can ask "Who are my best members?" or
+  "Who should I call to renew?" here, or use the Members list and its filters.
 - If asked something unrelated to running the gym or using DUMBBEL.fit, say politely that you can help with the gym and the dashboard."""
 
-SUGGESTED = ["Why did my revenue change this month?", "How many members haven't visited in 10 days?",
+SUGGESTED = ["Why did my revenue change this month?", "Who are my best members?", "How many members haven't visited in 10 days?",
              "How can I improve my gym score?", "How do I send expiry reminders on WhatsApp?",
              "How do I add a couple on one plan?", "Who should I call today to renew?"]
 
@@ -99,34 +100,108 @@ def _chg(now, before) -> str:
     return f"{now} vs {before} last month ({'+' if d >= 0 else ''}{round(100 * d / before)}%)"
 
 
-def plain_answer(raw: dict, question: str) -> str:
-    """Used when the AI model is slow or down: a short, correct answer built straight from the numbers / guide."""
+def _n(k: int, one: str, many: str) -> str:
+    return f"{k} {one if k == 1 else many}"
+
+
+def _has(q: str, *words) -> bool:
+    return any(w in q for w in words)
+
+
+HOW = ("how do", "how to", "how can i", "where do", "where can", "where is", "kaise", "ela ", "steps")
+PEOPLE_TOP = ("best member", "top member", "best members", "top members", "most regular", "regular member", "loyal", "comes the most",
+              "come the most", "most visits", "most active", "best customer", "top customer", "favourite member", "favorite member")
+PEOPLE_CALL = ("who should i call", "whom should i call", "who to call", "call today", "who needs to renew", "who is expiring",
+               "who are expiring", "whose plan", "who will expire", "list of expiring", "renew today")
+
+
+def people_answer(db: Session, gym, question: str) -> str | None:
+    """Questions about specific members are answered here, from our own database, so names never go to the AI."""
     q = question.lower()
-    if any(w in q for w in ("how do", "how to", "how can i", "where", "kaise", "ela ")):
-        words = [w for w in q.replace("?", " ").split() if len(w) > 3]
-        hits = [ln for ln in GUIDE.splitlines() if ln.startswith("-") and any(w in ln.lower() for w in words)]
+    td = today_in(gym.timezone)
+    if _has(q, *PEOPLE_TOP):
+        rows = db.execute(text("""SELECT gm.display_name, COUNT(DISTINCT c.local_date) days FROM checkins c JOIN gym_members gm ON gm.id = c.member_id
+                                  WHERE c.gym_id = :g AND c.result = 'success' AND c.local_date >= :a AND gm.status = 'active'
+                                  GROUP BY gm.id, gm.display_name ORDER BY days DESC, gm.display_name LIMIT 5"""),
+                          {"g": gym.id, "a": td - timedelta(days=29)}).all()
+        paid = db.execute(text("""SELECT gm.display_name, SUM(p.amount_paise) total FROM payments p JOIN gym_members gm ON gm.id = p.member_id
+                                  WHERE p.gym_id = :g AND p.status = 'recorded' AND p.paid_at >= :s AND gm.status = 'active'
+                                  GROUP BY gm.id, gm.display_name ORDER BY total DESC LIMIT 3"""),
+                          {"g": gym.id, "s": utcnow() - timedelta(days=365)}).all()
+        if not rows and not paid:
+            return "There aren’t enough check-ins or payments yet to pick out your best members. Once members check in with the QR, I can show who comes the most."
+        out = []
+        if rows:
+            out.append("Most regular in the last 30 days:\n" + "\n".join(f"{i + 1}. {r[0]} · {_n(int(r[1]), 'day', 'days')} at the gym" for i, r in enumerate(rows)))
+        if paid:
+            out.append("Paid the most in the last 12 months:\n" + "\n".join(f"- {r[0]} · {rupees(int(r[1]))}" for r in paid))
+        out.append("A quick thank-you or a small reward keeps regulars coming. Open any of them from Members to see their full history.")
+        return "\n\n".join(out)
+    if _has(q, *PEOPLE_CALL):
+        soon = db.execute(text(f"""SELECT gm.display_name, MAX(m.end_date) e FROM memberships m JOIN gym_members gm ON gm.id = m.member_id
+                                   WHERE m.gym_id = :g AND m.state <> 'cancelled' AND gm.status = 'active' AND m.end_date BETWEEN :a AND :b
+                                   AND NOT {NEXT} GROUP BY gm.id, gm.display_name ORDER BY e LIMIT 10"""),
+                          {"g": gym.id, "a": td, "b": td + timedelta(days=7)}).all()
+        lapsed = db.execute(text(f"""SELECT gm.display_name, MAX(m.end_date) e FROM memberships m JOIN gym_members gm ON gm.id = m.member_id
+                                     WHERE m.gym_id = :g AND m.state <> 'cancelled' AND gm.status = 'active' AND m.end_date BETWEEN :a AND :b
+                                     AND NOT {NEXT} GROUP BY gm.id, gm.display_name ORDER BY e DESC LIMIT 10"""),
+                            {"g": gym.id, "a": td - timedelta(days=14), "b": td - timedelta(days=1)}).all()
+        if not soon and not lapsed:
+            return "Nobody’s plan ends in the next 7 days, and nobody lapsed in the last 2 weeks. Nothing to chase today."
+        out = []
+        if soon:
+            out.append("Plan ends in the next 7 days:\n" + "\n".join(f"- {r[0]} · {'today' if r[1] == td else r[1].strftime('%d %b')}" for r in soon))
+        if lapsed:
+            out.append("Ended in the last 2 weeks, not renewed:\n" + "\n".join(f"- {r[0]} · ended {r[1].strftime('%d %b')}" for r in lapsed))
+        out.append("Open them from Members → Expiring / Expired to renew. If WhatsApp is linked, expiry reminders go out by themselves.")
+        return "\n\n".join(out)
+    return None
+
+
+def plain_answer(raw: dict, question: str) -> str:
+    """Used when the AI model is slow or down: answer only what was asked, straight from the numbers or the guide."""
+    q = question.lower()
+    if _has(q, *HOW):
+        words = [w.strip("?.,!") for w in q.split() if len(w) > 3]
+        hits = [ln for ln in GUIDE.splitlines() if ln.startswith("-") and any(w and w in ln.lower() for w in words)]
         if hits:
             return "Here’s how:\n" + "\n".join(hits[:3])
     n, s = raw["numbers"], raw["score"]
-    rv = n["revenue"]
-    lines = []
-    if rv["last_month_same_days_paise"]:
-        pc = rv["change_pct"]
-        lines.append(f"Revenue so far this month is {rupees(rv['this_month_paise'])}, against {rupees(rv['last_month_same_days_paise'])} "
-                     f"in the same days last month ({'+' if pc >= 0 else ''}{pc}%).")
-    else:
-        lines.append(f"Revenue so far this month is {rupees(rv['this_month_paise'])}.")
-    lines.append(f"Renewals: {_chg(n['renewals']['this_month'], n['renewals']['last_month_same_days'])}. "
-                 f"New members: {_chg(n['new_members']['this_month'], n['new_members']['last_month_same_days'])}.")
-    lines.append(f"{n['members_not_visited_10_days']} of your {n['active_members']} active members haven’t visited in the past 10 days, "
-                 f"and {n['expiring_next_7_days']} plans end in the next 7 days.")
-    if n["dues"]["members"]:
-        lines.append(f"{n['dues']['members']} members owe {rupees(n['dues']['total_paise'])} in dues.")
-    if s["score"] is not None:
-        lines.append(f"Your gym score is {s['score']} ({s['grade']}).")
-    lines.append("Next: call the members whose plans end this week (Members → Expiring), collect dues (Members → Dues), "
-                 "and message members who haven’t come in (Members → Away 14+ days).")
-    return " ".join(lines)
+    rv, out = n["revenue"], []
+    if _has(q, "revenue", "income", "money", "collection", "sales", "earning", "kamai", "paisa", "decrease", "increase", "drop", "down", "change"):
+        if rv["last_month_same_days_paise"]:
+            pc = rv["change_pct"]
+            out.append(f"Revenue so far this month is {rupees(rv['this_month_paise'])}, against {rupees(rv['last_month_same_days_paise'])} "
+                       f"in the same days last month ({'+' if pc >= 0 else ''}{pc}%).")
+        else:
+            out.append(f"Revenue so far this month is {rupees(rv['this_month_paise'])} (nothing recorded in the same days last month).")
+        out.append(f"Renewals: {_chg(n['renewals']['this_month'], n['renewals']['last_month_same_days'])}. "
+                   f"New members: {_chg(n['new_members']['this_month'], n['new_members']['last_month_same_days'])}.")
+    if _has(q, "renew", "expir", "ending", "lapse"):
+        out.append(f"Renewals this month: {_chg(n['renewals']['this_month'], n['renewals']['last_month_same_days'])}. "
+                   f"{_n(n['expiring_next_7_days'], 'plan ends', 'plans end')} in the next 7 days.")
+    if _has(q, "visit", "attend", "check", "came", "coming", "absent", "inactive"):
+        out.append(f"{n['members_not_visited_10_days']} of your {n['active_members']} active members haven’t visited in the past 10 days. "
+                   f"Check-ins: {_chg(n['checkins']['this_month'], n['checkins']['last_month_same_days'])}.")
+    if _has(q, "due", "pending", "owe", "balance", "baaki"):
+        d = n["dues"]
+        out.append(f"{_n(d['members'], 'member owes', 'members owe')} {rupees(d['total_paise'])} in dues. Collect from Members → filter Dues."
+                   if d["members"] else "Nobody has pending dues right now.")
+    if _has(q, "new member", "joined", "join", "new people", "acquisition"):
+        out.append(f"New members: {_chg(n['new_members']['this_month'], n['new_members']['last_month_same_days'])}.")
+    if _has(q, "score", "improve", "better", "grade", "perform"):
+        if s["score"] is None:
+            out.append("There isn’t enough data yet for a gym score.")
+        else:
+            parts = s.get("parts", {})
+            weak = min(((k, v["score"]) for k, v in parts.items() if v.get("score") is not None), key=lambda x: x[1], default=None)
+            out.append(f"Your gym score is {s['score']} ({s['grade']})." + (f" The weakest part is {weak[0].lower()} ({round(weak[1])})." if weak else ""))
+    if not out:
+        return ("I couldn’t reach the AI just now, so I can only answer questions about your numbers (revenue, renewals, visits, dues, "
+                "new members, your gym score) or how to use the dashboard. Please try again in a minute.")
+    out.append("Next: call members whose plans end this week (Members → Expiring), collect dues (Members → Dues), "
+               "and message members who haven’t come in (Members → Away 14+ days).")
+    return " ".join(out)
 
 
 @router.get("/gyms/{gymId}/score", summary="Gym performance score (0–100) from retention, attendance, renewals, new members and collection")
@@ -154,13 +229,17 @@ def ask(body: AskIn, ctx: GymCtx = Depends(perm_ctx("payments.view")), db: Sessi
             {"role": "system", "content": f"GYM DATA for {gym.name} (asked by {ctx.role_name or 'staff'}):\n" + json.dumps(facts, ensure_ascii=False)},
             *hist, {"role": "user", "content": body.question.strip()}]
     t0 = time.perf_counter()
-    try:
-        answer, provider = ai.ask(msgs)
-    except ai.AiUnavailable:  # model slow or down: still answer, straight from the numbers
-        answer, provider = plain_answer(raw, body.question), "numbers"
+    local = people_answer(db, gym, body.question)  # about specific members: answered here, names never sent to the AI
+    if local:
+        answer, provider = local, "local"
+    else:
+        try:
+            answer, provider = ai.ask(msgs)
+        except ai.AiUnavailable:  # model slow or down: still answer, straight from the numbers
+            answer, provider = plain_answer(raw, body.question), "numbers"
     ms = int((time.perf_counter() - t0) * 1000)
     q = body.question.lower()
-    topic = "how_to" if any(w in q for w in ("how do", "how to", "how can i add", "where", "kaise", "ela")) else "numbers"
+    topic = "how_to" if _has(q, *HOW) else "members" if provider == "local" else "numbers"
     log = AssistantLog(gym_id=gym.id, user_id=ctx.user.id, question=body.question.strip()[:600], answer=answer[:4000],
                        topic=topic, provider=provider, ms=ms)
     db.add(log)

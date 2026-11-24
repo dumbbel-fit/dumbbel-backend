@@ -88,6 +88,23 @@ print("   HOW-TO:", how.replace("\n", " ")[:400])
 expect("how-to answered from the guide (Custom)", "Custom" in how or "custom" in how, True)
 expect("feedback saved", c.post(f"{B}/gyms/{G}/assistant/{a['id']}/feedback", headers=H(T), json={"helpful": True}).status_code, 204)
 
+r = c.post(f"{B}/gyms/{G}/assistant", headers=H(T), json={"question": "so who is the best member for me"}).json()["answer"]
+print("   BEST:", r.replace("\n", " | ")[:300])
+expect("best members answered by name from our own data", any(n in r for n in names[:3]) and "day" in r, True)
+r = c.post(f"{B}/gyms/{G}/assistant", headers=H(T), json={"question": "Who should I call today to renew?"}).json()["answer"]
+print("   CALL:", r.replace("\n", " | ")[:300])
+expect("call list answered from our own data", "Expir" in r or "renew" in r.lower(), True)
+from app.routers.assistant import plain_answer  # noqa: E402
+raw = {"numbers": {"revenue": {"this_month_paise": 100000, "last_month_same_days_paise": 200000, "change_pct": -50.0},
+                   "renewals": {"this_month": 2, "last_month_same_days": 5}, "new_members": {"this_month": 1, "last_month_same_days": 3},
+                   "checkins": {"this_month": 40, "last_month_same_days": 60}, "members_not_visited_10_days": 7, "active_members": 30,
+                   "expiring_next_7_days": 4, "dues": {"members": 1, "total_paise": 150000}},
+       "score": {"score": 55, "grade": "Fair", "parts": {"Renewal rate": {"score": 40}, "Member retention": {"score": 70}}}}
+expect("backup: revenue question gets revenue", "Revenue so far" in plain_answer(raw, "why is revenue down?"), True)
+expect("backup: dues question gets dues only", (lambda a: "1 member owes" in a and "Revenue" not in a)(plain_answer(raw, "how much is pending dues?")), True)
+expect("backup: unrelated question is honest", "couldn’t reach the AI" in plain_answer(raw, "tell me a joke"), True)
+expect("backup: score question names the weakest part", "renewal rate" in plain_answer(raw, "how to improve my score").lower(), True)
+
 tp = rnd()
 c.post(f"{B}/gyms/{G}/staff", headers=H(T), json={"name": "Trainer T", "phone": tp, "staff_role": "trainer"})
 TT = login(tp)
