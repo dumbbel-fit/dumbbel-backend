@@ -156,13 +156,14 @@ async def request_context(request: Request, call_next):
     return resp
 
 
-from app.routers import auth, checkins, engage, exec as exec_console, explore, growth, gym_deletion, gyms, imports, insights, internal, me, member_app, members, payments, staff, staff_work, upi, whatsapp  # noqa: E402
+from app.routers import assistant, auth, checkins, engage, exec as exec_console, explore, growth, gym_deletion, gyms, imports, insights, internal, me, member_app, members, payments, staff, staff_work, upi, whatsapp  # noqa: E402
 
 P = settings.api_prefix
 for r in (auth.router, me.public, me.router, member_app.router, gyms.router, members.router, payments.router,
           checkins.router, checkins.me_router, engage.me, engage.gym, imports.public, imports.router, staff.router, staff_work.router, upi.router, upi.me_router, internal.router, exec_console.router, insights.router, growth.router,
           gym_deletion.owner, gym_deletion.console,
-          internal.uploads, explore.public, explore.me, explore.gym, whatsapp.router, whatsapp.public):
+          internal.uploads, explore.public, explore.me, explore.gym, whatsapp.router, whatsapp.public,
+          assistant.router, assistant.console):
     app.include_router(r, prefix=P)
 
 

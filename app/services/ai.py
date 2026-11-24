@@ -1,4 +1,5 @@
-"""Groq LLM client (OpenAI-compatible). Primary model + fallback; never raises raw provider errors to users."""
+"""LLM clients (OpenAI-compatible): Groq for the member coach, NVIDIA-hosted open models for the owner assistant.
+Never raises raw provider errors to users."""
 import json
 import logging
 import re
@@ -62,3 +63,36 @@ def chat_json(messages: list[dict], **kw) -> dict:
         if m:
             return json.loads(m.group(0))
         raise AiUnavailable("AI returned invalid JSON")
+
+
+NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+
+def assistant_enabled() -> bool:
+    return bool(settings.nvidia_api_key or settings.groq_api_key)
+
+
+def ask(messages: list[dict], *, max_tokens: int = 1500, temperature: float = 0.3) -> tuple[str, str]:
+    """Owner assistant: NVIDIA model first (light reasoning), then Groq. Returns (text, provider). Raises AiUnavailable."""
+    last = None
+    if settings.nvidia_api_key:
+        body = {"model": settings.nvidia_model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature,
+                "top_p": 1, "stream": False, "reasoning_effort": "low"}
+        try:
+            r = httpx.post(NVIDIA_URL, json=body, timeout=httpx.Timeout(35, connect=8),  # the shared NVIDIA endpoint can queue; we fall back rather than wait
+                           headers={"Authorization": f"Bearer {settings.nvidia_api_key}", "Accept": "application/json"})
+            data = r.json()
+            if r.status_code == 200:
+                text = (data["choices"][0]["message"].get("content") or "").strip()
+                if text:
+                    log.info("assistant ok nvidia tokens=%s rid=%s", data.get("usage", {}).get("total_tokens"), current_request_id())
+                    return text, "nvidia"
+                last = "empty reply"
+            else:
+                last = (data.get("error") or {}).get("message") if isinstance(data.get("error"), dict) else data.get("message") or f"HTTP {r.status_code}"
+        except Exception as e:  # network / JSON
+            last = f"{type(e).__name__}: {e}"
+        log.warning("assistant nvidia fail: %s rid=%s", str(last)[:200], current_request_id())
+    if settings.groq_api_key:
+        return chat(messages, max_tokens=min(max_tokens, 900), temperature=temperature), "groq"
+    raise AiUnavailable(str(last or "The assistant isn’t configured (NVIDIA_API_KEY)."))

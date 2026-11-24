@@ -795,3 +795,19 @@ class GymArchive(Base):
     deleted_by: Mapped[str] = mapped_column(String(36), nullable=False)
     deleted_at = mapped_column(TS, nullable=False)
     created_at = created()
+
+
+class AssistantLog(Base):
+    """Ask DUMBBEL: what owners and managers asked, what it answered, and whether it helped. Lets the team see
+    what gyms find hard. Holds only the question and answer text (the numbers it used are counts and money)."""
+    __tablename__ = "assistant_logs"
+    id: Mapped[str] = pk()
+    gym_id: Mapped[str] = fk("gyms.id", index=True)
+    user_id: Mapped[str] = fk("users.id")
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str | None] = mapped_column(Text)
+    topic: Mapped[str | None] = mapped_column(String(20))  # numbers | how_to | other
+    provider: Mapped[str | None] = mapped_column(String(16))
+    ms: Mapped[int | None] = mapped_column(Integer)
+    helpful = mapped_column(Boolean, nullable=True)
+    created_at = created()
