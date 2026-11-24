@@ -492,6 +492,7 @@ class StaffShift(Base):
     out_lng = mapped_column(Numeric(9, 6), nullable=True)
     out_accuracy_m: Mapped[int | None] = mapped_column(Integer)
     out_distance_m: Mapped[int | None] = mapped_column(Integer)
+    auto_out = mapped_column(Boolean, nullable=False, default=False, server_default="0")  # ended by itself after 8 h
     created_at = created()
     updated_at = updated()
     __table_args__ = (Index("ix_shift_gym_date", "gym_id", "local_date"),)

@@ -27,6 +27,7 @@ router = APIRouter(tags=["Staff at work"], route_class=DocRoute, responses=ERROR
 RANGES = {"today": 1, "7d": 7, "30d": 30}
 Range = Literal["today", "7d", "30d"]
 FORGOT_AFTER_H = 16  # an open shift older than this is treated as "forgot to check out"
+AUTO_OUT_H = 8  # a shift nobody ended is ended by itself this many hours after it started
 
 
 class Where(BaseModel):
@@ -68,11 +69,29 @@ def ser_shift(gym, s: StaffShift) -> dict:
     pt = lambda lat, lng: {"lat": float(lat), "lng": float(lng), "map_url": f"https://maps.google.com/?q={float(lat)},{float(lng)}"} \
         if lat is not None and lng is not None else None  # noqa: E731
     return {"id": s.id, "staff_id": s.staff_id, "date": dstr(s.local_date), "in_at": iso(in_at), "out_at": iso(out_at),
-            "open": out_at is None and not forgot, "forgot_checkout": forgot, "minutes": mins,
+            "open": out_at is None and not forgot, "forgot_checkout": forgot, "auto_out": bool(s.auto_out), "minutes": mins,
             "in": {"place": _place(gym, s.in_distance_m, s.in_accuracy_m, s.in_lat is not None), "distance_m": s.in_distance_m,
                    "accuracy_m": s.in_accuracy_m, "point": pt(s.in_lat, s.in_lng)},
             "out": {"place": _place(gym, s.out_distance_m, s.out_accuracy_m, s.out_lat is not None), "distance_m": s.out_distance_m,
                     "accuracy_m": s.out_accuracy_m, "point": pt(s.out_lat, s.out_lng)} if out_at else None}
+
+
+def end_long_shifts(db: Session, gym_id: str | None = None) -> int:
+    """Staff who forgot to scan out: any shift still open AUTO_OUT_H hours after it started is ended at exactly
+    start + AUTO_OUT_H, marked auto_out, and noted in the activity log. Commits. Returns how many were ended."""
+    cutoff = utcnow() - timedelta(hours=AUTO_OUT_H)
+    q = select(StaffShift).where(StaffShift.out_at.is_(None), StaffShift.in_at <= cutoff)
+    if gym_id:
+        q = q.where(StaffShift.gym_id == gym_id)
+    rows = db.scalars(q.with_for_update(skip_locked=True)).all()
+    for s in rows:
+        s.out_at, s.auto_out = _utc(s.in_at) + timedelta(hours=AUTO_OUT_H), True
+        name = db.scalar(select(User.name).where(User.id == s.user_id)) or "Staff"
+        audit(db, s.gym_id, None, "staff.auto_check_out", "staff", s.staff_id,
+              f"{name}’s shift ended automatically after {AUTO_OUT_H} h (no check-out scan)")
+    if rows:
+        db.commit()
+    return len(rows)
 
 
 def _open_shift(db: Session, ctx: GymCtx) -> StaffShift | None:
@@ -91,6 +110,7 @@ def _gym_place_info(gym) -> dict:
 @router.get("/gyms/{gymId}/staff/me/shift", summary="My shift today (any staff member)")
 def my_shift(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
     gym = ctx.gym
+    end_long_shifts(db, gym.id)
     today = today_in(gym.timezone)
     rows = db.scalars(select(StaffShift).where(StaffShift.staff_id == ctx.staff.id, StaffShift.local_date == today)
                       .order_by(StaffShift.in_at)).all()
@@ -125,6 +145,7 @@ def do_staff_scan(db: Session, gym, staff: GymStaff, user: User, code: str, lat,
     """Start or end a staff member's shift from a scanned gym QR. Also used by the member check-in page
     (POST /me/checkin), so a staff member is recognised however they signed in. Raises ApiError when refused."""
     rate_limit(f"staffscan:{user.id}", 12, 60)
+    end_long_shifts(db, gym.id)  # a shift left open past 8 h is ended first, so this scan starts a fresh one
     gym_id, token, sig = parse_gym_code(code)
     ok = False
     if gym_id == gym.id:
@@ -181,6 +202,7 @@ def _since(gym, rng: str):
 @router.get("/gyms/{gymId}/staff/work", summary="Every staff member at work: attendance, where they checked in, what they did (staff.manage)")
 def staff_work(rng: Range = Query("7d", alias="range"), ctx: GymCtx = Depends(perm_ctx("staff.manage")), db: Session = Depends(get_db)):
     gym = ctx.gym
+    end_long_shifts(db, gym.id)
     today, start, since = _since(gym, rng)
     staff = db.execute(select(GymStaff, User).join(User, User.id == GymStaff.user_id)
                        .where(GymStaff.gym_id == gym.id, GymStaff.status != "deactivated")
@@ -238,6 +260,7 @@ def staff_work(rng: Range = Query("7d", alias="range"), ctx: GymCtx = Depends(pe
 def staff_shifts(staffId: str, rng: Range = Query("30d", alias="range"), ctx: GymCtx = Depends(perm_ctx("staff.manage")),
                  db: Session = Depends(get_db)):
     gym = ctx.gym
+    end_long_shifts(db, gym.id)
     st = db.get(GymStaff, staffId)
     if not st or st.gym_id != gym.id:
         raise ApiError(404, "NOT_FOUND", "That staff member wasn’t found.")
@@ -253,6 +276,7 @@ def staff_shifts(staffId: str, rng: Range = Query("30d", alias="range"), ctx: Gy
 def my_attendance(month: str | None = Query(None, pattern=r"^\d{4}-\d{2}$", examples=["2026-11"]),
                   ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
     gym = ctx.gym
+    end_long_shifts(db, gym.id)
     today = today_in(gym.timezone)
     y, m = (int(x) for x in (month or today.strftime("%Y-%m")).split("-"))
     first = today.replace(year=y, month=m, day=1)

@@ -127,7 +127,16 @@ def account_deletion():
                        .values(revoked_at=utcnow()))
 
 
-JOBS = {"nightly_stats": nightly_stats, "membership_notifications": membership_notifications,
+def auto_end_shifts():
+    """Staff shifts left open for 8 hours end by themselves (see staff_work.end_long_shifts)."""
+    from app.routers.staff_work import end_long_shifts
+    with session_scope() as db:
+        n = end_long_shifts(db)
+    if n:
+        log.info("auto-ended %d staff shift(s) after 8 h", n)
+
+
+JOBS = {"nightly_stats": nightly_stats, "auto_end_shifts": auto_end_shifts, "membership_notifications": membership_notifications,
         "owner_digest": owner_digest, "cleanup": cleanup, "account_deletion": account_deletion,
         "sync_membership_states": sync_membership_states}
 
@@ -141,6 +150,7 @@ def start_scheduler():
     s.add_job(cleanup, "cron", minute=15, id="cleanup")
     s.add_job(account_deletion, "cron", hour=3, minute=0, id="account.deletion")
     s.add_job(sync_membership_states, "cron", hour=0, minute=5, id="membership.state_sync")
+    s.add_job(auto_end_shifts, "interval", minutes=10, id="staff.auto_end_shifts", max_instances=1, coalesce=True)
     from app.services import whatsapp as wa
     # WhatsApp: outbox worker every 20 s; reminders checked hourly (each gym sends at its own hour; dedupe makes repeats safe)
     s.add_job(wa.process_queue, "interval", seconds=5, id="whatsapp.queue", max_instances=1, coalesce=True)
