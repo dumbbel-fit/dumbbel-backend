@@ -1,9 +1,10 @@
-"""Location is optional by default: members and staff check in with the QR alone; owners can still switch the check on.
+"""Members never need location to check in. Staff attendance: location is off by default; the owner can switch it on for staff.
 
   * new gym: QR settings say location is off
   * member scans with no location -> checked in; far away -> still checked in, distance kept
   * staff scans with no location -> shift started (place: not shared)
-  * owner switches it on -> no location / far away refused as before; switched off again -> works
+  * owner switches it on -> members still check in with no location / far away; staff without location refused;
+    switched off again -> staff marked
 Run against a TEST database with the API on :8000:  DATABASE_URL=...dumbbel_test python tests/location_optional_e2e.py"""
 import os
 import random
@@ -68,17 +69,17 @@ expect("staff with location off: shift started", (r.status_code, r.json().get("a
        (200, "in", "not_shared"))
 expect("fake QR still refused", c.post(SC, headers=H(S), json={"code": QR[:-4] + "abcd"}).json()["error"]["code"], "WRONG_QR")
 
-print("== owner switches the check on")
+print("== owner switches the check on: it applies to staff only")
 c.patch(f"{B}/gyms/{G}", headers=H(T), json={"settings": {"checkin_require_location": True}})
 expect("QR settings say on", c.get(f"{B}/gyms/{G}/checkin-qr", headers=H(T)).json()["settings"]["require_location"], True)
 with engine.begin() as cn:   # let them scan again today
     cn.execute(text("DELETE FROM checkins WHERE gym_id=:g"), {"g": G})
 r = c.post(MC, headers=H(M, app="member"), json={"code": QR}).json()
-expect("member without location refused", r["result"], "location_required")
+expect("members never need location, even with the switch on", r["result"], "success")
+with engine.begin() as cn:
+    cn.execute(text("DELETE FROM checkins WHERE gym_id=:g"), {"g": G})
 r = c.post(MC, headers=H(M, app="member"), json={"code": QR, "lat": 17.5, "lng": 78.5}).json()
-expect("member far away refused", r["result"], "too_far")
-r = c.post(MC, headers=H(M, app="member"), json={"code": QR, "lat": 17.4484, "lng": 78.3916, "accuracy_m": 20}).json()
-expect("member at the gym checked in", r["result"], "success")
+expect("member far away: still checked in", r["result"], "success")
 sp2 = rnd()
 c.post(f"{B}/gyms/{G}/staff", headers=H(T), json={"name": "Trainer " + sp2[-3:], "phone": sp2, "staff_role": "trainer"})
 S2 = login(sp2)
