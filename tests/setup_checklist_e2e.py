@@ -33,7 +33,7 @@ G = c.post(f"{B}/gyms", headers=H(T), json={"name": "Setup Gym " + rnd()[-4:], "
 st = lambda: c.get(f"{B}/gyms/{G}/setup", headers=H(T)).json()  # noqa: E731
 done = lambda d: [x["key"] for x in d["steps"] if x["done"]]  # noqa: E731
 d = st()
-expect("new gym: nothing done", (done(d), d["complete"], d["required_total"]), ([], False, 6))
+expect("new gym: nothing done", (done(d), d["complete"], d["required_total"]), ([], False, 5))  # gym location is optional (members never need it)
 P = c.post(f"{B}/gyms/{G}/plans", headers=H(T), json={"name": "Monthly", "duration_days": 30, "price_paise": 100000}).json()
 m = c.post(f"{B}/gyms/{G}/members", headers=H(T, True), json={"name": "First Member", "phone": rnd(), "membership": {"plan_id": P.get("plan", P)["id"]}})
 with engine.begin() as cn:
