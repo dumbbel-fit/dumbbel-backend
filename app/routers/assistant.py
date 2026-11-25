@@ -47,18 +47,42 @@ DUMBBEL.fit dashboard, how things work (left menu names in quotes):
 """.strip()
 
 SYSTEM = """You are "Ask DUMBBEL", the assistant inside the DUMBBEL.fit gym dashboard. You help gym owners and managers
-understand their gym's numbers and use the dashboard.
+understand their gym's numbers and use the dashboard. You get GYM DATA (already worked out) and a GUIDE (how the dashboard works).
 
 Rules:
-- For anything about the gym's performance, use ONLY the numbers in GYM DATA. Never invent or estimate numbers that are not there.
-  If something isn't in the data, say you don't have it and point to where in the dashboard they can see it.
-- Explain the "why" by connecting numbers (for example: revenue fell, and renewals and visits fell too).
-  Percentages are already worked out for you where they matter; quote them as given.
-- Money is in Indian rupees, already formatted (₹1,23,000). Keep that format.
-- End with one to three short, concrete next steps, naming the exact place in the dashboard (from the GUIDE).
-- For "how do I…" questions, answer from the GUIDE in short numbered steps.
-- Be brief and plain: 2 to 6 short sentences or a short list. No tables, no headings, no markdown symbols except "-" lists and numbers.
-- Reply in the language the user wrote in (English, Hindi, Telugu, or a mix like Hinglish).
+- Facts about the gym come ONLY from GYM DATA. Use WHAT_CHANGED and SCORE_SUMMARY as written: never do your own maths,
+  never reverse a direction (up/down), never invent a number. If something isn't there, say you don't have it.
+- Never show field names, JSON, code or words like "whatsapp_linked", "true/false", "null". Say it in plain words.
+- Reply in the same language and style as the question: English → English; Hindi or Hinglish → Hinglish (Roman letters);
+  Telugu → Telugu (or Tenglish if they wrote in Roman letters).
+- Money stays as written in GYM DATA (₹1,23,000).
+- Never write labels like "One sentence:" or "Answer:". No tables, no "#" headings, no greetings, no sign-off.
+
+Two kinds of questions, two shapes:
+
+A) "How do I…" / "Where is…" → only numbered steps from the GUIDE (2 to 5 steps). Nothing about the gym's numbers.
+
+B) Anything about the gym's numbers or performance → exactly this shape:
+<one plain sentence that answers directly, key number in **bold**>
+
+Why:
+- <2 to 4 bullets; each is one fact from WHAT_CHANGED / SCORE_SUMMARY with its number in **bold**; things that hurt first>
+
+What to do:
+1. <1 to 3 short steps, each naming the exact place in the dashboard from the GUIDE>
+
+Example of shape B:
+Revenue is down **38%**: ₹62,000 this month against ₹1,00,000 in the same days last month.
+
+Why:
+- **6 fewer renewals** (4 vs 10)
+- **12 plans ended and were not renewed**
+- New members held steady (**8** vs **8**)
+
+What to do:
+1. Members → filter Expiring: call the members whose plans end this week.
+2. WhatsApp → turn on expiry reminders so renewals go out by themselves.
+
 - You do not have member names or phone numbers; for lists of people, say they can ask "Who are my best members?" or
   "Who should I call to renew?" here, or use the Members list and its filters.
 - If asked something unrelated to running the gym or using DUMBBEL.fit, say politely that you can help with the gym and the dashboard."""
@@ -83,9 +107,40 @@ def _readable(obj):
     return obj
 
 
+def what_changed(n: dict) -> list[str]:
+    """This month vs the same days last month, already worked out, biggest money effect first, so the model only explains."""
+    rows = []
+    rv = n["revenue"]
+    if rv["last_month_same_days_paise"] or rv["this_month_paise"]:
+        d = rv["this_month_paise"] - rv["last_month_same_days_paise"]
+        pc = "" if rv["change_pct"] is None else f" {abs(rv['change_pct'])}%"
+        word = "up" if d > 0 else "down" if d < 0 else "same"
+        rows.append((10**12, f"Revenue: {rupees(rv['this_month_paise'])} this month vs {rupees(rv['last_month_same_days_paise'])} "
+                              f"in the same days last month ({word}{pc})"))
+    for key, label in (("new_members", "New members"), ("renewals", "Renewals"), ("plans_ended_not_renewed", "Plans that ended and were not renewed"),
+                       ("checkins", "Check-ins")):
+        a, b = n[key]["this_month"], n[key]["last_month_same_days"]
+        d = a - b
+        word = "up" if d > 0 else "down" if d < 0 else "no change"
+        good = (d > 0) != (key == "plans_ended_not_renewed")
+        effect = "" if d == 0 else (" (helps revenue)" if good and key != "checkins" else " (hurts revenue)" if key != "checkins" else "")
+        rows.append((abs(d), f"{label}: {a} this month vs {b} last month ({word}{'' if d == 0 else ' ' + str(abs(d))}){effect}"))
+    return [t for _, t in sorted(rows, key=lambda x: -x[0])]
+
+
 def _facts(db: Session, gym, s: dict | None = None) -> dict:
     s = s or gym_score(db, gym)
-    return {"numbers": gym_numbers(db, gym),
+    nums = gym_numbers(db, gym)
+    summary = [f"Overall gym score: {s['score']} of 100 ({s['grade']})" + (f", {'up' if s['change'] > 0 else 'down'} {abs(s['change'])} from last month" if s.get("change") else "")
+               if s["score"] is not None else "Overall gym score: not enough data yet"]
+    for p in s["parts"]:
+        summary.append(f"{p['label']}: " + ("not enough data yet" if p["score"] is None else f"{round(p['score'])} of 100") + f". Tip: {p['tip']}")
+    st = nums["setup"]
+    setup = [("WhatsApp is linked" if st["whatsapp_linked"] else "WhatsApp is NOT linked yet (no automatic reminders are going out)"),
+             f"{st['plans']} active plans", f"{st['staff']} staff added",
+             ("UPI ID added (members can pay online)" if st["upi_ids"] else "No UPI ID added yet (members can't pay online)")]
+    return {"what_changed": what_changed(nums), "score_summary": summary, "setup": setup,
+            "numbers": {k: v for k, v in nums.items() if k != "setup"},
             "score": {"overall": s["score"], "grade": s["grade"], "last_month": s["previous_score"],
                       "parts": {p["label"]: {"score": p["score"], "rate_pct": p["rate_pct"], "last_month": p["previous_score"]}
                                 for p in s["parts"]},

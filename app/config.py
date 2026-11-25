@@ -56,7 +56,8 @@ class Settings(BaseSettings):
     groq_fallback_model: str = "openai/gpt-oss-20b"
     # Ask DUMBBEL (owner assistant): NVIDIA-hosted open model first, Groq as the backup
     nvidia_api_key: str | None = None
-    nvidia_model: str = "mistralai/mistral-large-4-1t-a52b"
+    nvidia_model: str = "nvidia/nemotron-3.5-lightning-30b-a3b"  # fast (~2 s) with thinking off
+    nvidia_fallback_model: str = "minimaxai/minimax-m3.1-flash"  # slower (~15 s), used if the fast one fails
 
     # Firebase Phone Auth (alternative to 2Factor; Google sends the SMS, no DLT needed)
     firebase_project_id: str | None = None

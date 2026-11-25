@@ -146,6 +146,10 @@ expect("token encrypted at rest", (RAW_TOKEN in enc, wa.decrypt(enc) == RAW_TOKE
 chk("another gym can't take the same number", c.post(f"{B}/gyms/{GB}/whatsapp/connect", headers=H(TB), json={"waba_id": WABA_B, "phone_number_id": PID_A, "access_token": RAW_TOKEN}), 409)
 chk("gym B connects its own number", c.post(f"{B}/gyms/{GB}/whatsapp/connect", headers=H(TB), json={"waba_id": WABA_B, "phone_number_id": PID_B, "access_token": "EAAGB" + uuid.uuid4().hex * 3, "consent_confirmed": True}))
 chk("test connection", c.post(f"{B}/gyms/{GA}/whatsapp/test", headers=H(TA)))
+# this test is about reminders: switch the member-event messages (welcome, receipts…) off so counts stay exact
+OFF = {k: False for k in ("welcome", "payment_received", "payment_failed", "membership_cancelled", "membership_frozen", "membership_resumed")}
+for T_, G_ in ((TA, GA), (TB, GB)):
+    chk("member-event messages off", c.patch(f"{B}/gyms/{G_}/whatsapp/settings", headers=H(T_), json={"automations": OFF}))
 
 print("\n== members")
 today = date.today()
@@ -188,8 +192,11 @@ s = chk("send to everyone expiring", c.post(f"{B}/gyms/{GA}/whatsapp/send", head
 expect("3 queued", (s["queued"], len(s["skipped"])), (3, 0))
 b = wait_batch(TA, GA, s["batch_id"])
 expect("batch finished: 3 accepted, 0 failed", (b["done"], b["accepted"], b["failed"]), (True, 3, 0))
-expect("Meta got 3 template messages from gym A's number only", ([x["phone_number_id"] for x in MOCK["sent"]], {x["payload"]["type"] for x in MOCK["sent"]}), ([PID_A] * 3, {"template"}))
-asha = next(x for x in MOCK["sent"] if x["payload"]["to"] == m3["phone"].lstrip("+"))
+# welcome messages that were waiting for template approval also go out now; look at the expiry reminders only
+rem = [x for x in MOCK["sent"] if "expiry_reminder" in str(x["payload"].get("template", {}).get("name", ""))]
+expect("Meta got 3 expiry reminders, all from gym A's number", ([x["phone_number_id"] for x in rem], {x["payload"]["type"] for x in rem}), ([PID_A] * 3, {"template"}))
+expect("everything sent went from gym A's number", {x["phone_number_id"] for x in MOCK["sent"]}, {PID_A})
+asha = next(x for x in rem if x["payload"]["to"] == m3["phone"].lstrip("+"))
 params = [p["text"] for p in asha["payload"]["template"]["components"][0]["parameters"]]
 expect("body params personalised", params[0], "Asha")
 TOKEN = asha["payload"]["template"]["components"][1]["parameters"][0]["text"]
@@ -241,14 +248,13 @@ n3 = wa.run_expiry_automation(force=True)
 after = c.get(f"{B}/gyms/{GA}/whatsapp/messages", headers=H(TA)).json()
 print("   queued per run:", n1, n2, n3)
 expect("second and third runs queue nothing", (n2, n3), (0, 0))
-auto = [m for m in after["items"] if m["trigger"] == "auto" and m["event"] != "gym_live"]
+auto = [m for m in after["items"] if m["trigger"] == "auto" and m["event"] in ("expiry_reminder", "expired")]
 # Asha and Chitra were reminded by hand earlier today, so the automatic run doesn't message them again;
 # Bala's hand-sent reminder failed, so Bala gets the automatic one; Esha (expired) wasn't reminded yet.
 expect("auto reminders: once each, skipping members already reminded by hand today", sorted(m["member"]["name"] for m in auto if m["member"]["id"] in (m3["id"], m1["id"], m7["id"], mexp["id"], m20["id"])), ["Bala One", "Esha Expired"])
-expect("20-days-left member gets no reminder", any(m["member"]["id"] == m20["id"] and m["event"] != "gym_live" for m in after["items"]), False)
-live = [m for m in after["items"] if m["event"] == "gym_live"]
-expect("each member gets the go-live message once", len(live), len({m["member"]["id"] for m in live}))
-expect("20-days-left member gets the go-live message", any(m["member"]["id"] == m20["id"] for m in live), True)
+expect("20-days-left member gets no reminder", any(m["member"]["id"] == m20["id"] and m["event"] in ("expiry_reminder", "expired") for m in after["items"]), False)
+live = [m for m in after["items"] if m["event"] == "gym_live" and m["status"] in ("queued", "sending", "sent", "delivered", "read")]
+expect("the go-live message is banned: never sent", len(live), 0)
 
 print("\n== retries")
 MOCK["sent"].clear(); MOCK["fail_next"] = "transient"

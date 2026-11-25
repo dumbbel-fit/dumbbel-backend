@@ -110,10 +110,10 @@ def clean_utr(u: str) -> str:
     return u
 
 
-def upi_links(r: UpiPaymentRequest) -> tuple[str, dict | None]:
-    """Personal UPI IDs: plain P2P QR (pa, pn, am, cu, tn) — UPI apps decline "tap to pay" links to personal IDs,
-    so no app links; members scan the QR in their UPI app or pay to the UPI ID.
-    Merchant UPI IDs: merchant intent (+ tr, mc) with one-tap app links."""
+def upi_links(r: UpiPaymentRequest) -> tuple[str, dict]:
+    """App links (Google Pay, PhonePe, Paytm, BHIM, any UPI app) for every UPI ID, so the member is taken straight to
+    the app with the amount filled in. Merchant IDs add the merchant fields (tr, mc). Some apps refuse "tap to pay"
+    links to a personal ID; the member app then offers the QR / UPI ID as a backup. Either way the member pastes the UTR."""
     merchant = (getattr(r, "account_type", None) or "personal") == "merchant"
     params = {"pa": r.vpa, "pn": r.payee_name, "am": f"{r.amount_paise / 100:.2f}", "cu": "INR"}
     if merchant:
@@ -123,8 +123,6 @@ def upi_links(r: UpiPaymentRequest) -> tuple[str, dict | None]:
         params["tn"] = r.note
     qs = urlencode(params, quote_via=lambda v, *a: quote(v, safe="@"))  # UPI apps expect a literal @
     uri = f"upi://pay?{qs}"
-    if not merchant:
-        return uri, None
     return uri, {"generic": uri, "gpay": f"tez://upi/pay?{qs}", "phonepe": f"phonepe://pay?{qs}",
                  "paytm": f"paytmmp://pay?{qs}", "bhim": f"bhim://upi/pay?{qs}"}
 

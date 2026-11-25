@@ -244,7 +244,11 @@ ce = cp["ceiling"]
 expect("capacity: slots = smallest of threads, pool, concurrency", ce["slots"], min(cp["setup"]["threads"], cp["setup"]["db_pool"], cp["setup"]["concurrency"]) * cp["setup"]["instances"])
 expect("capacity: ceiling arithmetic", ce["ceiling_per_min"], round(ce["slots"] / (ce["avg_ms"] / 1000) * 60))
 expect("capacity: safe load is 60% of the ceiling", ce["safe_per_min"], round(ce["ceiling_per_min"] * 0.6))
-expect("capacity: counts the live gyms", cp["people"]["gyms"], sql("SELECT COUNT(*) FROM gyms WHERE status='active'").scalar())
+from app.services import testgyms as _tg  # noqa: E402  (platform numbers leave test gyms out)
+_q = "SELECT COUNT(*) FROM gyms WHERE status='active'"
+with engine.connect() as _cn:
+    _live = _cn.execute(text(_tg.scope(_q, {})), {}).scalar()
+expect("capacity: counts the live gyms (test gyms left out)", cp["people"]["gyms"], _live)
 expect("capacity: database size and tables read", cp["database"]["size_mb"] > 0 and len(cp["database"]["tables"]) > 0, True)
 expect("capacity: always ends with a load-test step", cp["next_steps"][-1]["when"], "Before a big launch")
 chk("capacity needs sign-in", c.get(f"{I}/capacity"), 401)
