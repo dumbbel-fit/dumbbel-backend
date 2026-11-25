@@ -522,6 +522,8 @@ class UpiPaymentRequest(Base):
     result_membership_id: Mapped[str | None] = mapped_column(String(36))  # renewal: membership created on verify
     created_by: Mapped[str | None] = fk("users.id", nullable=True)
     utr: Mapped[str | None] = mapped_column(String(40))
+    auto_confirmed = mapped_column(Boolean, nullable=False, default=False, server_default="0")  # confirmed by the member's UTR
+    checked_at = mapped_column(TS, nullable=True)  # owner looked at their bank and said "received"
     claimed_at = mapped_column(TS, nullable=True)
     decided_by: Mapped[str | None] = fk("users.id", nullable=True)
     decided_at = mapped_column(TS, nullable=True)

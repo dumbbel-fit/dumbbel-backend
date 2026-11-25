@@ -661,6 +661,9 @@ class UpiRequestOut(Out):
     payment_id: str | None = None
     receipt_no: str | None = None
     created_via: str | None = None
+    auto_confirmed: bool | None = None
+    checked_at: str | None = None
+    to_check: bool | None = None
     purpose: str | None = None
     plan_id: str | None = None
     plan_name: str | None = None
@@ -673,6 +676,7 @@ class UpiRequestListOut(Out):
     items: list[UpiRequestOut]
     next_cursor: str | None = None
     counts: dict[str, int] | None = None
+    auto_confirm: bool | None = None
 
 
 class MyUpiInfoOut(Out):

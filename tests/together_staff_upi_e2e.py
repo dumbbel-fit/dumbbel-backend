@@ -155,7 +155,8 @@ print("\n== console: UPI payments through DUMBBEL.fit")
 acc = c.post(f"{B}/gyms/{G}/upi-accounts", headers=H(T), json={"vpa": "together@okhdfcbank", "payee_name": "Together Gym"})
 expect("upi id added", acc.status_code, 201)
 req = c.post(f"{B}/gyms/{G}/upi-requests", headers=H(T, True), json={"member_id": mid, "amount_paise": 50000}).json()
-c.post(f"{B}/gyms/{G}/upi-requests/{req['id']}/verify", headers=H(T), json={"utr": "612345678901"})
+UTR = str(random.randint(6 * 10**11, 7 * 10**11 - 1))  # a UTR can be used once across all gyms, so a fresh one each run
+c.post(f"{B}/gyms/{G}/upi-requests/{req['id']}/verify", headers=H(T), json={"utr": UTR})
 c.post(f"{B}/gyms/{G}/upi-requests", headers=H(T, True), json={"member_id": ids[1], "amount_paise": 20000})
 ADMIN = rnd()
 A = login(ADMIN)
@@ -164,7 +165,7 @@ with engine.begin() as cn:
 u = c.get(f"{B}/internal/upi-payments", headers=H(A, app="web"), params={"gym_id": G, "range": "7d"}).json()
 expect("totals", (u["totals"]["verified"], u["totals"]["pending"]["count"]), ({"count": 1, "paise": 50000}, 1))
 expect("who paid", [(i["member_name"], i["status"], i["amount_paise"], i["utr"], bool(i["receipt_no"])) for i in u["items"] if i["status"] == "verified"],
-       [("Desk Added", "verified", 50000, "612345678901", True)])
+       [("Desk Added", "verified", 50000, UTR, True)])
 expect("per gym", (u["by_gym"][0]["verified"], u["by_gym"][0]["verified_paise"]), (1, 50000))
 expect("filter verified", {i["status"] for i in c.get(f"{B}/internal/upi-payments", headers=H(A, app="web"), params={"gym_id": G, "status": "verified"}).json()["items"]}, {"verified"})
 print("\nFAILS:", fails)

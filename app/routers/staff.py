@@ -5,7 +5,7 @@ from typing import Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Query, Response
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -359,7 +359,9 @@ def summary(ctx: GymCtx = Depends(gym_ctx), db: Session = Depends(get_db)):
             "dues_paise": sum(s.due_paise for *_, s in data["dues"]),
             "pt_fees_paise": sum(m.pt_fee_paise or 0 for m, _ in data["rows"] if m.pt_enabled and states[m.id].status in LIVE),
             "upi_to_verify": db.scalar(select(func.count()).select_from(UpiPaymentRequest).where(
-                UpiPaymentRequest.gym_id == gym.id, UpiPaymentRequest.status == "claimed")) or 0,
+                UpiPaymentRequest.gym_id == gym.id, or_(UpiPaymentRequest.status == "claimed", and_(
+                    UpiPaymentRequest.auto_confirmed.is_(True), UpiPaymentRequest.status == "verified",
+                    UpiPaymentRequest.checked_at.is_(None))))) or 0,
         })
     expiring = []
     for m, u in data["rows"]:

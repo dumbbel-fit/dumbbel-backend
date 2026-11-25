@@ -24,7 +24,7 @@ from app.models import Gym, GymMember, GymStaff, GymUpiAccount, Membership, Paym
 from app.responses import (DocRoute, ERRORS, MyUpiInfoOut, UpiAccountListOut, UpiAccountOut, UpiRequestListOut, UpiRequestOut)
 from app.services.audit import audit
 from app.services.cache import rate_limit
-from app.services.core import (add_payment, check_duplicate_reference, create_membership, default_start, price_preview,
+from app.services.core import (add_payment, check_duplicate_reference, create_membership, default_start, gym_settings, price_preview,
                                ser_membership, settle_credit)
 from app.services.jobs import enqueue
 from app.services.push import send_push
@@ -154,6 +154,8 @@ def ser_req(r: UpiPaymentRequest, member: GymMember | None = None, receipt_no: s
             "utr": r.utr, "claimed_at": iso(r.claimed_at), "decided_at": iso(r.decided_at),
             "reject_reason": r.reject_reason, "payment_id": r.payment_id, "receipt_no": receipt_no,
             "created_via": r.created_via, "purpose": r.purpose or "dues", "plan_id": r.plan_id,
+            "auto_confirmed": bool(r.auto_confirmed), "checked_at": iso(r.checked_at),
+            "to_check": bool(r.auto_confirmed) and r.status == "verified" and r.checked_at is None,
             "plan_name": plan_name, "result_membership_id": r.result_membership_id,
             "expires_at": iso(r.expires_at), "created_at": iso(r.created_at)}
 
@@ -237,10 +239,10 @@ def _get_req(db: Session, ctx: GymCtx, rid: str) -> UpiPaymentRequest:
 
 
 def _utr_taken(db: Session, gym_id: str, utr: str, exclude_req: str | None = None):
-    if db.scalar(select(Payment.id).where(Payment.gym_id == gym_id, Payment.method == "upi",
-                                          Payment.reference == utr, Payment.status == "recorded")):
+    """A UTR belongs to exactly one UPI payment anywhere in India, so it may be used once across ALL gyms."""
+    if db.scalar(select(Payment.id).where(Payment.method == "upi", Payment.reference == utr, Payment.status == "recorded")):
         raise ApiError(409, "DUPLICATE_REFERENCE", "This UTR has already been recorded for a payment.")
-    q = select(UpiPaymentRequest.id).where(UpiPaymentRequest.gym_id == gym_id, UpiPaymentRequest.utr == utr,
+    q = select(UpiPaymentRequest.id).where(UpiPaymentRequest.utr == utr,
                                            UpiPaymentRequest.status.in_(("claimed", "verified")))
     if exclude_req:
         q = q.where(UpiPaymentRequest.id != exclude_req)
@@ -374,6 +376,7 @@ def create_request(body: UpiRequestIn, ctx: GymCtx = Depends(perm_ctx("payments.
 @router.get("/gyms/{gymId}/upi-requests", response_model=UpiRequestListOut,
             summary="UPI payments to review (payments.view). `status=claimed` = waiting for you to verify")
 def list_requests(status: Literal["pending", "claimed", "verified", "rejected", "expired", "cancelled"] | None = None,
+                  to_check: bool = Query(False, description="Only payments members confirmed with their UTR that you haven't checked yet"),
                   member_id: str | None = None, limit: int = Query(50, ge=1, le=100), cursor: str | None = None,
                   ctx: GymCtx = Depends(perm_ctx("payments.view")), db: Session = Depends(get_db)):
     gym = ctx.gym
@@ -383,7 +386,12 @@ def list_requests(status: Literal["pending", "claimed", "verified", "rejected", 
     db.commit()
     counts = dict(db.execute(select(UpiPaymentRequest.status, func.count()).where(
         UpiPaymentRequest.gym_id == gym.id).group_by(UpiPaymentRequest.status)).all())
+    to_check_n = db.scalar(select(func.count()).select_from(UpiPaymentRequest).where(
+        UpiPaymentRequest.gym_id == gym.id, UpiPaymentRequest.auto_confirmed.is_(True), UpiPaymentRequest.status == "verified",
+        UpiPaymentRequest.checked_at.is_(None))) or 0
     q = select(UpiPaymentRequest).where(UpiPaymentRequest.gym_id == gym.id)
+    if to_check:
+        q = q.where(UpiPaymentRequest.auto_confirmed.is_(True), UpiPaymentRequest.status == "verified", UpiPaymentRequest.checked_at.is_(None))
     if status:
         q = q.where(UpiPaymentRequest.status == status)
     if member_id:
@@ -399,7 +407,8 @@ def list_requests(status: Literal["pending", "claimed", "verified", "rejected", 
     receipts = {p.id: p.receipt_no for p in db.scalars(select(Payment).where(
         Payment.id.in_({r.payment_id for r in rows if r.payment_id} or {""})))}
     return {"items": [ser_req(r, members.get(r.member_id), receipts.get(r.payment_id)) for r in rows],
-            "next_cursor": nxt, "counts": {k: int(v) for k, v in counts.items()}}
+            "next_cursor": nxt, "counts": {**{k: int(v) for k, v in counts.items()}, "to_check": int(to_check_n)},
+            "auto_confirm": bool(gym_settings(gym).get("upi_auto_confirm", True))}
 
 
 @router.get("/gyms/{gymId}/upi-requests/{requestId}", response_model=UpiRequestOut, summary="One UPI payment")
@@ -425,11 +434,22 @@ def verify_request(requestId: str, body: VerifyIn, ctx: GymCtx = Depends(perm_ct
         _utr_taken(db, gym.id, utr, exclude_req=r.id)
         check_duplicate_reference(db, gym.id, "upi", utr)
     member = db.get(GymMember, r.member_id)
-    main = apply_upi_payment(db, gym, member, r, utr, ctx.user.id, body.note)
-    r.status, r.utr, r.decided_by, r.decided_at, r.payment_id = "verified", utr, ctx.user.id, utcnow(), main.id
-    audit(db, gym.id, ctx.user.id, "upi.verify", "upi_request", r.id,
-          f"Verified UPI {rupees(r.amount_paise)} from {member.display_name}" + (f" (UTR {utr})" if utr else ""))
-    audit(db, gym.id, ctx.user.id, "payment.record", "payment", main.id,
+    main = confirm(db, gym, member, r, utr, ctx.user.id, body.note)
+    r.checked_at = utcnow()  # verified by staff = already checked
+    db.commit()
+    return ser_req(r, member, main.receipt_no)
+
+
+def confirm(db: Session, gym: Gym, member: GymMember, r: UpiPaymentRequest, utr: str | None, actor_id: str,
+            note: str | None = None, auto: bool = False) -> Payment:
+    """Record the payment (renewal first if it's one), mark the request verified, tell the member. Commits."""
+    main = apply_upi_payment(db, gym, member, r, utr, actor_id, note)
+    r.status, r.utr, r.decided_by, r.decided_at, r.payment_id = "verified", utr, actor_id, utcnow(), main.id
+    r.auto_confirmed = auto
+    who = "the member’s UTR" if auto else "staff"
+    audit(db, gym.id, actor_id, "upi.verify", "upi_request", r.id,
+          f"UPI {rupees(r.amount_paise)} from {member.display_name} confirmed by {who}" + (f" (UTR {utr})" if utr else ""))
+    audit(db, gym.id, actor_id, "payment.record", "payment", main.id,
           f"Recorded {rupees(r.amount_paise)} UPI from {member.display_name}")
     db.commit()
     msg = f"{gym.name} confirmed your UPI payment of {rupees(r.amount_paise)}. Receipt {main.receipt_no}."
@@ -451,7 +471,7 @@ def verify_request(requestId: str, body: VerifyIn, ctx: GymCtx = Depends(perm_ct
         fire_later(gym.id, "renewal_confirmed", member.id, r.result_membership_id, dedupe=f"renewed:{r.result_membership_id}")
     else:
         fire_later(gym.id, "payment_received", member.id, r.membership_id, {"amount": rupees(r.amount_paise)}, f"paid:{main.id}")
-    return ser_req(r, member, main.receipt_no)
+    return main
 
 
 def apply_upi_payment(db: Session, gym: Gym, member: GymMember, r: UpiPaymentRequest, utr: str | None,
@@ -506,6 +526,63 @@ def reject_request(requestId: str, body: RejectIn, ctx: GymCtx = Depends(perm_ct
             {"type": "upi_rejected", "request_id": r.id})
     from app.services.whatsapp import fire_later
     fire_later(ctx.gym.id, "payment_failed", member.id, r.membership_id, {"amount": rupees(r.amount_paise)}, f"upirej:{r.id}")
+    return ser_req(r, member)
+
+
+class NotReceivedIn(BaseModel):
+    reason: str = Field("The money didn’t reach the gym’s bank account.", max_length=300)
+
+
+@router.post("/gyms/{gymId}/upi-requests/{requestId}/received", response_model=UpiRequestOut,
+             summary="Checked the bank: a member-confirmed UPI payment really arrived (payments.record)")
+def mark_received(requestId: str, ctx: GymCtx = Depends(perm_ctx("payments.record")), db: Session = Depends(get_db)):
+    r = _get_req(db, ctx, requestId)
+    if r.status != "verified":
+        raise ApiError(409, "NOT_ACTIVE", f"This UPI payment is {r.status}.")
+    r.checked_at = utcnow()
+    member = db.get(GymMember, r.member_id)
+    audit(db, ctx.gym.id, ctx.user.id, "upi.checked", "upi_request", r.id,
+          f"Checked the bank: {rupees(r.amount_paise)} UPI from {member.display_name} received (UTR {r.utr})")
+    db.commit()
+    return ser_req(r, member)
+
+
+@router.post("/gyms/{gymId}/upi-requests/{requestId}/not-received", response_model=UpiRequestOut,
+             summary="The money never arrived: void the payment and undo the renewal it made (payments.record)")
+def mark_not_received(requestId: str, body: NotReceivedIn, ctx: GymCtx = Depends(perm_ctx("payments.record")),
+                      db: Session = Depends(get_db)):
+    gym = ctx.gym
+    r = _get_req(db, ctx, requestId)
+    if r.status != "verified":
+        raise ApiError(409, "NOT_ACTIVE", f"This UPI payment is {r.status}.")
+    member = db.get(GymMember, r.member_id)
+    pays = db.scalars(select(Payment).where(Payment.member_id == member.id, Payment.status == "recorded",
+                                            Payment.method == "upi", Payment.note.like(f"UPI {r.ref}%"))).all()
+    now = utcnow()
+    for p in pays:
+        p.status, p.void_reason, p.voided_by, p.voided_at = "voided", body.reason, ctx.user.id, now
+        audit(db, gym.id, ctx.user.id, "payment.void", "payment", p.id,
+              f"Voided {rupees(p.amount_paise)} UPI from {member.display_name}: {body.reason}", {"status": "recorded"}, {"status": "voided"})
+    db.flush()  # the voids must count before we ask whether anything else paid for the renewal
+    undone = None
+    if r.result_membership_id:  # the renewal this payment made: take it back unless something else paid for it
+        ms = db.get(Membership, r.result_membership_id)
+        other = db.scalar(select(Payment.id).where(Payment.membership_id == ms.id, Payment.status == "recorded")) if ms else None
+        if ms and ms.state != "cancelled" and not other:
+            ms.state = "cancelled"
+            undone = ms
+            audit(db, gym.id, ctx.user.id, "membership.cancel", "membership", ms.id,
+                  f"Cancelled {ms.plan_name} for {member.display_name}: the UPI payment for it never arrived")
+    r.status, r.reject_reason, r.decided_by, r.decided_at, r.checked_at = "rejected", body.reason, ctx.user.id, now, now
+    db.flush()
+    settle_credit(db, gym, member, ctx.user.id)
+    audit(db, gym.id, ctx.user.id, "upi.not_received", "upi_request", r.id,
+          f"UPI {rupees(r.amount_paise)} from {member.display_name} not received (UTR {r.utr}): {body.reason}")
+    db.commit()
+    enqueue("push.send", send_push, member.user_id, "member", "Payment not received",
+            f"{gym.name} didn’t receive your UPI payment of {rupees(r.amount_paise)} (UTR {r.utr})."
+            + (" The renewal was undone." if undone else "") + " Please talk to the front desk.",
+            {"type": "upi_rejected", "request_id": r.id})
     return ser_req(r, member)
 
 
@@ -602,12 +679,21 @@ def my_claim(requestId: str, body: ClaimIn, user: User = Depends(current_user), 
     if r.status not in ("pending", "expired", "claimed"):
         raise ApiError(409, "NOT_ACTIVE", f"This payment is already {r.status}.")
     utr = clean_utr(body.utr)
+    if len(set(utr)) <= 2 or utr in "012345678901234567890" or utr in "98765432109876543210":
+        raise validation({"utr": "That doesn’t look like a real UTR. Copy the 12-digit UPI Ref No. from your UPI app."})
     _utr_taken(db, r.gym_id, utr, exclude_req=r.id)
     r.status, r.utr, r.claimed_at = "claimed", utr, utcnow()
     g = db.get(Gym, r.gym_id)
     audit(db, g.id, user.id, "upi.claim", "upi_request", r.id,
           f"{m.display_name} says they paid {rupees(r.amount_paise)} by UPI (UTR {utr})")
     db.commit()
+    if gym_settings(g).get("upi_auto_confirm", True):
+        main = confirm(db, g, m, r, utr, user.id, "confirmed with the member’s UTR", auto=True)
+        for uid in payment_staff(db, g.id):
+            enqueue("push.send", send_push, uid, "admin", "UPI payment received",
+                    f"{m.display_name} paid {rupees(r.amount_paise)} (UTR {utr}). It’s confirmed; check your bank when you can.",
+                    {"type": "upi_auto", "gym_id": g.id, "request_id": r.id})
+        return ser_req(r, m, main.receipt_no)
     for uid in payment_staff(db, g.id):
         enqueue("push.send", send_push, uid, "admin", "UPI payment to verify",
                 f"{m.display_name} paid {rupees(r.amount_paise)} (UTR {utr}). Check your bank and verify.",

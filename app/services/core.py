@@ -13,7 +13,9 @@ from app.utils import dstr, financial_year, iso, local_date_of, today_in, utcnow
 
 DEFAULT_SETTINGS = {"checkin_cooldown_min": 120, "max_freeze_days": 30, "receipt_footer": "Thank you for training with us!",
                     # member scans the gym's QR: printed poster allowed? location required? radius in metres
-                    "checkin_static_qr": True, "checkin_require_location": False, "checkin_radius_m": 150}
+                    "checkin_static_qr": True, "checkin_require_location": False, "checkin_radius_m": 150,
+                    # member enters the UTR after paying by UPI → confirmed at once (owner can mark "not received" later)
+                    "upi_auto_confirm": True}
 
 
 def gym_settings(gym: Gym) -> dict:

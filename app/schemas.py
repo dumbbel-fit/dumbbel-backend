@@ -87,6 +87,7 @@ class GymSettingsIn(BaseModel):
     checkin_cooldown_min: int | None = Field(None, ge=0, le=1440)
     checkin_static_qr: bool | None = Field(None, description="Deprecated — every branch now has one standard QR that always works")
     checkin_require_location: bool | None = Field(None, description="Member must be near the gym to check in")
+    upi_auto_confirm: bool | None = Field(None, description="Confirm a member's UPI payment as soon as they enter the UTR")
     checkin_radius_m: int | None = Field(None, ge=30, le=2000)
     capacity: int | None = Field(None, ge=1, le=5000, description="Max people inside at once — makes the crowd % exact")
     avg_session_min: int | None = Field(None, ge=20, le=240, description="Typical workout length; used by the crowd meter")
