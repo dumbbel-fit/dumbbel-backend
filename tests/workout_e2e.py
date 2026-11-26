@@ -56,7 +56,7 @@ expect("every exercise: steps, sets, reps, rest", all(e["steps"] and e["dose"]["
                                                       for x in work for e in x["exercises"]), True)
 expect("warm-up and cool-down on each workout", all(x["warmup"] and x["cooldown"] for x in work), True)
 expect("every exercise, warm-up move and stretch has an HD animation",
-       all((e.get("gif_url") or "").endswith(f"/{e['id']}.webp") for x in work for e in x["exercises"] + x["cooldown"] + [w for w in x["warmup"] if w.get("id")]), True)
+       all((e.get("gif_url") or "").split("?")[0].endswith(f"/{e['id']}.webp") for x in work for e in x["exercises"] + x["cooldown"] + [w for w in x["warmup"] if w.get("id")]), True)
 expect("first warm-up step linked to the day's first exercise", all(x["warmup"][-1].get("id") == x["exercises"][0]["id"] for x in work), True)
 expect("week 1 of block 1", (plan["block"], plan["week_in_block"]), (1, 1))
 

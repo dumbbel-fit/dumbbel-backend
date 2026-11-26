@@ -359,6 +359,9 @@ def risk_profile(p: dict) -> tuple[set[str], list[str], bool]:
     return avoid, notes, careful
 
 
+HD_MEDIA_VERSION = 3  # realistic Real-ESRGAN x4plus, cropped to the figure
+
+
 def media_for(ex_id: str | None) -> dict:
     """Media links for one exercise, worked out at read time so switching EXERCISE_MEDIA_BASE on or off applies to saved plans too."""
     base = (settings.exercise_media_base or "").rstrip("/")
@@ -368,7 +371,8 @@ def media_for(ex_id: str | None) -> dict:
         return {"gif_url": None, "image_url": None, "thumb_url": None, "attribution": None}
     if hd and ex_id in BY_ID:  # every exercise a plan can use has a sharp 3x animated WebP on our own site
         # gif_url: 720px HD animation (detail view); thumb_url: 200px animation for lists
-        return {"gif_url": f"{hd}/{ex_id}.webp", "image_url": f"{hd}/thumb/{ex_id}.webp", "thumb_url": f"{hd}/thumb/{ex_id}.webp",
+        v = f"?v={HD_MEDIA_VERSION}"  # bump when the files are remade, so phones don't keep old cached copies
+        return {"gif_url": f"{hd}/{ex_id}.webp{v}", "image_url": f"{hd}/thumb/{ex_id}.webp{v}", "thumb_url": f"{hd}/thumb/{ex_id}.webp{v}",
                 "attribution": MEDIA_ATTRIBUTION}
     return {"gif_url": f"{base}/{x['gif']}", "image_url": f"{base}/{x['image']}", "thumb_url": f"{base}/{x['gif']}", "attribution": MEDIA_ATTRIBUTION}
 
