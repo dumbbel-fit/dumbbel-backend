@@ -10,6 +10,11 @@ Every changed row's old date is saved first in the table payment_paid_at_backup,
   python scripts/backfill_paid_at_start.py            # preview only, changes nothing
   python scripts/backfill_paid_at_start.py --apply    # save old dates, then update
   python scripts/backfill_paid_at_start.py --undo     # put the saved old dates back
+
+Safety: a payment that would move more than 60 days back is left as it is and listed under "Left as is" (an old
+start date is usually a typo or an old member re-added, and moving it would shift revenue into an earlier month/year).
+  --max-days 400                  # allow bigger moves
+  --skip BSK/2026-27/000123,...   # leave these receipts as they are
 """
 import os
 import sys
@@ -43,15 +48,21 @@ def ensure_backup_table(cn):
         changed_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6))"""))
 
 
-def find(cn):
-    todo = []
+def find(cn, max_days=60, skip=frozenset()):
+    todo, held = [], []
     for r in cn.execute(text(FIND)).mappings():
         old = r["paid_at"].replace(tzinfo=None)  # stored as UTC
         local_day = old.replace(tzinfo=timezone.utc).astimezone(tz(r["timezone"])).date()
         days = (local_day - r["start_date"]).days
         if days > 0:
-            todo.append((r, old, old - timedelta(days=days), local_day))
-    return todo
+            row = (r, old, old - timedelta(days=days), local_day)
+            if r["receipt_no"] in skip:
+                held.append((row, "skipped by you"))
+            elif days > max_days:
+                held.append((row, f"would move {days} days back"))
+            else:
+                todo.append(row)
+    return todo, held
 
 
 def show(todo):
@@ -65,7 +76,16 @@ def show(todo):
     print(f"\nTotal: {len(todo)} payment(s) to move to their plan's start date.")
 
 
-def main(mode):
+def show_held(held):
+    if not held:
+        return
+    print(f"\nLeft as is ({len(held)}), please check these by hand:")
+    for (r, _, _, day), why in held:
+        print(f"  {r['receipt_no']:<22} {r['gym'][:16]:<16} {r['member_name'][:20]:<20} paid {day:%d %b %Y}, "
+              f"plan starts {r['start_date']:%d %b %Y} ({why})")
+
+
+def main(mode, max_days=60, skip=frozenset()):
     print("Database:", engine.url.host, "/", engine.url.database, "| mode:", mode)
     with engine.begin() as cn:
         ensure_backup_table(cn)
@@ -77,8 +97,9 @@ def main(mode):
         print(f"Put back the old date on {n} payment(s).")
         return
     with engine.begin() as cn:
-        todo = find(cn)
+        todo, held = find(cn, max_days, skip)
         show(todo)
+        show_held(held)
         if mode == "--preview":
             print("Preview only. Nothing changed. Run with --apply to update.")
             return
@@ -91,7 +112,16 @@ def main(mode):
 
 
 if __name__ == "__main__":
-    mode = (sys.argv[1:] or ["--preview"])[0]
-    if mode not in ("--preview", "--apply", "--undo"):
-        sys.exit(__doc__)
-    main(mode)
+    args = sys.argv[1:]
+    mode, max_days, skip = "--preview", 60, set()
+    while args:
+        a = args.pop(0)
+        if a in ("--preview", "--apply", "--undo"):
+            mode = a
+        elif a == "--max-days" and args:
+            max_days = int(args.pop(0))
+        elif a == "--skip" and args:
+            skip |= {x.strip() for x in args.pop(0).split(",") if x.strip()}
+        else:
+            sys.exit(__doc__)
+    main(mode, max_days, frozenset(skip))
