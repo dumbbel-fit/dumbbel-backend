@@ -365,10 +365,12 @@ def media_for(ex_id: str | None) -> dict:
     hd = (settings.exercise_hd_base or "").rstrip("/")
     x = dataset().get(ex_id) if ex_id else None
     if not base or not x:
-        return {"gif_url": None, "image_url": None, "attribution": None}
+        return {"gif_url": None, "image_url": None, "thumb_url": None, "attribution": None}
     if hd and ex_id in BY_ID:  # every exercise a plan can use has a sharp 3x animated WebP on our own site
-        return {"gif_url": f"{hd}/{ex_id}.webp", "image_url": f"{hd}/{ex_id}.webp", "attribution": MEDIA_ATTRIBUTION}
-    return {"gif_url": f"{base}/{x['gif']}", "image_url": f"{base}/{x['image']}", "attribution": MEDIA_ATTRIBUTION}
+        # gif_url: 720px HD animation (detail view); thumb_url: 200px animation for lists
+        return {"gif_url": f"{hd}/{ex_id}.webp", "image_url": f"{hd}/thumb/{ex_id}.webp", "thumb_url": f"{hd}/thumb/{ex_id}.webp",
+                "attribution": MEDIA_ATTRIBUTION}
+    return {"gif_url": f"{base}/{x['gif']}", "image_url": f"{base}/{x['image']}", "thumb_url": f"{base}/{x['gif']}", "attribution": MEDIA_ATTRIBUTION}
 
 
 def _cues_for(pattern, name):
@@ -390,6 +392,15 @@ def exercise_view(ex_id: str, lib: dict | None = None) -> dict:
 
 def _pick(pattern_list, place, level, avoid, used, rnd, keep=None, goal=None, prefer_not=frozenset(), skip_patterns=frozenset(),
           used_fams=frozenset()):
+    # Keep last week's exercise (incl. one the member swapped in) whenever it is still safe for them: right place, level and
+    # health answers, and not already in today's workout. Variety rules only apply to fresh picks.
+    if keep and keep not in used:
+        for pat in pattern_list:
+            if pat in skip_patterns:
+                continue
+            hit = next((c for c in candidates(pat, place, level, avoid) if c["id"] == keep), None)
+            if hit:
+                return hit
     for pat in pattern_list:
         if pat in skip_patterns:
             continue
