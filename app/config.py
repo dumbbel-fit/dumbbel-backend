@@ -58,8 +58,9 @@ class Settings(BaseSettings):
     nvidia_api_key: str | None = None
     nvidia_model: str = "nvidia/nemotron-3.5-lightning-30b-a3b"  # fast (~2 s) with thinking off
     nvidia_fallback_model: str = "minimaxai/minimax-m3.1-flash"  # slower (~15 s), used if the fast one fails
-    # Exercise GIFs / images: only set this to media DUMBBEL.fit is licensed to use (Gym visual, see app/data/exercises/README.md)
-    exercise_media_base: str | None = None
+    # Exercise GIFs / images, served from the exercises-dataset repo through the jsDelivr CDN (fast, cached).
+    # Set EXERCISE_MEDIA_BASE to another host to move them, or to an empty value to show placeholders instead.
+    exercise_media_base: str | None = "https://cdn.jsdelivr.net/gh/hasaneyldrm/exercises-dataset@main"
 
     # Firebase Phone Auth (alternative to 2Factor; Google sends the SMS, no DLT needed)
     firebase_project_id: str | None = None
