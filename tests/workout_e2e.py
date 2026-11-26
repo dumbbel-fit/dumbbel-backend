@@ -41,7 +41,7 @@ UID = login["user"]["id"]
 d = c.get(f"{B}/me/workout", headers=H).json()
 expect("setup needed first", (d["plan"], "goal" in d["missing"]), (None, True))
 expect("options offered", (len(d["options"]["goals"]), len(d["options"]["conditions"])), (5, 8))
-expect("media off unless licensed", d["media"]["enabled"], False)
+expect("exercise media on", d["media"]["enabled"], True)
 
 body = {"height_cm": 175, "weight_kg": 72, "age": 27, "goal": "gain_muscle", "experience": "intermediate", "days_per_week": 4,
         "session_min": 60, "place": "gym", "conditions": []}
@@ -55,7 +55,9 @@ expect("4 days = upper / lower split", [x["title"] for x in work], ["Upper body"
 expect("every exercise: steps, sets, reps, rest", all(e["steps"] and e["dose"]["sets"] and (e["dose"].get("reps") or e["dose"].get("seconds")) and e["dose"]["rest_sec"]
                                                       for x in work for e in x["exercises"]), True)
 expect("warm-up and cool-down on each workout", all(x["warmup"] and x["cooldown"] for x in work), True)
-expect("no GIF urls without a licence", {e["gif_url"] for x in work for e in x["exercises"]}, {None})
+expect("every exercise, warm-up move and stretch has an HD animation",
+       all((e.get("gif_url") or "").endswith(f"/{e['id']}.webp") for x in work for e in x["exercises"] + x["cooldown"] + [w for w in x["warmup"] if w.get("id")]), True)
+expect("first warm-up step linked to the day's first exercise", all(x["warmup"][-1].get("id") == x["exercises"][0]["id"] for x in work), True)
 expect("week 1 of block 1", (plan["block"], plan["week_in_block"]), (1, 1))
 
 day = work[0]["index"]

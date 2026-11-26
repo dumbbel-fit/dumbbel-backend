@@ -58,9 +58,11 @@ class Settings(BaseSettings):
     nvidia_api_key: str | None = None
     nvidia_model: str = "nvidia/nemotron-3.5-lightning-30b-a3b"  # fast (~2 s) with thinking off
     nvidia_fallback_model: str = "minimaxai/minimax-m3.1-flash"  # slower (~15 s), used if the fast one fails
-    # Exercise GIFs / images, served from the exercises-dataset repo through the jsDelivr CDN (fast, cached).
-    # Set EXERCISE_MEDIA_BASE to another host to move them, or to an empty value to show placeholders instead.
-    exercise_media_base: str | None = "https://cdn.jsdelivr.net/gh/hasaneyldrm/exercises-dataset@main"
+    # Exercise GIFs / images from the exercises-dataset repo (raw GitHub: jsDelivr refuses repos over 50 MB).
+    # Set EXERCISE_MEDIA_BASE to an empty value to show placeholders instead.
+    exercise_media_base: str | None = "https://raw.githubusercontent.com/hasaneyldrm/exercises-dataset/main"
+    # Sharp 3x animated WebPs of every exercise a plan can use, shipped with the website (public/exercise-media/{id}.webp)
+    exercise_hd_base: str | None = "https://dumbbel.fit/exercise-media"
 
     # Firebase Phone Auth (alternative to 2Factor; Google sends the SMS, no DLT needed)
     firebase_project_id: str | None = None

@@ -362,9 +362,12 @@ def risk_profile(p: dict) -> tuple[set[str], list[str], bool]:
 def media_for(ex_id: str | None) -> dict:
     """Media links for one exercise, worked out at read time so switching EXERCISE_MEDIA_BASE on or off applies to saved plans too."""
     base = (settings.exercise_media_base or "").rstrip("/")
+    hd = (settings.exercise_hd_base or "").rstrip("/")
     x = dataset().get(ex_id) if ex_id else None
     if not base or not x:
         return {"gif_url": None, "image_url": None, "attribution": None}
+    if hd and ex_id in BY_ID:  # every exercise a plan can use has a sharp 3x animated WebP on our own site
+        return {"gif_url": f"{hd}/{ex_id}.webp", "image_url": f"{hd}/{ex_id}.webp", "attribution": MEDIA_ATTRIBUTION}
     return {"gif_url": f"{base}/{x['gif']}", "image_url": f"{base}/{x['image']}", "attribution": MEDIA_ATTRIBUTION}
 
 

@@ -105,7 +105,11 @@ def _out(user: User, row: WorkoutPlan | None) -> dict:
     if plan and not plan.get("blocked"):
         today = today_in(TZ).isoformat()
         for d in plan["days"]:
-            for e in (d.get("exercises") or []) + (d.get("cooldown") or []) + ([d["finisher"]] if d.get("finisher") else []):
+            first = (d.get("exercises") or [{}])[0]
+            for w in d.get("warmup") or []:  # "First exercise, light" shows that day's first exercise
+                if not w.get("id") and w.get("name") == "First exercise, light" and first.get("id"):
+                    w.update({"id": first["id"], "of": first.get("name")})
+            for e in (d.get("exercises") or []) + (d.get("cooldown") or []) + (d.get("warmup") or []) + ([d["finisher"]] if d.get("finisher") else []):
                 if "gif_url" in e or e.get("id"):
                     e.update(W.media_for(e.get("id")))
             p = prog.get(str(d["index"])) or {}
