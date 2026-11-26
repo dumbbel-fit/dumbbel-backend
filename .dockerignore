@@ -8,3 +8,5 @@ env.yaml
 storage/
 .git/
 *.json
+# the exercise library ships with the app (keys and other JSON stay out)
+!app/data/exercises/exercises.json

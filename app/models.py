@@ -813,3 +813,21 @@ class AssistantLog(Base):
     ms: Mapped[int | None] = mapped_column(Integer)
     helpful = mapped_column(Boolean, nullable=True)
     created_at = created()
+
+
+class WorkoutPlan(Base):
+    """A member's workout plan for one week (Mon–Sun, India time) and what they've done of it. Exercises stay the
+    same through a 4-week block (week_in_block 1–4) so progress can be tracked; a new block brings fresh ones."""
+    __tablename__ = "workout_plans"
+    id: Mapped[str] = pk()
+    user_id: Mapped[str] = fk("users.id", index=True)
+    week_start = mapped_column(Date, nullable=False)
+    block_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    week_in_block: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    variant: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    inputs = mapped_column(JSON, nullable=False)    # the profile the plan was built from
+    plan = mapped_column(JSON, nullable=False)
+    progress = mapped_column(JSON, nullable=True)   # {"days": {"0": {"done": true, "at": "...", "sets": {"main_legs": 3}}}}
+    created_at = created()
+    updated_at = updated()
+    __table_args__ = (UniqueConstraint("user_id", "week_start", name="uq_workout_week"),)
